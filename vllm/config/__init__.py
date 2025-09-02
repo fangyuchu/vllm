@@ -3206,6 +3206,50 @@ class ObservabilityConfig:
             self.collect_detailed_traces[0].split(","))
 
 
+@config
+@dataclass
+class FaultToleranceConfig:
+    """Configuration for distributed KV cache transfer."""
+
+    enable_fault_tolerance: bool = False
+    """Enable fault tolerance for detailed error recovery,
+    such as scaling down fault DPEngineCore.
+    """
+
+    engine_recovery_timeout: int = 0
+    """Timeout (in seconds) to wait for error handling instructions
+    before raising an exception. If the EngineCore encounters an
+    error, it waits up to this many seconds for instructions on how
+    to handle the error. If no instructions are received within this
+    time, the original error is raised.
+    """
+
+
+    def compute_hash(self) -> str:
+        """
+        WARNING: Whenever a new field is added to this config,
+        ensure that it is included in the factors list if
+        it affects the computation graph.
+
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
+        """
+        # no factors to consider.
+        # this config will not affect the computation graph.
+        factors: list[Any] = []
+        hash_str = hashlib.md5(str(factors).encode(),
+                               usedforsecurity=False).hexdigest()
+        return hash_str
+
+    def __post_init__(self) -> None:
+        pass
+
+
+
+
 KVProducer = Literal["kv_producer", "kv_both"]
 KVConsumer = Literal["kv_consumer", "kv_both"]
 KVRole = Literal[KVProducer, KVConsumer]
@@ -3400,6 +3444,8 @@ class VllmConfig:
     """The configurations for distributed KV cache transfer."""
     kv_events_config: Optional[KVEventsConfig] = None
     """The configurations for event publishing."""
+    fault_tolerance_config: Optional[FaultToleranceConfig] = None
+    """The configurations for fault tolerance."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.

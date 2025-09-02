@@ -32,7 +32,8 @@ from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
                          ObservabilityConfig, ParallelConfig, PoolerConfig,
                          PrefixCachingHashAlgo, RunnerOption, SchedulerConfig,
                          SchedulerPolicy, SpeculativeConfig, TaskOption,
-                         TokenizerMode, VllmConfig, get_attr_docs, get_field)
+                         TokenizerMode, VllmConfig, get_attr_docs, get_field,
+                         FaultToleranceConfig)
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
@@ -446,6 +447,9 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
+
+    enable_fault_tolerance: bool = FaultToleranceConfig.enable_fault_tolerance
+    engine_recovery_timeout: int = FaultToleranceConfig.engine_recovery_timeout
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -883,6 +887,17 @@ class EngineArgs:
         vllm_group.add_argument("--additional-config",
                                 **vllm_kwargs["additional_config"])
 
+        # fault tolerance arguments
+        fault_tolerance_kwargs = get_kwargs(FaultToleranceConfig)
+        fault_tolerance_group = parser.add_argument_group(
+            title="FaultToleranceConfig",
+            description=FaultToleranceConfig.__doc__,
+        )
+        fault_tolerance_group.add_argument("--enable-fault-tolerance",
+                                **fault_tolerance_kwargs["enable_fault_tolerance"])
+        fault_tolerance_group.add_argument("--engine-recovery-timeout",
+                                **fault_tolerance_kwargs["engine_recovery_timeout"])
+
         # Other arguments
         parser.add_argument('--disable-log-stats',
                             action='store_true',
@@ -1065,6 +1080,7 @@ class EngineArgs:
             "disable_log_stats": disable_log_stats,
         })
         return SpeculativeConfig(**self.speculative_config)
+
 
     def create_engine_config(
         self,
@@ -1380,6 +1396,11 @@ class EngineArgs:
             collect_detailed_traces=self.collect_detailed_traces,
         )
 
+        fault_tolerance_config = FaultToleranceConfig(
+            enable_fault_tolerance=self.enable_fault_tolerance,
+            engine_recovery_timeout=self.engine_recovery_timeout
+        )
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1395,9 +1416,13 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
+            fault_tolerance_config=fault_tolerance_config,
         )
 
         return config
+
+
+
 
     def _is_v1_supported_oracle(self, model_config: ModelConfig) -> bool:
         """Oracle for whether to use V0 or V1 Engine by default."""
