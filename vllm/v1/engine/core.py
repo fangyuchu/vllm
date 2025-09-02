@@ -28,7 +28,8 @@ from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
 from vllm.utils import (decorate_logs, get_hash_fn_by_name, make_zmq_socket,
-                        resolve_obj_by_qualname, set_process_title)
+                        resolve_obj_by_qualname, set_process_title,
+                        build_method_json, parse_method_json)
 from vllm.v1.core.kv_cache_utils import (BlockHash,
                                          generate_scheduler_kv_cache_config,
                                          get_kv_cache_configs,
@@ -41,6 +42,7 @@ from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType,
                             ReconfigureDistributedRequest, ReconfigureRankType,
                             UtilityOutput, UtilityResult)
+from vllm.v1.engine.exceptions import ExceptionInfo
 from vllm.v1.engine.utils import (EngineHandshakeMetadata, EngineZmqAddresses,
                                   get_device_indices)
 from vllm.v1.executor.abstract import Executor
@@ -449,6 +451,299 @@ class EngineCore:
             self.structured_output_manager.grammar_init(req)
         return req, request.current_wave
 
+def get_socket_identity(peer1: str,
+                        peer2: str,
+                        use: str,
+                        peer1_index: str | int | None = None,
+                        peer2_index: str | int | None = None
+                        ) -> bytes:
+    """Generate a unique ZMQ socket identity: peerA[-idx]-peerB[-idx]-use.
+
+    Args:
+        peer1: first participant
+        peer2: second participant
+        use: purpose of this socket
+        peer1_index: optional index for peer1
+        peer2_index: optional index for peer2
+
+    Identity is symmetric: the order of peer1/peer2 is sorted alphabetically,
+    so get_socket_identity(a, b, use) == get_socket_identity(b, a, use)
+    """
+    valid_peers = ('client', 'engine_core_guard', 'worker')
+    valid_use = ('fault_report', 'control')
+
+    # Optional whitelist check
+    if valid_peers is not None:
+        if peer1 not in valid_peers:
+            raise ValueError(
+                f"Invalid peer1: {peer1}, must be one of {valid_peers}"
+            )
+        if peer2 not in valid_peers:
+            raise ValueError(
+                f"Invalid peer2: {peer2}, must be one of {valid_peers}"
+            )
+    if use not in valid_use:
+        raise ValueError(
+            f"Invalid use: {use}, must be one of {valid_use}"
+        )
+
+    # Apply optional indices
+    peer1_part = f"{peer1}-{peer1_index}" if peer1_index is not None else peer1
+    peer2_part = f"{peer2}-{peer2_index}" if peer2_index is not None else peer2
+
+    # Sort alphabetically for symmetry
+    peerA, peerB = sorted([peer1_part, peer2_part])
+    return f"{peerA}-{peerB}-{use}".encode()
+
+
+class EngineCoreGuard(threading.Thread):  # changed
+    """
+    A watchdog thread that monitors EngineCore execution.
+
+    - Listens for exceptions raised in `run_busy_loop`.
+    - Reports exceptions to the client via ZMQ sockets.
+    - Waits for client instructions (e.g., RESUME) and dispatches them.
+    """
+
+    def __init__(self, engine_index: int,
+                 engine_control_addr, engine_fault_report_addr,
+                 exception_signal_queue: queue.Queue[Exception],
+                 fault_tolerance_queue: queue.Queue[str | None],
+                 model_executor: Executor):
+        super().__init__(daemon=True, name=f'EngineCoreGuard_{engine_index}')
+        self.engine_index = engine_index
+        self.exception_signal_q = exception_signal_queue
+        self.fault_tolerance_q = fault_tolerance_queue
+        self.engine_control_addr = engine_control_addr
+        self.engine_fault_report_addr = engine_fault_report_addr
+        self.model_executor = model_executor
+
+        ctx = zmq.Context()
+        # Client <-> EngineCoreGuard sockets
+        self.fault_report_socket = make_zmq_socket(
+            ctx, engine_fault_report_addr, zmq.DEALER, bind=False,
+            identity=get_socket_identity(
+                peer1='client',
+                peer2='engine_core_guard',
+                peer2_index=engine_index,
+                use='fault_report',
+            )
+        )
+
+        self.control_socket = make_zmq_socket(
+            ctx, engine_control_addr, zmq.DEALER, bind=False,
+            identity=get_socket_identity(
+                peer1='client',
+                peer2='engine_core_guard',
+                peer2_index=engine_index,
+                use='control',
+            )
+        )
+
+    def notify_client_exception(
+            self,
+            exception: Exception,
+            additional_info: Optional[dict] = None
+    ) -> bool:
+        """ Informs the client that an exception was raised in run_busy_loop.
+        """
+        try:
+            exception_info = ExceptionInfo.from_exception(
+                exception=exception,
+                engine_id=str(self.engine_index),
+                additional_info=additional_info
+            )
+            self.fault_report_socket.send_string(exception_info.to_json())
+            return True
+        except Exception as e:
+            logger.error(
+                "[EngineCoreGuard_%s] Failed to send exception: %s",
+                self.engine_index,
+                e,
+            )
+            return False
+
+    def notify_client_execution_result(
+            self,
+            success: bool,
+            reason: Optional[str] = None,
+    ) -> None:
+        """
+        Notifies the client about the execution result of a control instruction.
+
+        Args:
+            success: Whether the instruction was executed successfully.
+            reason: Error message if execution failed.
+        """
+        try:
+            result = {
+                "engine_id": str(self.engine_index),
+                "success": success,
+            }
+            if reason is not None:
+                result["reason"] = reason
+
+            self.control_socket.send_string(json.dumps(result))
+
+        except Exception as e:
+            logger.error(
+                "[EngineCoreGuard_%s] Failed to send execution result: %s",
+                self.engine_index,
+                e,
+            )
+
+    def wait_for_client_instruction(self) -> str:
+        # Receive multipart messages.
+        parts = self.control_socket.recv_multipart()
+
+        if not parts or len(parts) < 1:
+            raise ValueError(
+                f"[EngineCoreGuard_{self.engine_index}] "
+                f"Received empty or invalid message from client: {parts}"
+            )
+
+        instruction = parts[0].decode("utf-8")
+
+        logger.info(
+            "[EngineCoreGuard_%s] Received client instruction: %s",
+            self.engine_index,
+            instruction,
+        )
+        return instruction
+
+    def run(self):
+        # start monitoring the execution of run_busy_loop
+        self.monitor_run_busy_loop()
+
+    def monitor_run_busy_loop(self) -> None:
+        """Get an exception from the queue raised in run_busy_loop.
+           Notify client and wait for handling instructions.
+        """
+        while True:
+            # Exception will be put into the queue if raised in run_busy_loop
+            exception = self.exception_signal_q.get()
+            logger.warning(
+                "[EngineCoreGuard_%s] Received an error signal: %s",
+                self.engine_index,
+                type(exception).__name__,
+            )
+            # Notify the client about the exception and wait for instructions
+            self.notify_client_exception(exception=exception)
+            raw_instr = self.wait_for_client_instruction()
+            try:
+                method, params = parse_method_json(raw_instr)
+            except Exception as e:
+                # If parsing fails, re-insert the exception into the queue
+                self.exception_signal_q.put(e)
+                self.notify_client_execution_result(
+                    False,
+                    reason='Instruction parsing failed'
+                )
+                continue
+
+            try:
+                # Run the corresponding handler method dynamically
+                run_method(self, method, args=(), kwargs=params)
+                logger.info(
+                    "[EngineCoreGuard_%s] Method executed: %s",
+                    self.engine_index,
+                    method,
+                )
+                self.notify_client_execution_result(success=True)
+            except NotImplementedError:
+                unknown_error = RuntimeError(f"Unknown instruction: {method}")
+                logger.error(
+                    "[EngineCoreGuard_%s] Unknown instruction: %s",
+                    self.engine_index,
+                    method,
+                )
+                self.exception_signal_q.put(unknown_error)
+                self.notify_client_execution_result(
+                    False,
+                    reason='Unknown instruction'
+                )
+            except Exception as e:
+                # Catch any other error in execution and re-queue it
+                logger.error(
+                    "[EngineCoreGuard_%s] Error executing method %s: %s",
+                    self.engine_index,
+                    method,
+                    e,
+                )
+                self.exception_signal_q.put(e)
+                self.notify_client_execution_result(
+                    False,
+                    reason='Execution failed'
+                )
+
+    def handle_resume(self) -> None:
+        """
+            Handle the RESUME instruction from the client.
+
+            This instruction tells the EngineCore to continue its busy loop
+            after being suspended due to an exception. No additional fault
+            handling logic is required, so a simple signal is sent to the
+            fault_tolerance_queue to unblock the waiting thread.
+        """
+        # Nothing needs to be done for EngineCore
+        self.fault_tolerance_q.put(None)
+        # Ensure EngineCore has received the instruction
+        self.fault_tolerance_q.join()
+
+    def handle_shutdown(self) -> None:
+        instr = build_method_json(method='shutdown')
+        self.fault_tolerance_q.put(instr)
+
+
+def busy_loop_wrapper_for_fault_tolerance(busy_loop_func):
+    """
+    Wrap the busy loop function to handle exceptions with optional
+    fault tolerance.
+    """
+
+    def wrapper(self):
+        while True:
+            try:
+                busy_loop_func(self)
+            except Exception as e:
+                if self.enable_fault_tolerance:
+                    # Suspend thread when exception occurs, waiting for
+                    # fault tolerance instructions.
+                    # Put exception information into fault signal queue
+                    # to notify EngineCoreGuard.
+                    self.fault_signal_q.put(e)
+                    try:
+                        # Wait for fault tolerance instruction from
+                        # EngineCoreGuard with timeout.
+                        logger.warning(
+                            "EngineCore busy loop raised an exception. "
+                            "Suspended and waiting for fault tolerance "
+                            "instructions."
+                        )
+                        instr_str = self.fault_tolerance_q.get(
+                            timeout=self.fault_tolerance_timeout
+                        )
+                        if instr_str is not None:
+                            method, params = parse_method_json(instr_str)
+                            run_method(self, method, args=(), kwargs=params)
+                        self.fault_tolerance_q.task_done()
+                        continue
+                    except queue.Empty:
+                        # No handling instruction received within predefined
+                        # timeout period. Proceed with original fault handling.
+                        logger.error(
+                            "Fault tolerance instruction not received within "
+                            "timeout. Proceeding with default exception "
+                            "handling."
+                        )
+                        pass
+                # Fault tolerance not enabled OR no instruction received
+                # before timeout. Re-raise the original exception
+                # for upper level handling.
+                raise e
+
+    return wrapper
+
 
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
@@ -468,8 +763,19 @@ class EngineCoreProc(EngineCore):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[Union[tuple[int, EngineCoreOutputs],
                                               bytes]]()
-        executor_fail_callback = lambda: self.input_queue.put_nowait(
-            (EngineCoreRequestType.EXECUTOR_FAILED, b''))
+
+        fh_cfg = vllm_config.fault_tolerance_config
+        self.enable_fault_tolerance = fh_cfg.enable_fault_tolerance
+        if self.enable_fault_tolerance:
+            self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
+            self.fault_tolerance_q: queue.Queue[str | None] = queue.Queue()
+            self.fault_tolerance_timeout = fh_cfg.engine_recovery_timeout
+            executor_fail_callback = lambda: self.fault_signal_q.put(
+                RuntimeError(f'Executor on EngineCore {engine_index} failed')
+            )
+        else:
+            executor_fail_callback = lambda: self.input_queue.put_nowait(
+                (EngineCoreRequestType.EXECUTOR_FAILED, b''))
 
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
@@ -526,6 +832,21 @@ class EngineCoreProc(EngineCore):
                         "Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
+
+        if self.enable_fault_tolerance:
+            # Start a thread to monitor the execution of run_busy_loop,
+            # and perform fault tolerance.
+
+            guard_thread = EngineCoreGuard(
+                engine_index=engine_index,
+                exception_signal_queue=self.fault_signal_q,
+                fault_tolerance_queue=self.fault_tolerance_q,
+                engine_control_addr=addresses.engine_control_addr,
+                engine_fault_report_addr=addresses.engine_fault_report_addr,
+                model_executor=self.model_executor
+            )
+
+            guard_thread.start()
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -717,6 +1038,7 @@ class EngineCoreProc(EngineCore):
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
 
+    @busy_loop_wrapper_for_fault_tolerance
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
 
@@ -940,6 +1262,13 @@ class EngineCoreProc(EngineCore):
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
 
+    def handle_resume(self):
+        pass
+
+    def handle_shutdown(self):
+        self._send_engine_dead()
+        self.shutdown()
+
 
 class DPEngineCoreProc(EngineCoreProc):
     """ZMQ-wrapper for running EngineCore in background process
@@ -1033,6 +1362,7 @@ class DPEngineCoreProc(EngineCoreProc):
             self.output_queue.put_nowait(
                 (-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    @busy_loop_wrapper_for_fault_tolerance
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
 

@@ -724,6 +724,12 @@ class AsyncLLM(EngineClient):
                 custom_stat_loggers=None,
             )
 
+    async def report_runtime_exceptions(self) -> list[str]:
+        return await self.engine_core.get_engine_exception_info_async()
+
+    def handle_resume(self, clear_exceptions: bool, timeout_ms: int) -> bool:
+        return self.engine_core.handle_resume(clear_exceptions, timeout_ms)
+
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.

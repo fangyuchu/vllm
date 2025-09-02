@@ -326,3 +326,14 @@ class EngineClient(ABC):
                              kwargs: Optional[dict] = None):
         """Perform a collective RPC call to the given path."""
         raise NotImplementedError
+
+    async def report_runtime_exceptions(self):
+        """Report all runtime exceptions collected so far."""
+        raise NotImplementedError
+
+    def handle_resume(self, clear_exceptions: bool, timeout_ms: int) -> bool:
+        """Resume execution and optionally clear collected runtime exceptions.
+        This method should be called when the engine is ready to continue
+        after a fault has been detected. Implementations are expected to
+        restore necessary state and safely resume processing."""
+        raise NotImplementedError

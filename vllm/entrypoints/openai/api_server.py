@@ -1119,6 +1119,102 @@ async def is_scaling_elastic_ep(raw_request: Request):
     return JSONResponse({"is_scaling_elastic_ep": _scaling_elastic_ep})
 
 
+# Global variable to track fault recovery state
+_fault_recovery_active = False
+
+class FaultRecoveryMiddleware:
+    """
+    Middleware that checks if the system is performing fault recovery.
+    Returns 503 Service Unavailable if recovery is active. Applies to all
+    HTTP requests and prevents processing during transient recovery.
+    """
+
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    def __call__(self, scope: Scope, receive: Receive,
+                 send: Send) -> Awaitable[None]:
+        if scope["type"] != "http":
+            return self.app(scope, receive, send)
+
+        # Check global scaling state
+        global _fault_recovery_active
+        if _fault_recovery_active:
+            # Return 503 Service Unavailable response
+            response = JSONResponse(
+                content={
+                    "error": "System is performing fault recovery. "
+                             "Please try again later."
+                },
+                status_code=503
+            )
+            return response(scope, receive, send)
+
+        return self.app(scope, receive, send)
+
+
+@router.post("/fault_tolerance/is_fault_recovery")
+async def is_fault_recovery(raw_request: Request):
+    return JSONResponse({"is_fault_recovery": _fault_recovery_active})
+
+
+@router.get("/fault_tolerance/report_runtime_exceptions", response_class=Response)
+async def report_runtime_exceptions(raw_request: Request) -> Response:
+    """Report all runtime exceptions collected so far."""
+    exceptions = await engine_client(raw_request).report_runtime_exceptions()
+    return JSONResponse(
+        content=exceptions
+    )
+
+
+@router.post("/fault_tolerance/resume")
+async def resume(raw_request: Request):
+    global _fault_recovery_active
+    _fault_recovery_active = True
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400,
+                            detail="Invalid JSON format") from e
+
+    # Strict parameter validation
+    allowed_keys = {"clear_exceptions"}  # Only this parameter is allowed
+    received_keys = set(body.keys())
+
+    # Check for disallowed parameters
+    if not received_keys.issubset(allowed_keys):
+        invalid_keys = received_keys - allowed_keys
+        # Return 400 with list of invalid parameters
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid parameters: {', '.join(invalid_keys)}")
+
+    # Parameter type validation
+    clear_exceptions: bool = body.get("clear_exceptions", True)
+    timeout_ms: bool = body.get('timeout_ms', 2000) #default 2 seconds
+    if not isinstance(clear_exceptions, bool):
+        raise HTTPException(status_code=400,
+                            detail="clear_exceptions must be a boolean")
+
+    # Get client instance and execute resume operation
+    client = engine_client(raw_request)
+    success = False
+    try:
+        success = client.handle_resume(clear_exceptions, timeout_ms)
+    except Exception as e:
+        logger.error("Resume failed: %s", e)
+
+    _fault_recovery_active = False
+    if success:
+        return JSONResponse({
+            "message":f"Execution resumed. Current runtime exceptions cleared."
+        })
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to resume execution"
+        )
+
 # TODO: RequestType = TypeForm[BaseModel] when recognized by type checkers
 # (requires typing_extensions >= 4.13)
 RequestType = Any
@@ -1543,6 +1639,9 @@ def build_app(args: Namespace) -> FastAPI:
 
     # Add scaling middleware to check for scaling state
     app.add_middleware(ScalingMiddleware)
+
+    # Add middleware to check if the system is performing fault recovery
+    app.add_middleware(FaultRecoveryMiddleware)
 
     if envs.VLLM_DEBUG_LOG_API_SERVER_RESPONSE:
         logger.warning("CAUTION: Enabling log response in the API Server. "

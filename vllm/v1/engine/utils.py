@@ -62,6 +62,10 @@ class EngineZmqAddresses:
     # Not used by engine, just relayed to front-end in handshake response.
     # Only required for external DP LB case.
     frontend_stats_publish_address: Optional[str] = None
+    # ZMQ socket for front-end to communicate with EngineCoreGuard.
+    # Enables fault tolerance between the front-end and engine core.
+    engine_control_addr: Optional[str] = None
+    engine_fault_report_addr: Optional[str] = None
 
 
 @dataclass
@@ -652,6 +656,12 @@ def launch_core_engines(
                     coordinator.proc.pid)
     else:
         coordinator = None
+
+    if vllm_config.fault_tolerance_config.enable_fault_tolerance is True:
+        addresses.engine_control_addr = get_engine_client_zmq_addr(
+            local_only=client_local_only, host=host)
+        addresses.engine_fault_report_addr = get_engine_client_zmq_addr(
+            local_only=client_local_only, host=host)
 
     if parallel_config.data_parallel_backend == "ray":
         logger.info("Starting ray-based data parallel backend")
