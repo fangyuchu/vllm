@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from __future__ import annotations
-
 import json
 import os
 import queue
@@ -25,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.cache import receiver_cache_from_config
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
@@ -42,9 +41,9 @@ from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType,
                             ReconfigureDistributedRequest, ReconfigureRankType,
                             UtilityOutput, UtilityResult)
+from vllm.v1.engine.utils import (EngineHandshakeMetadata, EngineZmqAddresses,
+                                  get_device_indices)
 from vllm.v1.engine.exceptions import ExceptionInfo
-from vllm.v1.engine.mm_input_cache import MultiModalInputCacheServer
-from vllm.v1.engine.utils import EngineHandshakeMetadata, EngineZmqAddresses
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
@@ -53,7 +52,6 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
-
 
 logger = init_logger(__name__)
 
@@ -134,20 +132,21 @@ class EngineCore:
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
 
-        self.mm_input_cache_server = MultiModalInputCacheServer(
-            vllm_config.model_config, MULTIMODAL_REGISTRY)
+        self.mm_registry = mm_registry = MULTIMODAL_REGISTRY
+        self.mm_receiver_cache = receiver_cache_from_config(
+            vllm_config, mm_registry)
 
         # Setup batch queue for pipeline parallelism.
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
-                                                     SchedulerOutput]]] = None
+        self.batch_queue: Optional[deque[tuple[Future[ModelRunnerOutput],
+                                               SchedulerOutput]]] = None
         if self.batch_queue_size > 1:
             logger.info("Batch queue is enabled with size %d",
                         self.batch_queue_size)
-            self.batch_queue = queue.Queue(self.batch_queue_size)
+            self.batch_queue = deque(maxlen=self.batch_queue_size)
 
         self.request_block_hasher: Optional[Callable[[Request],
                                                      list[BlockHash]]] = None
@@ -323,41 +322,43 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
-        assert self.batch_queue is not None
+        batch_queue = self.batch_queue
+        assert batch_queue is not None
 
-        engine_core_outputs = None
-        scheduler_output = None
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
-        if not self.batch_queue.full():
+        assert len(batch_queue) < self.batch_queue_size
+
+        model_executed = False
+        if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            if scheduler_output.total_num_scheduled_tokens > 0:
-                future = self.model_executor.execute_model(scheduler_output)
-                self.batch_queue.put_nowait(
-                    (future, scheduler_output))  # type: ignore
+            future = self.model_executor.execute_model(scheduler_output)
+            batch_queue.appendleft(
+                (future, scheduler_output))  # type: ignore[arg-type]
 
-        scheduled_batch = (scheduler_output is not None
-                           and scheduler_output.total_num_scheduled_tokens > 0)
+            model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if model_executed and len(batch_queue) < self.batch_queue_size \
+                and not batch_queue[-1][0].done():
+                # Don't block on next worker response unless the queue is full
+                # or there are no more requests to schedule.
+                return None, True
 
-        # If no more requests can be scheduled and the job queue is not empty,
-        # block until the first batch in the job queue is finished.
-        # TODO(comaniac): Ideally we should peek the first batch in the
-        # job queue to check if it's finished before scheduling a new batch,
-        # but peeking the first element in a queue is not thread-safe,
-        # so we need more work.
-        if not scheduled_batch and not self.batch_queue.empty():
-            future, scheduler_output = self.batch_queue.get_nowait()
+        elif not batch_queue:
+            # Queue is empty. We should not reach here since this method should
+            # only be called when the scheduler contains requests or the queue
+            # is non-empty.
+            return None, False
 
-            # Blocking until the first result is available.
-            model_output = self.execute_model_with_error_logging(
-                lambda _: future.result(), scheduler_output)
+        # Block until the next result is available.
+        future, scheduler_output = batch_queue.pop()
+        model_output = self.execute_model_with_error_logging(
+            lambda _: future.result(), scheduler_output)
 
-            self.batch_queue.task_done()
-            engine_core_outputs = (self.scheduler.update_from_output(
-                scheduler_output, model_output))
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output)
 
-        return engine_core_outputs, scheduled_batch
+        return engine_core_outputs, model_executed
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
@@ -376,7 +377,8 @@ class EngineCore:
             logger.warning("Resetting the multi-modal cache when requests are "
                            "in progress may lead to desynced internal caches.")
 
-        self.mm_input_cache_server.reset()
+        if self.mm_receiver_cache is not None:
+            self.mm_receiver_cache.clear_cache()
 
     def reset_prefix_cache(self):
         self.scheduler.reset_prefix_cache()
@@ -391,7 +393,7 @@ class EngineCore:
         return self.model_executor.is_sleeping
 
     def execute_dummy_batch(self):
-        self.model_executor.collective_rpc("execute_dummy_batch")
+        self.model_executor.execute_dummy_batch()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)
@@ -437,14 +439,13 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
-        if request.mm_hashes is not None:
-            assert request.mm_kwargs is not None
-
-            # Note on thread safety: no race condition.
-            # `mm_input_cache_server` is reset at the end of LLMEngine init,
-            # and will only accessed in the input processing thread afterwards.
-            request.mm_kwargs = self.mm_input_cache_server.get_and_update(
-                request.mm_kwargs, request.mm_hashes)
+        # Note on thread safety: no race condition.
+        # `mm_receiver_cache` is reset at the end of LLMEngine init,
+        # and will only accessed in the input processing thread afterwards.
+        if self.mm_receiver_cache is not None and request.mm_features:
+            request.mm_features = (
+                self.mm_receiver_cache.get_and_update_features(
+                    request.mm_features))
 
         req = Request.from_engine_core_request(request,
                                                self.request_block_hasher)
@@ -858,8 +859,6 @@ class EngineCoreProc(EngineCore):
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
 
-
-
     @contextmanager
     def _perform_handshakes(
         self,
@@ -1060,7 +1059,8 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
-        while not self.engines_running and not self.scheduler.has_requests():
+        while not self.engines_running and not self.scheduler.has_requests() \
+                and not self.batch_queue:
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
@@ -1371,6 +1371,7 @@ class DPEngineCoreProc(EngineCoreProc):
     @busy_loop_wrapper_for_fault_tolerance
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
+
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
@@ -1502,22 +1503,30 @@ class DPEngineCoreActor(DPEngineCoreProc):
         # https://github.com/ray-project/ray/pull/40461/files#diff-31e8159767361e4bc259b6d9883d9c0d5e5db780fcea4a52ead4ee3ee4a59a78R1860 # noqa: E501
         # and get_accelerator_ids_for_accelerator_resource() in worker.py
         # of ray.
-        self._set_cuda_visible_devices(vllm_config, local_dp_rank)
+        self._set_visible_devices(vllm_config, local_dp_rank)
 
         super().__init__(vllm_config, local_client, "", executor_class,
                          log_stats)
 
-    def _set_cuda_visible_devices(self, vllm_config: VllmConfig,
-                                  local_dp_rank: int):
+    def _set_visible_devices(self, vllm_config: VllmConfig,
+                             local_dp_rank: int):
         from vllm.platforms import current_platform
-        device_control_env_var = current_platform.device_control_env_var
+        if current_platform.is_xpu():
+            pass
+        else:
+            device_control_env_var = current_platform.device_control_env_var
+            self._set_cuda_visible_devices(vllm_config, local_dp_rank,
+                                           device_control_env_var)
+
+    def _set_cuda_visible_devices(self, vllm_config: VllmConfig,
+                                  local_dp_rank: int,
+                                  device_control_env_var: str):
         world_size = vllm_config.parallel_config.world_size
         # Set CUDA_VISIBLE_DEVICES or equivalent.
         try:
-            os.environ[device_control_env_var] = ",".join(
-                str(current_platform.device_id_to_physical_device_id(i))
-                for i in range(local_dp_rank *
-                               world_size, (local_dp_rank + 1) * world_size))
+            value = get_device_indices(device_control_env_var, local_dp_rank,
+                                       world_size)
+            os.environ[device_control_env_var] = value
         except IndexError as e:
             raise Exception(
                 f"Error setting {device_control_env_var}: "
