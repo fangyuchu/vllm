@@ -939,10 +939,12 @@ class EngineArgs:
             title="FaultToleranceConfig",
             description=FaultToleranceConfig.__doc__,
         )
-        fault_tolerance_group.add_argument("--enable-fault-tolerance",
-                                **fault_tolerance_kwargs["enable_fault_tolerance"])
-        fault_tolerance_group.add_argument("--engine-recovery-timeout",
-                                **fault_tolerance_kwargs["engine_recovery_timeout"])
+        fault_tolerance_group.add_argument(
+            "--enable-fault-tolerance",
+            **fault_tolerance_kwargs["enable_fault_tolerance"])
+        fault_tolerance_group.add_argument(
+            "--engine-recovery-timeout",
+            **fault_tolerance_kwargs["engine_recovery_timeout"])
 
         # Other arguments
         parser.add_argument('--disable-log-stats',

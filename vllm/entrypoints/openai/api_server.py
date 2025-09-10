@@ -1122,13 +1122,13 @@ async def is_scaling_elastic_ep(raw_request: Request):
 # Global variable to track fault recovery state
 _fault_recovery_active = False
 
+
 class FaultRecoveryMiddleware:
     """
     Middleware that checks if the system is performing fault recovery.
     Returns 503 Service Unavailable if recovery is active. Applies to all
     HTTP requests and prevents processing during transient recovery.
     """
-
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -1142,13 +1142,12 @@ class FaultRecoveryMiddleware:
         global _fault_recovery_active
         if _fault_recovery_active:
             # Return 503 Service Unavailable response
-            response = JSONResponse(
-                content={
-                    "error": "System is performing fault recovery. "
-                             "Please try again later."
-                },
-                status_code=503
-            )
+            response = JSONResponse(content={
+                "error":
+                "System is performing fault recovery. "
+                "Please try again later."
+            },
+                                    status_code=503)
             return response(scope, receive, send)
 
         return self.app(scope, receive, send)
@@ -1159,13 +1158,12 @@ async def is_fault_recovery(raw_request: Request):
     return JSONResponse({"is_fault_recovery": _fault_recovery_active})
 
 
-@router.get("/fault_tolerance/report_runtime_exceptions", response_class=Response)
+@router.get("/fault_tolerance/report_runtime_exceptions",
+            response_class=Response)
 async def report_runtime_exceptions(raw_request: Request) -> Response:
     """Report all runtime exceptions collected so far."""
     exceptions = await engine_client(raw_request).report_runtime_exceptions()
-    return JSONResponse(
-        content=exceptions
-    )
+    return JSONResponse(content=exceptions)
 
 
 @router.post("/fault_tolerance/resume")
@@ -1186,12 +1184,13 @@ async def resume(raw_request: Request):
     if not received_keys.issubset(allowed_keys):
         invalid_keys = received_keys - allowed_keys
         # Return 400 with list of invalid parameters
-        raise HTTPException(status_code=400,
-                            detail=f"Invalid parameters: {', '.join(invalid_keys)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid parameters: {', '.join(invalid_keys)}")
 
     # Parameter type validation
     clear_exceptions: bool = body.get("clear_exceptions", True)
-    timeout_ms: bool = body.get('timeout_ms', 2000) #default 2 seconds
+    timeout_ms: bool = body.get('timeout_ms', 2000)  #default 2 seconds
     if not isinstance(clear_exceptions, bool):
         raise HTTPException(status_code=400,
                             detail="clear_exceptions must be a boolean")
@@ -1207,13 +1206,13 @@ async def resume(raw_request: Request):
     _fault_recovery_active = False
     if success:
         return JSONResponse({
-            "message":f"Execution resumed. Current runtime exceptions cleared."
+            "message":
+            "Execution resumed. Current runtime exceptions cleared."
         })
     else:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to resume execution"
-        )
+        raise HTTPException(status_code=500,
+                            detail="Failed to resume execution")
+
 
 # TODO: RequestType = TypeForm[BaseModel] when recognized by type checkers
 # (requires typing_extensions >= 4.13)

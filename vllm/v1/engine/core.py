@@ -476,16 +476,12 @@ def get_socket_identity(peer1: str,
     if valid_peers is not None:
         if peer1 not in valid_peers:
             raise ValueError(
-                f"Invalid peer1: {peer1}, must be one of {valid_peers}"
-            )
+                f"Invalid peer1: {peer1}, must be one of {valid_peers}")
         if peer2 not in valid_peers:
             raise ValueError(
-                f"Invalid peer2: {peer2}, must be one of {valid_peers}"
-            )
+                f"Invalid peer2: {peer2}, must be one of {valid_peers}")
     if use not in valid_use:
-        raise ValueError(
-            f"Invalid use: {use}, must be one of {valid_use}"
-        )
+        raise ValueError(f"Invalid use: {use}, must be one of {valid_use}")
 
     # Apply optional indices
     peer1_part = f"{peer1}-{peer1_index}" if peer1_index is not None else peer1
@@ -543,16 +539,14 @@ class EngineCoreGuard(threading.Thread):  # changed
     def notify_client_exception(
             self,
             exception: Exception,
-            additional_info: Optional[dict] = None
-    ) -> bool:
+            additional_info: Optional[dict] = None) -> bool:
         """ Informs the client that an exception was raised in run_busy_loop.
         """
         try:
             exception_info = ExceptionInfo.from_exception(
                 exception=exception,
                 engine_id=str(self.engine_index),
-                additional_info=additional_info
-            )
+                additional_info=additional_info)
             self.fault_report_socket.send_string(exception_info.to_json())
             return True
         except Exception as e:
@@ -631,6 +625,7 @@ class EngineCoreGuard(threading.Thread):  # changed
             self.notify_client_exception(exception=exception)
             raw_instr = self.wait_for_client_instruction()
             try:
+                raw_instr = self.wait_for_client_instruction()
                 method, params = parse_method_json(raw_instr)
             except Exception as e:
                 # If parsing fails, re-insert the exception into the queue
@@ -659,9 +654,7 @@ class EngineCoreGuard(threading.Thread):  # changed
                 )
                 self.exception_signal_q.put(unknown_error)
                 self.notify_client_execution_result(
-                    False,
-                    reason='Unknown instruction'
-                )
+                    False, reason='Unknown instruction')
             except Exception as e:
                 # Catch any other error in execution and re-queue it
                 logger.error(
@@ -833,18 +826,19 @@ class EngineCoreProc(EngineCore):
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
 
-        if self.enable_fault_tolerance:
-            # Start a thread to monitor the execution of run_busy_loop,
-            # and perform fault tolerance.
 
-            guard_thread = EngineCoreGuard(
-                engine_index=engine_index,
-                exception_signal_queue=self.fault_signal_q,
-                fault_tolerance_queue=self.fault_tolerance_q,
-                engine_control_addr=addresses.engine_control_addr,
-                engine_fault_report_addr=addresses.engine_fault_report_addr,
-                model_executor=self.model_executor
-            )
+            if self.enable_fault_tolerance:
+                # Start a thread to monitor the execution of run_busy_loop,
+                # and perform fault tolerance.
+
+                guard_thread = EngineCoreGuard(
+                    engine_index=engine_index,
+                    exception_signal_queue=self.fault_signal_q,
+                    fault_tolerance_queue=self.fault_tolerance_q,
+                    engine_control_addr=addresses.engine_control_addr,
+                    engine_fault_report_addr=addresses.engine_fault_report_addr,
+                    model_executor=self.model_executor
+                )
 
             guard_thread.start()
 
