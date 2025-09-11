@@ -698,6 +698,8 @@ def busy_loop_wrapper_for_fault_tolerance(busy_loop_func):
         while True:
             try:
                 busy_loop_func(self)
+            except SystemExit:
+                raise
             except Exception as e:
                 if self.enable_fault_tolerance:
                     # Suspend thread when exception occurs, waiting for
