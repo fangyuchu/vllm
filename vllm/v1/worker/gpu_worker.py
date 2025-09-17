@@ -631,7 +631,7 @@ class Worker(WorkerBase):
         from vllm.config import set_current_vllm_config
         from vllm.distributed.parallel_state import (
             cleanup_dist_env_and_memory, get_ep_group)
-
+        # todo Compatible failure scenarios
         old_ep_size = get_ep_group().world_size
         old_ep_rank = get_ep_group().rank
         new_ep_size = reconfig_request.new_data_parallel_size * get_tp_group(
