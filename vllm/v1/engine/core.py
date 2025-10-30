@@ -28,7 +28,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import engine_receiver_cache_from_config
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
-from vllm.utils import run_method
 from vllm.utils.gc_utils import maybe_attach_gc_debug_callback
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -68,6 +67,7 @@ from vllm.v1.serial_utils import (
     MsgpackDecoder,
     MsgpackEncoder,
     deserialize_method_call,
+    run_method,
     serialize_method_call,
 )
 from vllm.v1.structured_output import StructuredOutputManager
@@ -130,6 +130,7 @@ class EngineCoreGuard(threading.Thread):  # changed
             self.ctx, worker_cmd_addr, zmq.ROUTER, bind=True
         )
         self.poller = zmq.Poller()
+        self.communicator_aborted = False
 
     def run(self) -> None:
         """
@@ -140,11 +141,18 @@ class EngineCoreGuard(threading.Thread):  # changed
             # Check for engine fault signals
             try:
                 engine_exception = self.fault_signal_q.get_nowait()
-                logger.warning(
-                    "[EngineCoreGuard] Detected exception",
-                    engine_exception,
-                )
-                self._report_client_exception(engine_exception)
+                if isinstance(engine_exception, EngineLoopPausedError):
+                    # The busy loop stopped due to another critical exception,
+                    # put it back
+                    logger.info(
+                        "[EngineCoreGuard] Engine paused",
+                    )
+                else:
+                    logger.error(
+                        "[EngineCoreGuard] Detected exception.",
+                        engine_exception,
+                    )
+                    self._report_client_exception(engine_exception)
             except queue.Empty:
                 pass
 
@@ -175,7 +183,6 @@ class EngineCoreGuard(threading.Thread):  # changed
             else:
                 raise TypeError("Non-serialized messages must be str or bytes")
 
-            # DEALER 协议格式：[empty frame, message content]
             src_socket.send_multipart([b"", msg_bytes])
             logger.debug("Sent message via %s: %s", src_socket, msg)
             return True, None
@@ -233,15 +240,24 @@ class EngineCoreGuard(threading.Thread):  # changed
             logger.error("Unexpected error occurred while receiving message: %s", e)
             return (False, None)
 
-    def _stop_worker_execution(self):
+    def _stop_worker_execution(self, soft_pause: bool):
+        if soft_pause:
+            pause_method = "pause_by_signal"
+        else:
+            pause_method = "pause_by_abort_communicators"
+            self.communicator_aborted = True
+
+        self._send_cmd_to_worker(pause_method)
+
+    def _send_cmd_to_worker(self, method_name, **kwargs):
         for tp_rank in range(self.tp_size):
             for pp_rank in range(self.pp_size):
                 identity = f"{tp_rank}_{pp_rank}".encode()
-                kwargs: dict[str, Any] = {}
-                serialized_stop_worker = serialize_method_call("pause", **kwargs)
+                method_json = serialize_method_call(method_name, **kwargs)
                 self.worker_cmd_socket.send_multipart(
-                    [identity, b"", serialized_stop_worker.encode("utf-8")]
+                    [identity, b"", method_json.encode("utf-8")]
                 )
+        # todo: need to recv results from worker after it sends back the result
 
     def _report_client_exception(self, exception: Exception) -> None:
         msg = FaultInfo.from_exception(exception, self.engine_index).serialize()
@@ -255,7 +271,7 @@ class EngineCoreGuard(threading.Thread):  # changed
         logger.info("[EngineCoreGuard] Executing command: %s", method)
         try:
             success = run_method(self, method, args=(), kwargs=method_params)
-            logger.info("[EngineCoreGuard] Command succeeded: %s", success)
+            logger.info("[EngineCoreGuard] Command (%s) succeeded: %s", method, success)
 
         except Exception as e:
             logger.error(
@@ -267,11 +283,13 @@ class EngineCoreGuard(threading.Thread):  # changed
 
         self._send_execution_result(success)
 
-    def pause(self, timeout: int = 1) -> bool:
+    def pause(self, timeout: int = 1, soft_pause: bool = True) -> bool:
         """
         Pause the busy loop safely.
         Args:
             timeout:wait for the busy loop to acknowledge the pause signal
+            soft_pause: if True, perform a soft pause using a flag; otherwise
+            abort the communicator
         """
         logger.info("[EngineCoreGuard] Start pausing EngineCore")
         if self.busy_loop_active.is_set():
@@ -280,14 +298,11 @@ class EngineCoreGuard(threading.Thread):  # changed
             # Put a sentinel (empty request) to unblock the busy loop
             # if it's blocked on input_queue.get()
             self.engine_input_q.put(None)
-            self._stop_worker_execution()
+            self._stop_worker_execution(soft_pause=soft_pause)
             try:
                 # Wait for engine to acknowledge the pause via fault_signal_q
                 exception = self.fault_signal_q.get(timeout=timeout)
-                if not isinstance(exception, EngineLoopPausedError):
-                    # The busy loop stopped due to another critical exception,
-                    # put it back
-                    self.fault_signal_q.put(exception)
+                self.fault_signal_q.put(exception)
                 success = True
             except queue.Empty:
                 # Timeout waiting for pause acknowledgment
@@ -305,6 +320,8 @@ class EngineCoreGuard(threading.Thread):  # changed
         handling logic is required, so a simple signal is sent to the
         fault_tolerance_queue to unblock the waiting thread.
         """
+        self._send_cmd_to_worker("restart_worker")
+
         # Nothing needs to be done for EngineCore
         self.cmd_q.put(None)
         # Ensure busy loop has been recovered.

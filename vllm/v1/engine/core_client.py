@@ -26,7 +26,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
-from vllm.utils import run_method
 from vllm.utils.async_utils import in_loop
 from vllm.utils.collection_utils import ThreadSafeDict
 from vllm.utils.network_utils import (
@@ -54,7 +53,7 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr, run_method
 
 logger = init_logger(__name__)
 
@@ -391,7 +390,7 @@ class ClientGuard:
             target=self.fault_receiver, daemon=True, name="EngineCoreFaultReceiver"
         ).start()
 
-    async def handle_fault(self, instruction: str, timeout: int) -> bool:
+    async def handle_fault(self, instruction: str, timeout: int, **kwargs) -> bool:
         """
         Executes fault tolerance measures based on the fault tolerance instructions
          received from the api_server.
@@ -402,7 +401,10 @@ class ClientGuard:
         of the relevant components.
         """
         return await run_method(
-            self.fault_handler, "handle_fault", args=(instruction, timeout), kwargs={}
+            self.fault_handler,
+            "handle_fault",
+            args=(instruction, timeout),
+            kwargs=kwargs,
         )
 
     def fault_receiver(self):
@@ -436,7 +438,7 @@ class ClientGuard:
             # Pause will be invoked again during fault-tolerance handling,
             # so it's unnecessary to track whether all engines are currently
             # paused.
-            asyncio.run(self.handle_fault("pause", 1))
+            asyncio.run(self.handle_fault("pause", 2, soft_pause=True))
 
     def shutdown_guard(self):
         self.client_guard_dead = True
@@ -833,9 +835,9 @@ class MPClient(EngineCoreClient):
             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
         ).start()
 
-    async def handle_fault(self, instruction: str, timeout: int) -> bool:
+    async def handle_fault(self, instruction: str, timeout: int, **kwargs) -> bool:
         """handle fault of current instance by instruction"""
-        return await self.client_guard.handle_fault(instruction, timeout)
+        return await self.client_guard.handle_fault(instruction, timeout, **kwargs)
 
     async def fault_reporter(self):
         return self.engine_status_dict.to_dict()
