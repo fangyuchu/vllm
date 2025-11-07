@@ -41,6 +41,7 @@ from vllm.config import (
     DeviceConfig,
     ECTransferConfig,
     EPLBConfig,
+    FaultToleranceConfig,
     KVEventsConfig,
     KVTransferConfig,
     LoadConfig,
@@ -570,6 +571,13 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
+
+    # fault tolerance fields
+    enable_fault_tolerance: bool = FaultToleranceConfig.enable_fault_tolerance
+    engine_recovery_timeout: int = FaultToleranceConfig.engine_recovery_timeout
+    internal_fault_report_port: int = FaultToleranceConfig.internal_fault_report_port
+    external_fault_notify_port: int = FaultToleranceConfig.external_fault_notify_port
+    gloo_comm_timeout: int = FaultToleranceConfig.gloo_comm_timeout
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend | None = (
@@ -1159,6 +1167,33 @@ class EngineArgs:
             "--optimization-level", **vllm_kwargs["optimization_level"]
         )
 
+        # fault tolerance arguments
+        fault_tolerance_kwargs = get_kwargs(FaultToleranceConfig)
+        fault_tolerance_group = parser.add_argument_group(
+            title="FaultToleranceConfig",
+            description=FaultToleranceConfig.__doc__,
+        )
+        fault_tolerance_group.add_argument(
+            "--enable-fault-tolerance",
+            **fault_tolerance_kwargs["enable_fault_tolerance"],
+        )
+        fault_tolerance_group.add_argument(
+            "--engine-recovery-timeout",
+            **fault_tolerance_kwargs["engine_recovery_timeout"],
+        )
+        fault_tolerance_group.add_argument(
+            "--internal-fault-report-port",
+            **fault_tolerance_kwargs["internal_fault_report_port"],
+        )
+        fault_tolerance_group.add_argument(
+            "--external-fault-notify-port",
+            **fault_tolerance_kwargs["external_fault_notify_port"],
+        )
+        fault_tolerance_group.add_argument(
+            "--gloo-comm-timeout",
+            **fault_tolerance_kwargs["gloo_comm_timeout"],
+        )
+
         # Other arguments
         parser.add_argument(
             "--disable-log-stats",
@@ -1697,6 +1732,16 @@ class EngineArgs:
             enable_mfu_metrics=self.enable_mfu_metrics,
         )
 
+        fault_tolerance_config = FaultToleranceConfig(
+            enable_fault_tolerance=self.enable_fault_tolerance,
+            engine_recovery_timeout=self.engine_recovery_timeout,
+            internal_fault_report_port=self.internal_fault_report_port
+            or FaultToleranceConfig.internal_fault_report_port,
+            external_fault_notify_port=self.external_fault_notify_port
+            or FaultToleranceConfig.external_fault_notify_port,
+            gloo_comm_timeout=self.gloo_comm_timeout,
+        )
+
         # Compilation config overrides
         compilation_config = copy.deepcopy(self.compilation_config)
         if self.cudagraph_capture_sizes is not None:
@@ -1732,6 +1777,7 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             ec_transfer_config=self.ec_transfer_config,
             profiler_config=self.profiler_config,
+            fault_tolerance_config=fault_tolerance_config,
             additional_config=self.additional_config,
             optimization_level=self.optimization_level,
         )
