@@ -196,7 +196,6 @@ async def test_handle_fault_async():
 
     def receive_cmd(cmd_socket):
         nonlocal uuid
-        time.sleep(0.1)
 
         identity, msg = cmd_socket.recv_multipart()
         cmd_dict = json.loads(msg.decode("utf-8"))
