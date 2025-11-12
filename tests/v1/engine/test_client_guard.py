@@ -219,4 +219,5 @@ async def test_handle_fault_async():
     assert result is True
     assert engine_status_dict[0] == "Healthy"
 
+    cmd_socket.close()
     guard.shutdown_guard()
