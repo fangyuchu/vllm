@@ -79,7 +79,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
-class WorkerGuard:
+class WorkerSentinel:
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -105,16 +105,16 @@ class WorkerGuard:
             bind=False,
             identity=identity,
         )
-        self.worker_guard_dead = False
+        self.worker_sentinel_dead = False
         self.pause_event = pause_event
         self.communicator_aborted = False
         self.logger = self._make_worker_logger()
         threading.Thread(
-            target=self.run, daemon=True, name="WorkerGuardCmdReceiver"
+            target=self.run, daemon=True, name="WorkerSentinelCmdReceiver"
         ).start()
 
     def _make_worker_logger(self):
-        prefix = f"[WorkerGuard_dp{self.dp_rank}_pp{self.pp_rank}_tp{self.tp_rank}] "
+        prefix = f"[WorkerSentinel_dp{self.dp_rank}_pp{self.pp_rank}_tp{self.tp_rank}] "
 
         def log(msg, *args, level="info", **kwargs):
             """
@@ -128,7 +128,7 @@ class WorkerGuard:
     def run(self):
         """Run the message receiving loop and handle control commands"""
         torch.cuda.set_device(self.device)
-        while not self.worker_guard_dead:
+        while not self.worker_sentinel_dead:
             try:
                 # Use blocking receive - will wait until a message arrives
                 has_msg, _, cmd_str = recv_router_dealer_message(self.cmd_socket)
@@ -154,7 +154,7 @@ class WorkerGuard:
                 # Socket was closed, exit loop.
                 self.logger("Command socket closed, stopping thread.", level="info")
                 break
-        self.logger("Worker guard thread has stopped.")
+        self.logger("Worker sentinel thread has stopped.")
 
     def pause_by_signal(self):
         self._set_device_communicator_status(False)
@@ -247,7 +247,7 @@ class WorkerGuard:
         self.cmd_socket.send_multipart([b"", msg_bytes])
 
     def shutdown(self):
-        self.worker_guard_dead = True
+        self.worker_sentinel_dead = True
         self.cmd_socket.close()
         self.zmq_ctx.term()
 
@@ -273,7 +273,7 @@ class Worker(WorkerBase):
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.backends.cuda.matmul.fp32_precision = precision
 
-        self.worker_guard: WorkerGuard | None = None
+        self.worker_sentinel: WorkerSentinel | None = None
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils.import_utils import init_cached_hf_modules
@@ -473,7 +473,7 @@ class Worker(WorkerBase):
                 for req_id in list(cached_req_ids):
                     input_batch.remove_request(req_id)
 
-            self.worker_guard = WorkerGuard(
+            self.worker_sentinel = WorkerSentinel(
                 self.vllm_config,
                 self.model_runner.pause_event,
                 init_distributed_env_callback,
@@ -1126,8 +1126,8 @@ class Worker(WorkerBase):
             runner.ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
-        if self.worker_guard is not None:
-            self.worker_guard.shutdown()
+        if self.worker_sentinel is not None:
+            self.worker_sentinel.shutdown()
 
 
 def init_worker_distributed_environment(
