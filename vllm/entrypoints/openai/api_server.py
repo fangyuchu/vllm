@@ -260,6 +260,20 @@ async def validate_json_request(raw_request: Request):
         )
 
 
+async def check_engine_fault(raw_request: Request):
+    client = engine_client(raw_request)
+    assert hasattr(client, "engine_core")
+    core_client = client.engine_core
+    if (
+        hasattr(core_client, "client_sentinel")
+        and core_client.client_sentinel.is_faulted.is_set()
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Service is in faulted state, cannot process requests.",
+        )
+
+
 router = APIRouter()
 
 
@@ -388,7 +402,7 @@ async def get_server_load_metrics(request: Request):
 
 @router.post(
     "/tokenize",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
@@ -423,7 +437,7 @@ async def tokenize(request: TokenizeRequest, raw_request: Request):
 
 @router.post(
     "/detokenize",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
@@ -498,7 +512,7 @@ async def _convert_stream_to_sse_events(
 
 @router.post(
     "/v1/responses",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -591,7 +605,7 @@ async def cancel_responses(response_id: str, raw_request: Request):
 
 @router.post(
     "/v1/messages",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": AnthropicErrorResponse},
@@ -647,7 +661,7 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques
 
 @router.post(
     "/v1/chat/completions",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -688,7 +702,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
 @router.post(
     "/v1/completions",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -734,7 +748,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
 @router.post(
     "/v1/embeddings",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -777,7 +791,7 @@ async def create_embedding(
 
 @router.post(
     "/pooling",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -813,7 +827,10 @@ async def create_pooling(request: PoolingRequest, raw_request: Request):
     assert_never(generator)
 
 
-@router.post("/classify", dependencies=[Depends(validate_json_request)])
+@router.post(
+    "/classify",
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
+)
 @with_cancellation
 @load_aware_call
 async def create_classify(request: ClassificationRequest, raw_request: Request):
@@ -842,7 +859,7 @@ async def create_classify(request: ClassificationRequest, raw_request: Request):
 
 @router.post(
     "/score",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -875,7 +892,7 @@ async def create_score(request: ScoreRequest, raw_request: Request):
 
 @router.post(
     "/v1/score",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -972,7 +989,7 @@ async def create_translations(
 
 @router.post(
     "/rerank",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -1004,7 +1021,7 @@ async def do_rerank(request: RerankRequest, raw_request: Request):
 
 @router.post(
     "/v1/rerank",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -1023,7 +1040,7 @@ async def do_rerank_v1(request: RerankRequest, raw_request: Request):
 
 @router.post(
     "/v2/rerank",
-    dependencies=[Depends(validate_json_request)],
+    dependencies=[Depends(validate_json_request), Depends(check_engine_fault)],
     responses={
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -1300,8 +1317,8 @@ async def get_fault_info(
     raw_request: Request,
 ):
     client = engine_client(raw_request)
-    engine_exception_dict = await client.exception_reporter()
-    return JSONResponse(content=engine_exception_dict)
+    engine_status_dict = await client.get_fault_info()
+    return JSONResponse(content=engine_status_dict)
 
 
 # NOTE: Construct the TypeAdapters only once
