@@ -6,7 +6,6 @@ import gc
 import json
 import os
 import threading
-import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
@@ -170,6 +169,7 @@ class WorkerSentinel:
         """
         if self.communicator_aborted:
             return True
+        self.pause_event.set()
         self._set_device_communicator_status(False)
         torch.cuda.set_device(self.device)
         model_groups = get_all_model_groups()
@@ -1266,7 +1266,7 @@ def init_worker_distributed_environment(
         local_rank,
         backend,
         vllm_config.fault_tolerance_config.enable_fault_tolerance,
-        timeout
+        timeout,
     )
 
     ensure_model_parallel_initialized(
