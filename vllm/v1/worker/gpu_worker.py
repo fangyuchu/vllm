@@ -30,6 +30,7 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -94,7 +95,7 @@ class WorkerSentinel:
         self.clear_input_batch_callback = clear_input_batch_callback
         self.device = device
         identity = f"{self.pp_rank}_{self.tp_rank}".encode()
-        worker_cmd_addr = vllm_config.fault_tolerance_config.engine_core_cmd_addr
+        worker_cmd_addr = vllm_config.fault_tolerance_config.worker_cmd_addr
         self.cmd_socket = make_zmq_socket(
             ctx=self.zmq_ctx,
             path=worker_cmd_addr,
@@ -173,7 +174,8 @@ class WorkerSentinel:
 
         def _abort_nccl_comm(group: GroupCoordinator):
             if group.device_communicator is not None:
-                nccl_comm = group.device_communicator.pynccl_comm
+                device_comm = cast(CudaCommunicator, group.device_communicator)
+                nccl_comm = device_comm.pynccl_comm
                 nccl_comm.nccl_abort_comm()
 
         def _abort_process_group(group: GroupCoordinator):
@@ -221,7 +223,8 @@ class WorkerSentinel:
         model_groups = get_all_model_groups()
         for group in model_groups:
             if group.device_communicator is not None:
-                nccl_comm = group.device_communicator.pynccl_comm
+                device_comm = cast(CudaCommunicator, group.device_communicator)
+                nccl_comm = device_comm.pynccl_comm
                 nccl_comm.available = active
                 nccl_comm.disabled = not active
 
