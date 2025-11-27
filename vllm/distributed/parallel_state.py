@@ -347,9 +347,7 @@ class GroupCoordinator:
             # processes through the CPU.
             with suppress_stdout():
                 if not enable_fault_tolerance:
-                    cpu_group = torch.distributed.new_group(
-                        ranks, backend="gloo"
-                    )
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
                 else:
                     cpu_group = torch.distributed.new_group(
                         ranks, backend="gloo", timeout=gloo_comm_timeout
