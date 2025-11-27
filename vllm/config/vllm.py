@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import is_dataclass, field, replace
+from dataclasses import is_dataclass, replace
 from datetime import datetime
 from enum import IntEnum
 from functools import lru_cache
@@ -228,7 +228,7 @@ class VllmConfig:
     """The configurations for event publishing."""
     ec_transfer_config: ECTransferConfig | None = None
     """The configurations for distributed EC cache transfer."""
-    fault_tolerance_config: FaultToleranceConfig = field(
+    fault_tolerance_config: FaultToleranceConfig = Field(
         default_factory=FaultToleranceConfig
     )
     """The configurations for fault tolerance."""

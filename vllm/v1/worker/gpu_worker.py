@@ -176,6 +176,7 @@ class WorkerSentinel:
             if group.device_communicator is not None:
                 device_comm = cast(CudaCommunicator, group.device_communicator)
                 nccl_comm = device_comm.pynccl_comm
+                assert nccl_comm is not None
                 nccl_comm.nccl_abort_comm()
 
         def _abort_process_group(group: GroupCoordinator):
@@ -225,6 +226,7 @@ class WorkerSentinel:
             if group.device_communicator is not None:
                 device_comm = cast(CudaCommunicator, group.device_communicator)
                 nccl_comm = device_comm.pynccl_comm
+                assert nccl_comm is not None
                 nccl_comm.available = active
                 nccl_comm.disabled = not active
 
