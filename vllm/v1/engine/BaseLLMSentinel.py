@@ -107,7 +107,6 @@ class BaseLLMSentinel:
             self._execute_cmd(cmd_str)
         return True
 
-    @abstractmethod
     def fault_listener(self) -> bool:
         raise NotImplementedError
 

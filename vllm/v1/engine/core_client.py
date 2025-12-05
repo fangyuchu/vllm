@@ -545,7 +545,7 @@ class BackgroundResources:
         if self.coordinator is not None:
             self.coordinator.close()
         if self.client_sentinel is not None:
-            self.client_sentinel.shutdown_sentinel()
+            self.client_sentinel.shutdown()
 
         if isinstance(self.output_socket, zmq.asyncio.Socket):
             # Async case.

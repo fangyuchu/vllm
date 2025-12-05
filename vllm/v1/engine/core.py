@@ -111,7 +111,6 @@ class EngineCoreSentinel(BaseLLMSentinel):
             worker_cmd_addr,
             sentinel_identity,
             str(self.engine_index),
-            True,
         )
 
         self.fault_signal_q = fault_signal_q
@@ -906,7 +905,6 @@ class EngineCoreProc(EngineCore):
                     pp_size=vllm_config.parallel_config.pipeline_parallel_size,
                     dp_size=vllm_config.parallel_config.data_parallel_size,
                 )
-                self.engine_core_sentinel.start()
                 vllm_config.fault_tolerance_config.worker_cmd_addr = worker_cmd_addr
                 # Do not shut down the engine immediately upon failure.
                 executor_fail_callback = lambda: self.fault_signal_q.put(

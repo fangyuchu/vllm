@@ -81,6 +81,9 @@ class WorkerSentinel(BaseLLMSentinel):
         clear_input_batch_callback: Callable,
         device: torch.cuda.device,
     ):
+        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_rank = get_tp_group().rank_in_group
+        self.pp_rank = get_pp_group().rank_in_group
         identity = f"{self.pp_rank}_{self.tp_rank}"
         super().__init__(
             vllm_config.fault_tolerance_config.worker_cmd_addr,
@@ -90,9 +93,6 @@ class WorkerSentinel(BaseLLMSentinel):
         )
         self.vllm_config = vllm_config
         self.zmq_ctx = zmq.Context()
-        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
-        self.tp_rank = get_tp_group().rank_in_group
-        self.pp_rank = get_pp_group().rank_in_group
         self.init_distributed_env_callback = init_distributed_env_callback
         self.clear_input_batch_callback = clear_input_batch_callback
         self.device = device
@@ -185,7 +185,7 @@ class WorkerSentinel(BaseLLMSentinel):
                 nccl_comm.available = active
                 nccl_comm.disabled = not active
 
-    def retry(self):
+    def retry(self, new_stateless_dp_group_port: int, timeout: int = 1):
         # In practice, the actual operation performed is restarting the worker
         if self.communicator_aborted:
             torch.cuda.set_device(self.device)
