@@ -206,8 +206,9 @@ class EngineCoreSentinel(BaseLLMSentinel):
             success, _ = self._execute_downstream_method(
                 "pause",
                 self._get_target_worker_identity(),
-                wait_timeout=timeout,
+                response_timeout=timeout,
                 timeout=timeout,
+                soft_pause=soft_pause,
             )
             elapsed = time.monotonic() - start_time
             if success:
@@ -229,8 +230,9 @@ class EngineCoreSentinel(BaseLLMSentinel):
                 success, _ = self._execute_downstream_method(
                     "pause",
                     self._get_target_worker_identity(),
-                    wait_timeout=timeout,
+                    response_timeout=timeout,
                     timeout=timeout,
+                    soft_pause=False,
                 )
         return success
 
@@ -245,7 +247,9 @@ class EngineCoreSentinel(BaseLLMSentinel):
 
         start_time = time.monotonic()
         identities = self._get_target_worker_identity()
-        success = self._execute_downstream_method("retry", identities, timeout=timeout)
+        success, _ = self._execute_downstream_method(
+            "retry", identities, timeout=timeout
+        )
         if not success:
             return success
 

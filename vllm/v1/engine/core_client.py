@@ -430,11 +430,12 @@ class ClientSentinel(BaseLLMSentinel):
             return False, set()
 
         target_engines = set(self.engine_identity_to_index.keys())
-        success = self._execute_downstream_method(
-            "pause",
+        new_stateless_dp_group_port = get_open_port()
+        success, _ = self._execute_downstream_method(
+            "retry",
             target_engines,
             wait_timeout=timeout,
-            new_stateless_dp_group_port=get_open_port(),
+            new_stateless_dp_group_port=new_stateless_dp_group_port,
             timeout=timeout,
         )
 
@@ -464,7 +465,7 @@ class ClientSentinel(BaseLLMSentinel):
             for identity, index in self.engine_identity_to_index.items()
             if self.engine_status_dict.get(index) != "Dead"
         }
-        success = self._execute_downstream_method(
+        success, _ = self._execute_downstream_method(
             "pause",
             alive_engines,
             wait_timeout=timeout,

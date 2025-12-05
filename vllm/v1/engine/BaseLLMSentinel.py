@@ -199,16 +199,20 @@ class BaseLLMSentinel:
                     level="error",
                 )
                 all_success = False
-        for sentinel in target_downstream_sentinels:
-            response = downstream_sentinel_responses.get(sentinel)
-            if response is None or not response.get("success", False):
-                return False
 
         return all_success, downstream_sentinel_responses
 
     def shutdown(self):
-        if self.upstream_cmd_socket is not None:
+        if (
+            hasattr(self, "upstream_cmd_socket")
+            and self.upstream_cmd_socket is not None
+        ):
             self.upstream_cmd_socket.close()
+        if (
+            hasattr(self, "downstream_cmd_socket")
+            and self.downstream_cmd_socket is not None
+        ):
+            self.downstream_cmd_socket.close()
         if self.ctx is not None:
             self.ctx.term()
         self.is_sentinel_dead = True
