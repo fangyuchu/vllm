@@ -434,7 +434,7 @@ class ClientSentinel(BaseLLMSentinel):
                 "Engine core is dead; retry won't work.",
                 level="warning",
             )
-            return False, set()
+            return False
 
         target_engines = set(self.engine_identity_to_index.keys())
         new_stateless_dp_group_port = get_open_port()
