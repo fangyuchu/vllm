@@ -44,6 +44,7 @@ class BaseLLMSentinel:
         self.ctx = zmq.Context()
         self.sentinel_index = sentinel_index
         self.sentinel_name = f"{self.__class__.__name__}"
+        self.logger = self._make_logger(f"[{self.sentinel_name}_{sentinel_index}]")
         if upstream_cmd_addr is not None and sentinel_identity is not None:
             self.upstream_cmd_socket = make_zmq_socket(
                 self.ctx,

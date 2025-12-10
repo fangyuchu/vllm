@@ -134,7 +134,6 @@ class EngineCoreSentinel(BaseLLMSentinel):
         self.communicator_aborted = False
         self.engine_running = True
         self.engine_core_sentinel_dead = False
-        self.logger = self._make_logger(f"[EngineCoreSentinel_{engine_index}]")
         threading.Thread(
             target=self.run, daemon=True, name="EngineCoreSentinelMonitorThread"
         ).start()

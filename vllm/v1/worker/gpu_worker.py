@@ -89,7 +89,7 @@ class WorkerSentinel(BaseLLMSentinel):
             vllm_config.fault_tolerance_config.worker_cmd_addr,
             None,
             identity.encode(),
-            identity,
+            f"{self.dp_rank}_{identity}",
         )
         self.vllm_config = vllm_config
         self.zmq_ctx = zmq.Context()
@@ -100,7 +100,6 @@ class WorkerSentinel(BaseLLMSentinel):
         self.worker_sentinel_dead = False
         self.pause_event = pause_event
         self.communicator_aborted = False
-        self.logger = self._make_logger(f"[WorkerSentinel_{self.dp_rank}_{identity}]")
         torch.cuda.set_device(self.device)
         threading.Thread(
             target=self.run, daemon=True, name="WorkerSentinelMonitorThread"

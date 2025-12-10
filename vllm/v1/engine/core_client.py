@@ -381,8 +381,6 @@ class ClientSentinel(BaseLLMSentinel):
             identity: i for i, identity in self.engine_registry.items()
         }
 
-        self.logger = self._make_logger("[ClientSentinel]")
-
         threading.Thread(
             target=self.run, daemon=True, name="ClientSentinelMonitorThread"
         ).start()
