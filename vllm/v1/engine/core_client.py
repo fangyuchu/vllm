@@ -358,16 +358,15 @@ class ClientSentinel(BaseLLMSentinel):
         super().__init__(None, cmd_addr, None, None)
         self.is_faulted = threading.Event()
         self.engine_registry = engine_registry
-        self.zmq_ctx = zmq.Context()
         self.fault_receiver_socket = make_zmq_socket(
-            ctx=self.zmq_ctx,
+            ctx=self.ctx,
             path=fault_receiver_addr,
             socket_type=zmq.ROUTER,
             bind=True,
         )
 
         self.fault_pub_socket = make_zmq_socket(
-            ctx=self.zmq_ctx, path=fault_pub_addr, socket_type=zmq.PUB, bind=True
+            ctx=self.ctx, path=fault_pub_addr, socket_type=zmq.PUB, bind=True
         )
 
         self.engine_exception_q: queue.Queue[FaultInfo] = engine_exception_q
@@ -382,7 +381,7 @@ class ClientSentinel(BaseLLMSentinel):
             identity: i for i, identity in self.engine_registry.items()
         }
 
-        self.logger = self._make_logger("ClientSentinel")
+        self.logger = self._make_logger("[ClientSentinel]")
 
         threading.Thread(
             target=self.run, daemon=True, name="ClientSentinelMonitorThread"
@@ -402,10 +401,19 @@ class ClientSentinel(BaseLLMSentinel):
             # Pause can be invoked again during fault-tolerance handling,
             # so it's unnecessary to track whether all engines are currently
             # paused.
-            if not self.receive_execute_cmd(
-                serialize_method_call("pause", timeout=5, soft_pause=False)
-            ):
-                self.logger.warning("Failed to pause engines automatically")
+            self._submit_fault("pause", 5, soft_pause=False)
+
+    def _submit_fault(self, instruction: str, timeout: int, **kwargs) -> None:
+        """
+        thread-safe fire-and-forget submission of a fault handling task.
+        This method can be called from **any thread**
+        """
+
+        def _enqueue():
+            fut = self._loop.create_future()
+            self._task_queue.put_nowait((instruction, timeout, kwargs, fut))
+
+        self._loop.call_soon_threadsafe(_enqueue)
 
     async def _dispatcher(self):
         while True:
@@ -413,15 +421,16 @@ class ClientSentinel(BaseLLMSentinel):
             # (instruction, timeout, kwargs, future)
             instruction, timeout, kwargs, fut = await self._task_queue.get()
             try:
-                cmd_str = serialize_method_call(instruction, timeout, **kwargs)
-                success = self._execute_cmd(cmd_str)
+                kwargs["timeout"] = timeout
+                cmd_str = serialize_method_call(instruction, None, **kwargs)
+                success, _, _ = self._execute_cmd(cmd_str)
                 if fut:
                     fut.set_result(success)
             except Exception as e:
                 if fut:
                     fut.set_exception(e)
 
-    def retry(self, new_stateless_dp_group_port: int, timeout: int = 1):
+    def retry(self, timeout: int = 1, new_stateless_dp_group_port: int = 8000) -> bool:
         if "Dead" in self.engine_status_dict.values():
             self.logger(
                 "Engine core is dead; retry won't work.",
@@ -434,7 +443,7 @@ class ClientSentinel(BaseLLMSentinel):
         success, _ = self._execute_downstream_method(
             "retry",
             target_engines,
-            wait_timeout=timeout,
+            response_timeout=timeout,
             new_stateless_dp_group_port=new_stateless_dp_group_port,
             timeout=timeout,
         )
@@ -468,8 +477,9 @@ class ClientSentinel(BaseLLMSentinel):
         success, _ = self._execute_downstream_method(
             "pause",
             alive_engines,
-            wait_timeout=timeout,
+            response_timeout=timeout,
             timeout=timeout,
+            soft_pause=soft_pause,
         )
         return success
 
@@ -481,7 +491,10 @@ class ClientSentinel(BaseLLMSentinel):
         """
         fut = self._loop.create_future()
         await self._task_queue.put((instruction, timeout, kwargs, fut))
-        return await fut
+        result = await fut
+        if result:
+            self.is_faulted.clear()
+        return result
 
     def fault_listener(self) -> bool:
         try:

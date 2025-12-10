@@ -44,9 +44,6 @@ class BaseLLMSentinel:
         self.ctx = zmq.Context()
         self.sentinel_index = sentinel_index
         self.sentinel_name = f"{self.__class__.__name__}"
-        self.logger = self._make_logger(
-            f"{self.__class__.__name__}_{self.sentinel_index}"
-        )
         if upstream_cmd_addr is not None and sentinel_identity is not None:
             self.upstream_cmd_socket = make_zmq_socket(
                 self.ctx,
@@ -86,7 +83,9 @@ class BaseLLMSentinel:
         """
         raise NotImplementedError
 
-    def receive_execute_cmd(self, cmd_str: str | None = None) -> bool:
+    def receive_execute_cmd(
+        self, cmd_str: str | None = None, need_send_result: bool = True
+    ) -> bool:
         try:
             if cmd_str is None:
                 has_msg, _, cmd_str = recv_router_dealer_message(
@@ -104,7 +103,10 @@ class BaseLLMSentinel:
 
         if has_msg:
             self.logger("Received cmd: %s", cmd_str, level="info")
-            self._execute_cmd(cmd_str)
+            success, method_uuid, reason = self._execute_cmd(cmd_str)
+            if need_send_result:
+                self._send_execution_result(success, method_uuid, reason)
+
         return True
 
     def fault_listener(self) -> bool:
@@ -130,14 +132,14 @@ class BaseLLMSentinel:
             )
             success = False
             reason = f"{type(e).__name__}: {e}"
-        self._send_execution_result(success, method_uuid, reason)
+        return success, method_uuid, reason
 
     @abstractmethod
     def pause(self, timeout: int = 1, soft_pause: bool = True) -> bool:
         raise NotImplementedError
 
     @abstractmethod
-    def retry(self, new_stateless_dp_group_port: int, timeout: int = 1) -> bool:
+    def retry(self, timeout: int = 1, new_stateless_dp_group_port: int = 8000) -> bool:
         raise NotImplementedError
 
     def _send_execution_result(

@@ -100,7 +100,7 @@ class WorkerSentinel(BaseLLMSentinel):
         self.worker_sentinel_dead = False
         self.pause_event = pause_event
         self.communicator_aborted = False
-        self.logger = self._make_logger(f"WorkerSentinel_{identity}")
+        self.logger = self._make_logger(f"[WorkerSentinel_{self.dp_rank}_{identity}]")
         torch.cuda.set_device(self.device)
         threading.Thread(
             target=self.run, daemon=True, name="WorkerSentinelMonitorThread"
@@ -110,7 +110,7 @@ class WorkerSentinel(BaseLLMSentinel):
         # Wait for fault tolerance instructions from EngineCoreSentinel
         while not self.is_sentinel_dead:
             if not self.receive_execute_cmd(None):
-                self.logger.error("Failed to execute cmd")
+                self.logger("Failed to execute cmd")
                 break
 
     def pause(self, timeout: int = 1, soft_pause: bool = True):
@@ -185,7 +185,7 @@ class WorkerSentinel(BaseLLMSentinel):
                 nccl_comm.available = active
                 nccl_comm.disabled = not active
 
-    def retry(self, new_stateless_dp_group_port: int, timeout: int = 1):
+    def retry(self, timeout: int = 1, new_stateless_dp_group_port: int = 8000) -> bool:
         # In practice, the actual operation performed is restarting the worker
         if self.communicator_aborted:
             torch.cuda.set_device(self.device)

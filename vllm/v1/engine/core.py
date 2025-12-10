@@ -121,7 +121,6 @@ class EngineCoreSentinel(BaseLLMSentinel):
         self.pp_size = pp_size
         self.dp_size = dp_size
 
-        self.ctx = zmq.Context()
         # Client <-> EngineCoreSentinel sockets
         self.fault_report_socket = make_zmq_socket(
             self.ctx,
@@ -131,18 +130,11 @@ class EngineCoreSentinel(BaseLLMSentinel):
             identity=sentinel_identity,
         )
 
-        self.client_cmd_socket = make_zmq_socket(
-            self.ctx,
-            client_cmd_addr,
-            zmq.DEALER,
-            bind=False,
-            identity=sentinel_identity,
-        )
         self.poller = zmq.Poller()
         self.communicator_aborted = False
         self.engine_running = True
         self.engine_core_sentinel_dead = False
-        self.logger = self._make_logger(f"EngineCoreSentinel_{engine_index}")
+        self.logger = self._make_logger(f"[EngineCoreSentinel_{engine_index}]")
         threading.Thread(
             target=self.run, daemon=True, name="EngineCoreSentinelMonitorThread"
         ).start()
@@ -157,7 +149,7 @@ class EngineCoreSentinel(BaseLLMSentinel):
             # Check for engine fault signals
             # listen exception info
             if not self.fault_listener():
-                continue
+                pass
             if not self.receive_execute_cmd(None):
                 break
 
@@ -236,7 +228,7 @@ class EngineCoreSentinel(BaseLLMSentinel):
                 )
         return success
 
-    def retry(self, new_stateless_dp_group_port: int, timeout: int = 1) -> bool:
+    def retry(self, timeout: int = 1, new_stateless_dp_group_port: int = 8000) -> bool:
         """
         Handle the retry instruction from the ClientSentinel.
         This instruction tells the EngineCore to continue its busy loop
