@@ -54,7 +54,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
-from vllm.v1.engine.BaseLLMSentinel import BaseLLMSentinel
+from vllm.v1.engine.BaseSentinel import BaseSentinel
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 
 
-class WorkerSentinel(BaseLLMSentinel):
+class WorkerSentinel(BaseSentinel):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -107,7 +107,7 @@ class WorkerSentinel(BaseLLMSentinel):
 
     def run(self):
         # Wait for fault tolerance instructions from EngineCoreSentinel
-        while not self.is_sentinel_dead:
+        while not self.sentinel_dead:
             if not self.receive_execute_cmd(None):
                 self.logger("Failed to execute cmd")
                 break

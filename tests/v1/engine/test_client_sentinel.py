@@ -49,7 +49,7 @@ def test_client_sentinel_initialization():
     sentinel = create_client_sentinel(engine_exception_q, engine_status_dict)
 
     assert sentinel.engine_registry[0] == b"engine_identity"
-    assert not sentinel.is_sentinel_dead
+    assert not sentinel.sentinel_dead
     assert sentinel.engine_exception_q is engine_exception_q
 
     assert sentinel.fault_receiver_socket.type == zmq.ROUTER
@@ -143,7 +143,7 @@ def test_shutdown_sentinel():
 
     sentinel.shutdown()
 
-    assert sentinel.is_sentinel_dead is True
+    assert sentinel.sentinel_dead is True
 
     with pytest.raises(zmq.ZMQError):
         original_fault_sock.recv()

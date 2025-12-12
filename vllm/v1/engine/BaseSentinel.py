@@ -15,10 +15,11 @@ from vllm.v1.serial_utils import (
 )
 
 logger = init_logger(__name__)
+# Polling timeout in milliseconds for non-blocking message reception
 POLL_TIMEOUT_MS = 100
 
 
-class BaseLLMSentinel:
+class BaseSentinel:
     """
     Abstract and constrain the core functionalities of the Sentinel.
 
@@ -40,7 +41,7 @@ class BaseLLMSentinel:
         sentinel_identity: bytes | None,
         sentinel_index: str | None,
     ):
-        self.is_sentinel_dead = False
+        self.sentinel_dead = False
         self.ctx = zmq.Context()
         self.sentinel_index = sentinel_index
         self.sentinel_name = (
@@ -91,6 +92,26 @@ class BaseLLMSentinel:
     def receive_execute_cmd(
         self, cmd_str: str | None = None, need_send_result: bool = True
     ) -> bool:
+        """Receive commands from upstream_cmd_socket and execute them, with optional
+         custom command and result transmission control.
+
+        Core function: Listen to and read command content from the upstream command
+         socket (upstream_cmd_socket), then execute the corresponding command logic.
+        Additionally, it supports directly executing a passed command string (bypassing
+         socket reception) and allows controlling whether to send the execution result
+          back to the upstream.
+
+        Args:
+            cmd_str: Optional command string. If provided, the method will execute this
+             command directly instead of receiving from upstream_cmd_socket; if None
+              (default), the method will read the command from upstream_cmd_socket.
+            need_send_result: Boolean flag indicating whether to send the command
+             execution result back to the upstream. Defaults to True (send result).
+
+        Returns:
+            bool: Execution status - True if the command is executed successfully,
+             False if it fails.
+        """
         try:
             if cmd_str is None:
                 has_msg, _, cmd_str = recv_router_dealer_message(
@@ -117,9 +138,18 @@ class BaseLLMSentinel:
     def fault_listener(self) -> bool:
         raise NotImplementedError
 
-    def _execute_cmd(self, cmd_str):
+    def _execute_cmd(self, cmd_str: str) -> tuple[bool, str, str]:
         """
-        Execute a command received from ClientSentinel.
+        Execute a command received from upstream_cmd_socket.
+
+        Args:
+        json_str (str): JSON string representing a serialized method call.
+
+        Returns:
+            tuple[str, dict[str, Any]]:
+            - success (bool): execution status of method call.
+            - method_uuid (str): The UUID identifying the method call.
+            - reason (str): reason for executing method call when failed.
         """
         method, method_uuid, method_params = deserialize_method_call(cmd_str)
         self.logger("Executing command: %s", method, level="info")
@@ -160,7 +190,7 @@ class BaseLLMSentinel:
         msg_bytes = json.dumps(msg).encode("utf-8")
         self.upstream_cmd_socket.send_multipart([b"", msg_bytes])
 
-    def _execute_downstream_method(
+    def _broadcast_command_to_downstream(
         self,
         method_name,
         target_downstream_sentinels,
@@ -222,4 +252,4 @@ class BaseLLMSentinel:
             self.downstream_cmd_socket.close()
         if self.ctx is not None:
             self.ctx.term()
-        self.is_sentinel_dead = True
+        self.sentinel_dead = True

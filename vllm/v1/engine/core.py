@@ -52,7 +52,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
-from vllm.v1.engine.BaseLLMSentinel import BaseLLMSentinel
+from vllm.v1.engine.BaseSentinel import BaseSentinel
 from vllm.v1.engine.exceptions import EngineLoopPausedError, FaultInfo
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -82,7 +82,7 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
-class EngineCoreSentinel(BaseLLMSentinel):
+class EngineCoreSentinel(BaseSentinel):
     """
     EngineCoreSentinel monitors a single EngineCore instance, responsible for:
       1. Receiving fault signals (exceptions raised in EngineCore busy loop)
@@ -144,7 +144,7 @@ class EngineCoreSentinel(BaseLLMSentinel):
         Keep retrieving exception data continuously until an exception is detected;
         after that, switch to the command listening state.
         """
-        while not self.is_sentinel_dead:
+        while not self.sentinel_dead:
             # Check for engine fault signals
             # listen exception info
             if not self.fault_listener():
@@ -194,7 +194,7 @@ class EngineCoreSentinel(BaseLLMSentinel):
             # Put a sentinel (empty request) to unblock the busy loop
             # if it's blocked on input_queue.get()
             self.engine_input_q.put((EngineCoreRequestType.PAUSE, None))
-            success, _ = self._execute_downstream_method(
+            success, _ = self._broadcast_command_to_downstream(
                 "pause",
                 self._get_target_worker_identity(),
                 response_timeout=timeout,
@@ -218,7 +218,7 @@ class EngineCoreSentinel(BaseLLMSentinel):
             success = True
             if not soft_pause:
                 # abort the communicators
-                success, _ = self._execute_downstream_method(
+                success, _ = self._broadcast_command_to_downstream(
                     "pause",
                     self._get_target_worker_identity(),
                     response_timeout=timeout,
@@ -238,7 +238,7 @@ class EngineCoreSentinel(BaseLLMSentinel):
 
         start_time = time.monotonic()
         identities = self._get_target_worker_identity()
-        success, _ = self._execute_downstream_method(
+        success, _ = self._broadcast_command_to_downstream(
             "retry", identities, timeout=timeout
         )
         if not success:

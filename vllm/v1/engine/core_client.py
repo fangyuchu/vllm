@@ -43,7 +43,7 @@ from vllm.v1.engine import (
     ReconfigureRankType,
     UtilityOutput,
 )
-from vllm.v1.engine.BaseLLMSentinel import BaseLLMSentinel
+from vllm.v1.engine.BaseSentinel import BaseSentinel
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError, FaultInfo
@@ -345,7 +345,7 @@ class InprocClient(EngineCoreClient):
         return False
 
 
-class ClientSentinel(BaseLLMSentinel):
+class ClientSentinel(BaseSentinel):
     def __init__(
         self,
         fault_receiver_addr: str,
@@ -392,7 +392,7 @@ class ClientSentinel(BaseLLMSentinel):
         2. Unblock only when fault is received
         3. Execute the pause command immediately upon detecting an fault message
         """
-        while not self.is_sentinel_dead:
+        while not self.sentinel_dead:
             if not self.fault_listener():
                 break
             # Pause healthy engines on fault.
@@ -438,7 +438,7 @@ class ClientSentinel(BaseLLMSentinel):
 
         target_engines = set(self.engine_identity_to_index.keys())
         new_stateless_dp_group_port = get_open_port()
-        success, _ = self._execute_downstream_method(
+        success, _ = self._broadcast_command_to_downstream(
             "retry",
             target_engines,
             response_timeout=timeout,
@@ -472,7 +472,7 @@ class ClientSentinel(BaseLLMSentinel):
             for identity, index in self.engine_identity_to_index.items()
             if self.engine_status_dict.get(index) != "Dead"
         }
-        success, _ = self._execute_downstream_method(
+        success, _ = self._broadcast_command_to_downstream(
             "pause",
             alive_engines,
             response_timeout=timeout,
