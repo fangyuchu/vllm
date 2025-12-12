@@ -89,9 +89,7 @@ class BaseSentinel:
         """
         raise NotImplementedError
 
-    def receive_execute_cmd(
-        self, cmd_str: str | None = None, need_send_result: bool = True
-    ) -> bool:
+    def receive_execute_cmd(self) -> tuple[bool, str | None]:
         """Receive commands from upstream_cmd_socket and execute them, with optional
          custom command and result transmission control.
 
@@ -101,40 +99,23 @@ class BaseSentinel:
          socket reception) and allows controlling whether to send the execution result
           back to the upstream.
 
-        Args:
-            cmd_str: Optional command string. If provided, the method will execute this
-             command directly instead of receiving from upstream_cmd_socket; if None
-              (default), the method will read the command from upstream_cmd_socket.
-            need_send_result: Boolean flag indicating whether to send the command
-             execution result back to the upstream. Defaults to True (send result).
-
         Returns:
-            bool: Execution status - True if the command is executed successfully,
-             False if it fails.
+            tuple[str, str|None]:
+            - has_msg (bool): Whether there has message been received.
+            - cmd_str (str): Serialized command string.
         """
         try:
-            if cmd_str is None:
-                has_msg, _, cmd_str = recv_router_dealer_message(
-                    self.upstream_cmd_socket,
-                    use_poller=True,
-                    poll_timeout=POLL_TIMEOUT_MS,
-                )
-            else:
-                has_msg = True
+            has_msg, _, cmd_str = recv_router_dealer_message(
+                self.upstream_cmd_socket,
+                use_poller=True,
+                poll_timeout=POLL_TIMEOUT_MS,
+            )
         except zmq.ZMQError:
             self.logger(
                 "Socket closed, terminating %s", self.sentinel_name, level="info"
             )
-            return False
-
-        if has_msg:
-            self.logger("Received cmd: %s", cmd_str, level="info")
-            assert cmd_str is not None
-            success, method_uuid, reason = self._execute_cmd(cmd_str)
-            if need_send_result:
-                self._send_execution_result(success, method_uuid, reason)
-
-        return True
+            return False, None
+        return has_msg, cmd_str
 
     def fault_listener(self) -> bool:
         raise NotImplementedError

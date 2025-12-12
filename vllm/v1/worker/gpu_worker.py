@@ -108,9 +108,10 @@ class WorkerSentinel(BaseSentinel):
     def run(self):
         # Wait for fault tolerance instructions from EngineCoreSentinel
         while not self.sentinel_dead:
-            if not self.receive_execute_cmd(None):
-                self.logger("Failed to execute cmd")
-                break
+            has_msg, cmd_str = self.receive_execute_cmd()
+            if has_msg:
+                success, method_uuid, reason = self._execute_cmd(cmd_str)
+                self._send_execution_result(success, method_uuid, reason)
 
     def pause(self, timeout: int = 1, soft_pause: bool = True):
         if soft_pause:

@@ -149,8 +149,10 @@ class EngineCoreSentinel(BaseSentinel):
             # listen exception info
             if not self.fault_listener():
                 pass
-            if not self.receive_execute_cmd(None):
-                break
+            has_msg, cmd_str = self.receive_execute_cmd()
+            if has_msg:
+                success, method_uuid, reason = self._execute_cmd(cmd_str)
+                self._send_execution_result(success, method_uuid, reason)
 
     def fault_listener(self):
         try:
