@@ -129,6 +129,7 @@ class BaseSentinel:
 
         if has_msg:
             self.logger("Received cmd: %s", cmd_str, level="info")
+            assert cmd_str is not None
             success, method_uuid, reason = self._execute_cmd(cmd_str)
             if need_send_result:
                 self._send_execution_result(success, method_uuid, reason)
@@ -138,7 +139,7 @@ class BaseSentinel:
     def fault_listener(self) -> bool:
         raise NotImplementedError
 
-    def _execute_cmd(self, cmd_str: str) -> tuple[bool, str, str]:
+    def _execute_cmd(self, cmd_str: str) -> tuple[bool, str, str | None]:
         """
         Execute a command received from upstream_cmd_socket.
 
@@ -149,12 +150,12 @@ class BaseSentinel:
             tuple[str, dict[str, Any]]:
             - success (bool): execution status of method call.
             - method_uuid (str): The UUID identifying the method call.
-            - reason (str): reason for executing method call when failed.
+            - reason (str | None): reason for executing method call when failed.
         """
         method, method_uuid, method_params = deserialize_method_call(cmd_str)
         self.logger("Executing command: %s", method, level="info")
         try:
-            success = run_method(self, method, args=(), kwargs=method_params)
+            success: bool = run_method(self, method, args=(), kwargs=method_params)
             self.logger("Command (%s) succeeded: %s", method, success, level="info")
             reason = None
         except Exception as e:
