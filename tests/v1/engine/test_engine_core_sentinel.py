@@ -34,7 +34,7 @@ def create_engine_core_sentinel(
         client_cmd_addr=CLIENT_CMD_ADDR,
         worker_cmd_addr=WORKER_CMD_ADDR,
         fault_report_addr=FAULT_REPORT_ADDR,
-        sentinel_identity=SENTINEL_IDENTITY,
+        dealer_identity=SENTINEL_IDENTITY,
         tp_size=1,
         pp_size=1,
         dp_size=1,

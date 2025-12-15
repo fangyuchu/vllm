@@ -38,7 +38,7 @@ class BaseSentinel:
         self,
         upstream_cmd_addr: str | None,
         downstream_cmd_addr: str | None,
-        sentinel_identity: bytes | None,
+        dealer_identity: bytes | None,
         sentinel_index: str | None,
     ):
         self.sentinel_dead = False
@@ -50,13 +50,14 @@ class BaseSentinel:
             else f"[{self.__class__.__name__}_{sentinel_index}]"
         )
         self.logger = self._make_logger(self.sentinel_name)
-        if upstream_cmd_addr is not None and sentinel_identity is not None:
+        if upstream_cmd_addr is not None:
+            assert dealer_identity is not None
             self.upstream_cmd_socket = make_zmq_socket(
                 self.ctx,
                 upstream_cmd_addr,
                 zmq.DEALER,
                 bind=False,
-                identity=sentinel_identity,
+                identity=dealer_identity,
             )
         if downstream_cmd_addr is not None:
             self.downstream_cmd_socket = make_zmq_socket(
@@ -89,7 +90,7 @@ class BaseSentinel:
         """
         raise NotImplementedError
 
-    def receive_execute_cmd(self) -> tuple[bool, str | None]:
+    def receive_upstream_cmd(self) -> tuple[bool, str | None]:
         """Receive commands from upstream_cmd_socket and execute them, with optional
          custom command and result transmission control.
 
@@ -163,7 +164,7 @@ class BaseSentinel:
         self, success: bool, method_uuid: str, reason: str | None
     ):
         msg = {
-            "engine_index": self.sentinel_index,
+            "sentinel_index": self.sentinel_index,
             "success": success,
             "method_uuid": method_uuid,
         }
@@ -201,18 +202,16 @@ class BaseSentinel:
 
             if response is None:
                 self.logger(
-                    "EngineCoreSentinel[%s] did not respond"
-                    ' to command "%s" within timeout.',
-                    sentinel_identity,
+                    '%s did not respond to command "%s" within timeout.',
+                    self.sentinel_name,
                     method_name,
                     level="info",
                 )
                 all_success = False
             elif not response.get("success", False):
                 self.logger(
-                    "EngineCoreSentinel[%s] failed to execute "
-                    'command "%s" (reason: %s)',
-                    sentinel_identity,
+                    '%s failed to execute command "%s" (reason: %s)',
+                    self.sentinel_name,
                     method_name,
                     response.get("reason", "unknown"),
                     level="error",

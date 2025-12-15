@@ -100,7 +100,7 @@ class EngineCoreSentinel(BaseSentinel):
         client_cmd_addr: str,
         worker_cmd_addr: str,
         fault_report_addr: str,
-        sentinel_identity: bytes,
+        dealer_identity: bytes,
         tp_size: int,
         pp_size: int,
         dp_size: int,
@@ -109,8 +109,8 @@ class EngineCoreSentinel(BaseSentinel):
         super().__init__(
             client_cmd_addr,
             worker_cmd_addr,
-            sentinel_identity,
-            str(self.engine_index),
+            dealer_identity,
+            f"{self.engine_index}",
         )
 
         self.fault_signal_q = fault_signal_q
@@ -127,7 +127,7 @@ class EngineCoreSentinel(BaseSentinel):
             fault_report_addr,
             zmq.DEALER,
             bind=False,
-            identity=sentinel_identity,
+            identity=dealer_identity,
         )
 
         self.poller = zmq.Poller()
@@ -149,7 +149,7 @@ class EngineCoreSentinel(BaseSentinel):
             # listen exception info
             if not self.fault_listener():
                 pass
-            has_msg, cmd_str = self.receive_execute_cmd()
+            has_msg, cmd_str = self.receive_upstream_cmd()
             if has_msg:
                 assert cmd_str is not None
                 success, method_uuid, reason = self._execute_cmd(cmd_str)
@@ -898,7 +898,7 @@ class EngineCoreProc(EngineCore):
                     fault_report_addr=addresses.fault_report_addr,
                     client_cmd_addr=addresses.client_cmd_addr,
                     worker_cmd_addr=worker_cmd_addr,
-                    sentinel_identity=engine_core_sentinel_ids[self.engine_index],
+                    dealer_identity=engine_core_sentinel_ids[self.engine_index],
                     tp_size=vllm_config.parallel_config.tensor_parallel_size,
                     pp_size=vllm_config.parallel_config.pipeline_parallel_size,
                     dp_size=vllm_config.parallel_config.data_parallel_size,
