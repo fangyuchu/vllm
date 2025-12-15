@@ -110,6 +110,7 @@ class WorkerSentinel(BaseSentinel):
         while not self.sentinel_dead:
             has_msg, cmd_str = self.receive_execute_cmd()
             if has_msg:
+                assert cmd_str is not None
                 success, method_uuid, reason = self._execute_cmd(cmd_str)
                 self._send_execution_result(success, method_uuid, reason)
 

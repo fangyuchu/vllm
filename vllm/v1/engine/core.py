@@ -133,7 +133,6 @@ class EngineCoreSentinel(BaseSentinel):
         self.poller = zmq.Poller()
         self.communicator_aborted = False
         self.engine_running = True
-        self.engine_core_sentinel_dead = False
         threading.Thread(
             target=self.run, daemon=True, name="EngineCoreSentinelMonitorThread"
         ).start()
@@ -141,8 +140,9 @@ class EngineCoreSentinel(BaseSentinel):
     def run(self):
         """
         Loop to fetch exception information from the fault_signal_q queue.
-        Keep retrieving exception data continuously until an exception is detected;
-        after that, switch to the command listening state.
+        Keep retrieving exception data continuously until an exception is detected or
+        a command from ClientSentinel is dispatched; after that, switch to the command
+        listening state.
         """
         while not self.sentinel_dead:
             # Check for engine fault signals
@@ -151,6 +151,7 @@ class EngineCoreSentinel(BaseSentinel):
                 pass
             has_msg, cmd_str = self.receive_execute_cmd()
             if has_msg:
+                assert cmd_str is not None
                 success, method_uuid, reason = self._execute_cmd(cmd_str)
                 self._send_execution_result(success, method_uuid, reason)
 
