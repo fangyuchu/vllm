@@ -230,6 +230,7 @@ async def build_async_engine_client_from_engine_args(
         if async_llm:
             async_llm.shutdown()
 
+
 async def check_engine_fault(raw_request: Request):
     client = engine_client(raw_request)
     assert hasattr(client, "engine_core")
@@ -242,6 +243,7 @@ async def check_engine_fault(raw_request: Request):
             status_code=503,
             detail="Service is in faulted state, cannot process requests.",
         )
+
 
 router = APIRouter()
 
@@ -740,6 +742,7 @@ if envs.VLLM_SERVER_DEV_MODE:
             else:
                 response.append(str(result))
         return JSONResponse(content={"results": response})
+
 
 @router.post(
     "/fault_tolerance/apply",
