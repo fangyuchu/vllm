@@ -54,7 +54,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
-from vllm.v1.engine.BaseSentinel import BaseSentinel
+from vllm.v1.engine.base_sentinel import BaseSentinel
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
