@@ -385,6 +385,8 @@ class ClientSentinel(BaseSentinel):
             fault_tolerance_config=fault_tolerance_config,
         )
         self.is_faulted = threading.Event()
+        self.engine_running = threading.Event()
+        self.engine_running.set()
         self.engine_registry = engine_registry
         self.engine_exception_q: queue.Queue[FaultInfo] = engine_exception_q
         self.engine_status_dict: ThreadSafeDict[int, str] = engine_status_dict
@@ -430,9 +432,10 @@ class ClientSentinel(BaseSentinel):
                 # Pause can be invoked again during fault-tolerance handling,
                 # so it's unnecessary to track whether all engines are currently
                 # paused.
-                self._submit_task(
-                    "pause", self.ft_config.gloo_comm_timeout, soft_pause=False
-                )
+                if self.engine_running.is_set():
+                    self._submit_task(
+                        "pause", self.ft_config.gloo_comm_timeout, soft_pause=False
+                    )
             except zmq.ZMQError:
                 # Socket is closed.
                 break
@@ -494,6 +497,7 @@ class ClientSentinel(BaseSentinel):
 
         if success:
             self.is_faulted.clear()
+            self.engine_running.set()
         return success
 
     def pause(self, timeout: int = 1, soft_pause: bool = True):
@@ -506,7 +510,7 @@ class ClientSentinel(BaseSentinel):
             "the instance.",
             level="warning",
         )
-
+        self.engine_running.clear()
         alive_engines = {
             identity
             for identity, index in self.engine_identity_to_index.items()
