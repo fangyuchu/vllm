@@ -5,11 +5,13 @@ pynvml. However, it should not initialize cuda context.
 """
 
 import os
+from datetime import timedelta
 from collections.abc import Callable
 from functools import cache, wraps
 from typing import TYPE_CHECKING, Optional, TypeVar
 
 import torch
+from torch.distributed import ProcessGroup
 from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
@@ -573,6 +575,59 @@ class NvmlCudaPlatform(CudaPlatformBase):
                     ", ".join(device_names),
                 )
 
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+            cls,
+            backend: str,
+            prefix_store: "PrefixStore",
+            group_rank: int,
+            group_size: int,
+            timeout: timedelta,
+            **kwargs
+    ) -> "ProcessGroup":
+        """
+        Initialize a stateless process group for device-specific distributed communication.
+
+        This method creates a ProcessGroup with the specified backend configuration,
+        typically used for GPU communication. It sets up the necessary backend
+        options and registers the backend with the process group.
+
+        Args:
+            backend: The distributed backend to use (e.g., 'nccl')
+            prefix_store: The prefix store for distributed coordination
+            group_rank: The rank of the current process within the group
+            group_size: The total number of processes in the group
+            timeout: Maximum time to wait for the operation to complete
+            **kwargs: Additional backend-specific options
+
+        Returns:
+            A ProcessGroup object configured with the specified backend
+        """
+        from torch._C._distributed_c10d import ProcessGroupNCCL
+
+        pg = ProcessGroup(prefix_store, group_rank, group_size)
+
+        backend_options = ProcessGroupNCCL.Options()
+        backend_options._timeout = timeout
+
+        device = torch.device("cuda")
+        if hasattr(backend_options, '_device'):
+            backend_options._device = device
+
+        # Apply high-priority stream setting if provided
+        if 'is_high_priority_stream' in kwargs:
+            backend_options.is_high_priority_stream = kwargs['is_high_priority_stream']
+
+        backend_class = ProcessGroupNCCL(
+            prefix_store, group_rank, group_size, backend_options
+        )
+
+        backend_class._set_sequence_number_for_group()
+
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        pg._register_backend(device, backend_type, backend_class)
+
+        return pg
 
 class NonNvmlCudaPlatform(CudaPlatformBase):
     @classmethod
