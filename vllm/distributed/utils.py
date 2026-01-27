@@ -531,91 +531,134 @@ def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:
 
     _unregister_process_group(pg.group_name)
 
-
-def create_stateless_process_group(ranks: list[int],
-                                   local_rank: int,
-                                   backend: str,
-                                   host: str = "127.0.0.1",
-                                   base_port: int = 29500,
-                                   port_range: int = 1500) -> ProcessGroup:
+def create_stateless_process_group(
+        ranks: list[int],
+        rank: int,
+        backend: str,
+        host: str = "127.0.0.1",
+        base_port: int = 29500,
+        port_range: int = 1500
+) -> ProcessGroup:
     """
-    Create a stateless process group for distributed communication.
+        Create a stateless process group for distributed communication.
 
-    This function initializes a TCP store and creates a process group using the specified backend.
-    It handles port conflicts by retrying with different ports if the initial port is unavailable.
+        This function initializes a TCP store and creates a process group using the specified backend.
+        It handles port conflicts by retrying with different ports if the initial port is unavailable.
 
-    Args:
-        ranks: List of global ranks that should be included in the process group
-        local_rank: The rank of the current process
-        backend: The distributed backend to use (e.g., 'nccl', 'gloo')
-        host: The host address for the TCP store (default: '127.0.0.1')
-        base_port: The base port number to start from (default: 29500)
-        port_range: The range of ports to try if the initial port is busy (default: 1500)
+        Args:
+            ranks: List of global ranks that should be included in the process group
+            rank: The rank of the current process
+            backend: The distributed backend to use (e.g., 'nccl', 'gloo')
+            host: The host address for the TCP store (default: '127.0.0.1')
+            base_port: The base port number to start from (default: 29500)
+            port_range: The range of ports to try if the initial port is busy (default: 1500)
 
-    Returns:
-        A ProcessGroup object if successful, None if the local_rank is not in the ranks list
-    """
-
-    # Check if current rank is part of the target group
-    if local_rank not in ranks:
-        logger.debug(f"Local rank {local_rank} not in ranks {ranks}, skipping...")
+        Returns:
+            A ProcessGroup object if successful, None if the local_rank is not in the ranks list
+        """
+    if not _is_rank_in_group(rank, ranks):
         return None
 
-    # Calculate group position and size
-    group_rank = ranks.index(local_rank)
-    group_size = len(ranks)
+    group_rank, group_size = _calculate_group_position(rank, ranks)
 
-    # Generate a deterministic port based on the sorted ranks
+    port = _generate_deterministic_port(ranks, base_port, port_range)
+
+    logger.debug(f"Creating TCP store for group {ranks} at {host}:{port}, "
+                 f"group_rank={group_rank}, group_size={group_size}")
+
+    # Attempt to create TCP store with retry mechanism for port conflicts
+    timeout = _get_default_timeout(backend)
+    prefix_store = _create_tcp_store_with_retry(
+        host, port, group_rank, group_size, timeout, ranks
+    )
+
+    # Initialize the process group using the current platform's implementation
+    return _initialize_process_group(backend, prefix_store, group_rank, group_size, timeout)
+
+
+def _is_rank_in_group(rank: int, ranks: list[int]) -> bool:
+    """Generate a deterministic port based on the sorted ranks"""
+    if rank not in ranks:
+        logger.debug(f"Rank {rank} not in {ranks}，skipping...")
+        return False
+    return True
+
+
+def _calculate_group_position(rank: int, ranks: list[int]) -> tuple[int, int]:
+    """Calculate group position and size"""
+    group_rank = ranks.index(rank)
+    group_size = len(ranks)
+    return group_rank, group_size
+
+
+def _generate_deterministic_port(ranks: list[int], base_port: int, port_range: int) -> int:
+    """Generate a deterministic port based on the sorted ranks"""
     import hashlib
     ranks_tuple = tuple(sorted(ranks))
     ranks_hash = hashlib.md5(str(ranks_tuple).encode()).hexdigest()
     port_offset = int(ranks_hash, 16) % port_range
-    port = base_port + port_offset
+    return base_port + port_offset
 
-    logger.debug(f"Creating TCP store for group {ranks} at {host}:{port}, "
-                f"group_rank={group_rank}, group_size={group_size}")
 
-    # Get timeout configuration for the backend
-    timeout = _get_default_timeout(backend)
+def _create_tcp_store_with_retry(
+        host: str,
+        port: int,
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+        ranks: list[int]
+) -> "PrefixStore":
+    """
+    This function initializes a TCP store and creates a process group using the specified backend.
+    It handles port conflicts by retrying with different ports if the initial port is unavailable.
+    """
+    max_retries = 100
 
-    # Attempt to create TCP store with retry mechanism for port conflicts
-    try:
-        prefix_store = get_stateless_prefix_store(
-            host=host,
-            port=port,
-            rank=group_rank,
-            world_size=group_size,
-            timeout=timeout
-        )
-        logger.info(f"Successfully created TCP store for group {ranks} at {host}:{port}")
+    for attempt in range(max_retries):
+        try:
+            current_port = port + attempt
+            if current_port > 65535:
+                raise RuntimeError(f"The number of port exceeds the maximum limit.")
 
-    except Exception as e:
-        logger.error(f"Failed to create TCP store at {host}:{port}: {e}")
+            prefix_store = get_stateless_prefix_store(
+                host, current_port, group_rank, group_size, timeout
+            )
+            logger.info(f"Success for group {ranks} Create TCP store {host}:{current_port}")
+            return prefix_store
 
-        # Retry with different ports if initial attempt fails
-        for offset in range(1, 100):
-            try_port = port + offset
-            if try_port > 65535:
-                break
+        except Exception as e:
+            if _should_retry(e, attempt, max_retries):
+                logger.warning(f"port {current_port} is using，Try next...")
+                continue
+            else:
+                logger.error(f"Create TCP store fail: {e}")
+                raise
 
-            try:
-                logger.info(f"Retrying with port {try_port}")
-                prefix_store = get_stateless_prefix_store(
-                    host=host,
-                    port=try_port,
-                    rank=group_rank,
-                    world_size=group_size,
-                    timeout=timeout
-                )
-                logger.info(f"Successfully created TCP store with fallback port {try_port}")
-                break  # Success, exit retry loop
-            except Exception as e2:
-                if offset == 99:
-                    logger.error(f"All port attempts failed: {e2}")
-                    raise  # Re-raise exception after all retries fail
-                continue  # Try next port
+    raise RuntimeError(f"Re-raise exception after all retries fail")
 
-    # Initialize the process group using the current platform's implementation
+
+def _should_retry(exception: Exception, attempt: int, max_retries: int) -> bool:
+    """Determine whether retry should be performed."""
+    if attempt >= max_retries - 1:
+        return False  # Last attempt, no retry
+    is_port_in_use = False
+    # Retry only for port conflict errors
+    import errno
+    if isinstance(exception, OSError) and hasattr(exception, 'errno'):
+        is_port_in_use =  (exception.errno == errno.EADDRINUSE)
+    elif isinstance(exception, torch.distributed.DistNetworkError):
+        is_port_in_use = "Address already in use" in str(e)
+
+    return is_port_in_use
+
+
+def _initialize_process_group(
+        backend: str,
+        prefix_store: "PrefixStore",
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta
+) -> "ProcessGroup":
     from vllm.platforms import current_platform
     return current_platform.stateless_init_device_torch_dist_pg(
         backend=backend,

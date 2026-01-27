@@ -331,7 +331,7 @@ class GroupCoordinator:
                 )
                 ip = config.parallel_config.data_parallel_master_ip
                 device_group = create_stateless_process_group(
-                    ranks=ranks, local_rank=local_rank, backend=torch_distributed_backend, host=ip
+                    ranks=ranks, rank=self.rank, backend=torch_distributed_backend, host=ip
                 )
             else:
                 device_group = torch.distributed.new_group(
@@ -1262,7 +1262,7 @@ def init_distributed_environment(
     global _WORLD, _NODE_COUNT, _INNER_DP_WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
-        _WORLD = init_world_group(ranks, rank % world_size, backend)
+        _WORLD = init_world_group(ranks, local_rank, backend)
         if config.parallel_config.nnodes > 1:
             _NODE_COUNT = config.parallel_config.nnodes
         else:
