@@ -183,13 +183,11 @@ class EngineCoreSentinel(BaseSentinel):
         msg_bytes = msg.encode("utf-8")
         self.engine_fault_socket.send_multipart([b"", msg_bytes])
 
-    def pause(self, timeout: int = 1, soft_pause: bool = True) -> bool:
+    def pause(self, timeout: int = 1, **kwargs) -> bool:
         """
         Pause the busy loop safely.
         Args:
             timeout:wait for the busy loop to acknowledge the pause signal
-            soft_pause: if True, perform a soft pause using a flag; otherwise
-            abort the communicator
         """
         self.logger("Start pausing EngineCore", level="info")
         start_time = time.monotonic()
@@ -204,7 +202,7 @@ class EngineCoreSentinel(BaseSentinel):
                 self._get_target_worker_identity(),
                 response_timeout=timeout,
                 timeout=timeout,
-                soft_pause=soft_pause,
+                soft_pause=kwargs["soft_pause"],
             )
             elapsed = time.monotonic() - start_time
             if success:
@@ -221,7 +219,7 @@ class EngineCoreSentinel(BaseSentinel):
         else:
             # already paused
             success = True
-            if not soft_pause:
+            if not kwargs["soft_pause"]:
                 # abort the communicators
                 success, _ = self._broadcast_command_to_downstream(
                     "pause",
@@ -232,9 +230,7 @@ class EngineCoreSentinel(BaseSentinel):
                 )
         return success
 
-    def retry(
-        self, timeout: int = 1, new_stateless_dp_group_port: int = 8000, **kwargs
-    ) -> bool:
+    def retry(self, timeout: int = 1, **kwargs) -> bool:
         """
         Handle the retry instruction from the ClientSentinel.
         This instruction tells the EngineCore to continue its busy loop
@@ -257,7 +253,8 @@ class EngineCoreSentinel(BaseSentinel):
             command = "reinit_dp_group_on_fault_tolerance"
             self.cmd_q.put(
                 serialize_method_call(
-                    command, new_stateless_dp_group_port=new_stateless_dp_group_port
+                    command,
+                    new_stateless_dp_group_port=kwargs["new_stateless_dp_group_port"],
                 )
             )
         else:
