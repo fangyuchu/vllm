@@ -321,10 +321,28 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
+        from vllm.config import get_current_vllm_config
+
+        config = get_current_vllm_config()
+
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            if config.parallel_config.enable_stateless_pg and len(ranks) > 1:
+                self.stateless_backend = torch_distributed_backend
+                from vllm.distributed.utils import (
+                    create_stateless_process_group,
+                )
+
+                ip = config.parallel_config.data_parallel_master_ip
+                device_group = create_stateless_process_group(
+                    ranks=ranks,
+                    rank=self.rank,
+                    backend=torch_distributed_backend,
+                    host=ip,
+                )
+            else:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
@@ -1445,6 +1463,12 @@ def ensure_model_parallel_initialized(
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
     values if the model parallel groups are initialized.
     """
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config()
+    if config.parallel_config.enable_stateless_pg:
+        backend = get_world_group().stateless_backend
+
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(

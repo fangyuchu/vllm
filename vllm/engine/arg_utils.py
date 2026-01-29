@@ -577,6 +577,7 @@ class EngineArgs:
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
     tokens_only: bool = False
+    enable_stateless_pg: bool = False
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -893,6 +894,9 @@ class EngineArgs:
         parallel_group.add_argument("--worker-cls", **parallel_kwargs["worker_cls"])
         parallel_group.add_argument(
             "--worker-extension-cls", **parallel_kwargs["worker_extension_cls"]
+        )
+        parallel_group.add_argument(
+            "--enable-stateless-pg", **parallel_kwargs["enable_stateless_pg"]
         )
 
         # KV cache arguments
@@ -1621,6 +1625,7 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
+            enable_stateless_pg=self.enable_stateless_pg,
         )
 
         speculative_config = self.create_speculative_config(

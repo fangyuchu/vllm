@@ -6,10 +6,12 @@ pynvml. However, it should not initialize cuda context.
 
 import os
 from collections.abc import Callable
+from datetime import timedelta
 from functools import cache, wraps
 from typing import TYPE_CHECKING, Optional, TypeVar
 
 import torch
+from torch.distributed import PrefixStore, ProcessGroup
 from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
@@ -572,6 +574,75 @@ class NvmlCudaPlatform(CudaPlatformBase):
                     "avoid unexpected behavior.",
                     ", ".join(device_names),
                 )
+
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+        cls,
+        backend: str,
+        prefix_store: "PrefixStore",
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+        **kwargs,
+    ) -> "ProcessGroup":
+        """
+        Initialize a stateless NCCL process group for CUDA devices.
+
+        This method creates a ProcessGroup with the specified backend configuration,
+        typically used for GPU communication. It sets up the necessary backend
+        options and registers the backend with the process group.
+
+        Args:
+            backend: The distributed backend to use (e.g., 'nccl')
+            prefix_store: The prefix store for distributed coordination
+            group_rank: The rank of the current process within the group
+            group_size: The total number of processes in the group
+            timeout: Maximum time to wait for the operation to complete
+            **kwargs: Additional backend-specific options
+
+        warning:
+        Uses internal PyTorch API (torch._C._distributed_c10d.ProcessGroupNCCL)
+        which may change in future PyTorch versions. Compatibility should be
+        verified with each PyTorch upgrade.
+
+        Compatibility Risk:
+        - High risk of breakage in PyTorch 2.4+
+        - No semantic versioning guarantees
+        - Requires testing with new PyTorch releases
+
+        Returns:
+            A ProcessGroup object configured with the specified backend
+        """
+
+        # INTERNAL API USAGE - COMPATIBILITY RISK
+        # This internal import is necessary for stateless process group functionality
+        # but carries compatibility risks. Monitor PyTorch release notes for changes.
+        # TODO: Migrate to public API when available in future PyTorch versions
+        from torch._C._distributed_c10d import ProcessGroupNCCL
+
+        pg = ProcessGroup(prefix_store, group_rank, group_size)
+
+        backend_options = ProcessGroupNCCL.Options()
+        backend_options._timeout = timeout
+
+        device = torch.device("cuda")
+        if hasattr(backend_options, "_device"):
+            backend_options._device = device
+
+        # Apply high-priority stream setting if provided
+        if "is_high_priority_stream" in kwargs:
+            backend_options.is_high_priority_stream = kwargs["is_high_priority_stream"]
+
+        backend_class = ProcessGroupNCCL(
+            prefix_store, group_rank, group_size, backend_options
+        )
+
+        backend_class._set_sequence_number_for_group()
+
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        pg._register_backend(device, backend_type, backend_class)
+
+        return pg
 
 
 class NonNvmlCudaPlatform(CudaPlatformBase):

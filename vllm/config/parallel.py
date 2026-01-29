@@ -299,6 +299,33 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
+    enable_stateless_pg: bool = False
+    """
+    Whether to use stateless process group creation instead of
+    torch.distributed.new_group.
+
+    When set to True, enables stateless process group creation for distributed
+    communication, which provides better resource management and cleanup compared to
+    the standard torch.distributed.new_group approach. This is particularly useful
+    for scenarios requiring dynamic process group creation, improved isolation, and
+    deterministic resource release.
+
+    When set to False (default), uses torch.distributed.new_group for process group
+    creation, which is the standard PyTorch approach.
+
+    Key benefits of stateless process groups:
+    - Better resource cleanup and memory management
+    - Improved isolation between different process groups
+    - More deterministic initialization and destruction
+    - Enhanced debugging capabilities
+
+    Note:
+        This option requires proper initialization and cleanup of process group
+        resources. Ensure your distributed setup supports the chosen backend.
+        Stateless process groups may have different performance characteristics
+        compared to standard process groups.
+    """
+
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
@@ -530,6 +557,7 @@ class ParallelConfig:
             "worker_extension_cls",
             "_api_process_count",
             "_api_process_rank",
+            "enable_stateless_pg",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
