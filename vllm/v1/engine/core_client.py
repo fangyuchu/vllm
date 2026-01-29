@@ -456,9 +456,7 @@ class ClientSentinel(BaseSentinel):
                 if fut:
                     fut.set_exception(e)
 
-    def retry(
-        self, timeout: int = 1, new_stateless_dp_group_port: int = 8000, **kwargs
-    ) -> bool:
+    def retry(self, timeout: int = 1, **kwargs) -> bool:
         if "Dead" in self.engine_status_dict.values():
             self.logger(
                 "Engine core is dead; retry won't work.",
@@ -489,7 +487,7 @@ class ClientSentinel(BaseSentinel):
             self.engine_running.set()
         return success
 
-    def pause(self, timeout: int = 1, soft_pause: bool = True):
+    def pause(self, timeout: int = 1, **kwargs) -> bool:
         self.logger(
             "Pause operation is best-effort only. Due to the complexity of "
             "collective communications (e.g., timing dependencies and "
@@ -499,11 +497,14 @@ class ClientSentinel(BaseSentinel):
             "the instance.",
             level="warning",
         )
+        exclude_engine_index = kwargs.get("exclude_engine_index")
+        soft_pause = kwargs.get("soft_pause", False)
         self.engine_running.clear()
         alive_engines = {
             identity
             for identity, index in self.engine_identity_to_index.items()
             if self.engine_status_dict.get(index) != "Dead"
+            and (exclude_engine_index is None or index not in exclude_engine_index)
         }
         success, _ = self._broadcast_command_to_downstream(
             "pause",
