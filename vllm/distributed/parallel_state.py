@@ -331,7 +331,8 @@ class GroupCoordinator:
                 )
                 ip = config.parallel_config.data_parallel_master_ip
                 device_group = create_stateless_process_group(
-                    ranks=ranks, rank=self.rank, backend=torch_distributed_backend, host=ip
+                    ranks=ranks, rank=self.rank,
+                    backend=torch_distributed_backend, host=ip
                 )
             else:
                 device_group = torch.distributed.new_group(

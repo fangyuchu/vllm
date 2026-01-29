@@ -282,7 +282,8 @@ class ParallelConfig:
 
     enable_stateless_pg: bool = False
     """
-    Whether to use stateless process group creation instead of torch.distributed.new_group.
+    Whether to use stateless process group creation instead of
+    torch.distributed.new_group.
     
     When set to True, enables stateless process group creation for distributed
     communication, which provides better resource management and cleanup compared to

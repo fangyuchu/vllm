@@ -542,8 +542,10 @@ def create_stateless_process_group(
     """
         Create a stateless process group for distributed communication.
 
-        This function initializes a TCP store and creates a process group using the specified backend.
-        It handles port conflicts by retrying with different ports if the initial port is unavailable.
+        This function initializes a TCP store
+        and creates a process group using the specified backend.
+        It handles port conflicts by retrying
+        with different ports if the initial port is unavailable.
 
         Args:
             ranks: List of global ranks that should be included in the process group
@@ -551,10 +553,11 @@ def create_stateless_process_group(
             backend: The distributed backend to use (e.g., 'nccl', 'gloo')
             host: The host address for the TCP store (default: '127.0.0.1')
             base_port: The base port number to start from (default: 29500)
-            port_range: The range of ports to try if the initial port is busy (default: 1500)
+            port_range: The range of ports to try if the initial port is busy
 
         Returns:
-            A ProcessGroup object if successful, None if the local_rank is not in the ranks list
+            A ProcessGroup object if successful,
+            None if the local_rank is not in the ranks list
         """
     if not _is_rank_in_group(rank, ranks):
         return None
@@ -563,9 +566,6 @@ def create_stateless_process_group(
 
     port = _generate_deterministic_port(ranks, base_port, port_range)
 
-    logger.debug(f"Creating TCP store for group {ranks} at {host}:{port}, "
-                 f"group_rank={group_rank}, group_size={group_size}")
-
     # Attempt to create TCP store with retry mechanism for port conflicts
     timeout = _get_default_timeout(backend)
     prefix_store = _create_tcp_store_with_retry(
@@ -573,13 +573,14 @@ def create_stateless_process_group(
     )
 
     # Initialize the process group using the current platform's implementation
-    return _initialize_process_group(backend, prefix_store, group_rank, group_size, timeout)
+    return _initialize_process_group(
+        backend, prefix_store, group_rank, group_size, timeout
+    )
 
 
 def _is_rank_in_group(rank: int, ranks: list[int]) -> bool:
     """Generate a deterministic port based on the sorted ranks"""
     if rank not in ranks:
-        logger.debug(f"Rank {rank} not in {ranks}，skipping...")
         return False
     return True
 
@@ -591,7 +592,9 @@ def _calculate_group_position(rank: int, ranks: list[int]) -> tuple[int, int]:
     return group_rank, group_size
 
 
-def _generate_deterministic_port(ranks: list[int], base_port: int, port_range: int) -> int:
+def _generate_deterministic_port(
+        ranks: list[int], base_port: int, port_range: int
+) -> int:
     """Generate a deterministic port based on the sorted ranks"""
     import hashlib
     ranks_tuple = tuple(sorted(ranks))
