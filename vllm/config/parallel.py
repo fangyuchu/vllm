@@ -557,7 +557,6 @@ class ParallelConfig:
             "worker_extension_cls",
             "_api_process_count",
             "_api_process_rank",
-            "enable_stateless_pg",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

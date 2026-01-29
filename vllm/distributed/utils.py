@@ -636,7 +636,9 @@ def _create_tcp_store_with_retry(
 
         except Exception as e:
             if _should_retry(e, attempt, max_retries):
-                logger.warning("port %s is using，Try next...", current_port)
+                logger.warning(
+                    "Port %s is in use, trying the next available port...", current_port
+                )
                 continue
             else:
                 logger.error("Create TCP store fail: %s", e)
