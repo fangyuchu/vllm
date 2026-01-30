@@ -469,7 +469,6 @@ class ClientSentinel(BaseSentinel):
         success, _ = self._broadcast_command_to_downstream(
             "retry",
             target_engines,
-            response_timeout=timeout,
             new_stateless_dp_group_port=new_stateless_dp_group_port,
             timeout=timeout,
         )
@@ -509,7 +508,6 @@ class ClientSentinel(BaseSentinel):
         success, _ = self._broadcast_command_to_downstream(
             "pause",
             alive_engines,
-            response_timeout=timeout,
             timeout=timeout,
             soft_pause=soft_pause,
         )

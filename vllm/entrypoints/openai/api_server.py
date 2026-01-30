@@ -39,6 +39,7 @@ from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.elastic_ep.middleware import (
     ScalingMiddleware,
 )
+from vllm.entrypoints.serve.fault_tolerance.middleware import FaultToleranceMiddleware
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 from vllm.entrypoints.utils import (
     cli_env_setup,
@@ -151,19 +152,6 @@ async def build_async_engine_client_from_engine_args(
             async_llm.shutdown()
 
 
-async def check_engine_fault(raw_request: Request):
-    client = engine_client(raw_request)
-    assert hasattr(client, "engine_core")
-    core_client = client.engine_core
-    if (
-        hasattr(core_client, "client_sentinel")
-        and core_client.client_sentinel.is_faulted.is_set()
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail="Service is in faulted state, cannot process requests.",
-        )
-
 def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> FastAPI:
     if args.disable_fastapi_docs:
         app = FastAPI(
@@ -181,7 +169,7 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
-    register_vllm_serve_api_routers(app)
+    register_vllm_serve_api_routers(app, args=args)
 
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
@@ -239,6 +227,11 @@ def build_app(args: Namespace, supported_tasks: tuple["SupportedTask", ...]) -> 
 
     # Add scaling middleware to check for scaling state
     app.add_middleware(ScalingMiddleware)
+
+    if args.enable_fault_tolerance:
+        # Add fault-tolerance middleware to short-circuit requests when the
+        # engine's ClientSentinel reports a faulted state.
+        app.add_middleware(FaultToleranceMiddleware)
 
     if envs.VLLM_DEBUG_LOG_API_SERVER_RESPONSE:
         logger.warning(
