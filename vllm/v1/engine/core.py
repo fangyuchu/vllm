@@ -202,7 +202,6 @@ class EngineCoreSentinel(BaseSentinel):
             success, _ = self._broadcast_command_to_downstream(
                 "pause",
                 self._get_target_worker_identity(),
-                response_timeout=timeout,
                 timeout=timeout,
                 soft_pause=soft_pause,
             )
@@ -226,7 +225,6 @@ class EngineCoreSentinel(BaseSentinel):
                 success, _ = self._broadcast_command_to_downstream(
                     "pause",
                     self._get_target_worker_identity(),
-                    response_timeout=timeout,
                     timeout=timeout,
                     soft_pause=False,
                 )
