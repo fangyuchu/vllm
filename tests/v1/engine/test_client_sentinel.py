@@ -11,7 +11,7 @@ import zmq
 
 from vllm.config import FaultToleranceConfig
 from vllm.utils.collection_utils import ThreadSafeDict
-from vllm.v1.engine.core_client import ClientSentinel
+from vllm.v1.engine.base_sentinel import ClientSentinel
 from vllm.v1.engine.utils import FaultInfo
 
 FAULT_RECEIVER_ADDR = "tcp://127.0.0.1:8844"
