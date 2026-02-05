@@ -448,7 +448,7 @@ def init_gloo_process_group(
 
 
 def stateless_init_torch_distributed_process_group(
-    host: str, port: int, rank: int, world_size: int, backend: str
+    host: str, port: int, rank: int, world_size: int, backend: str, **kwargs
 ) -> ProcessGroup:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -496,25 +496,25 @@ def stateless_init_torch_distributed_process_group(
     # Use a PrefixStore to avoid accidental overrides of keys used by
     # different systems (e.g. RPC) in case the store is multi-tenant.
     prefix_store = PrefixStore(init_method, store)
-    try:
-        from vllm.platforms import current_platform
 
-        return current_platform.stateless_init_device_torch_dist_pg(
-            backend=backend,
-            prefix_store=prefix_store,
-            group_rank=group_rank,
-            group_size=group_size,
-            timeout=timeout,
-        )
-    except NotImplementedError:
-        # If platform doesn't implement stateless_init_device_torch_dist_pg, it
-        # will raise a NotImplementedError. In this case, we fall back to gloo.
+    if backend == "" or backend == "gloo":
         return init_gloo_process_group(
             prefix_store=prefix_store,
             group_rank=group_rank,
             group_size=group_size,
             timeout=timeout,
         )
+
+    from vllm.platforms import current_platform
+
+    return current_platform.stateless_init_device_torch_dist_pg(
+        backend=backend,
+        prefix_store=prefix_store,
+        group_rank=group_rank,
+        group_size=group_size,
+        timeout=timeout,
+        **kwargs,
+    )
 
 
 def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:
@@ -524,3 +524,36 @@ def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:
     """
     pg.shutdown()
     _unregister_process_group(pg.group_name)
+
+
+def _generate_deterministic_port(
+    ranks: list[int],
+    rank: int,
+    world_size: int,
+    host: str = "127.0.0.1",
+    base_port: int = 29500,
+    port_range: int = 1500,
+) -> int:
+    """Generate a deterministic port based on the sorted ranks"""
+    import hashlib
+
+    if not hasattr(_generate_deterministic_port, "_cache"):
+        _generate_deterministic_port._cache = {}
+
+    ranks_tuple = tuple(sorted(ranks))
+    cache_key = (host, ranks_tuple)
+    if cache_key in _generate_deterministic_port._cache:
+        return _generate_deterministic_port._cache[cache_key]
+
+    ranks_hash = hashlib.md5(str(ranks_tuple).encode()).hexdigest()
+    port_offset = int(ranks_hash, 16) % port_range
+    port = base_port + port_offset
+
+    from vllm.distributed.port_coordination_handler import negotiation_port
+
+    last_port = negotiation_port(rank, port, host, world_size)
+
+    if len(_generate_deterministic_port._cache) < 1000:
+        _generate_deterministic_port._cache[cache_key] = last_port
+
+    return last_port
