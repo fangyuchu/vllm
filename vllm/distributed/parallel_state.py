@@ -337,7 +337,9 @@ class GroupCoordinator:
             ):
                 self.stateless_backend = torch_distributed_backend
                 ip = config.parallel_config.data_parallel_master_ip
-                port = _generate_deterministic_port(ranks, host=ip)
+                port = _generate_deterministic_port(
+                    ranks, ranks.index(self.rank), len(ranks), host=ip
+                )
                 device_group = stateless_init_torch_distributed_process_group(
                     host=ip,
                     port=port,
@@ -1500,10 +1502,11 @@ def ensure_model_parallel_initialized(
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
-    if config.parallel_config.enable_stateless_pg:
-        backend = get_world_group().stateless_backend
-
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    if backend is None:
+        if config.parallel_config.enable_stateless_pg:
+            backend = get_world_group().stateless_backend
+        else:
+            backend = torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
             tensor_model_parallel_size,

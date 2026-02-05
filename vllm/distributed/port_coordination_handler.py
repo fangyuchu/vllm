@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import os
 import socket
 import threading
 import time
@@ -10,6 +11,9 @@ from urllib.request import Request, urlopen
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+DEFAULT_AUTH_TOKEN = "vllm_port_coordination_default"
+AUTH_TOKEN = os.environ.get("VLLM_PORT_COORDINATION_AUTH_TOKEN", DEFAULT_AUTH_TOKEN)
 
 """
     Custom HTTP request handler for port coordination service.
@@ -24,6 +28,10 @@ class CoordinationHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
+        if not self._check_auth():
+            self.send_response(401)  # Unauthorized
+            self.end_headers()
+            return
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -41,8 +49,21 @@ class CoordinationHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if not self._check_auth():
+            self.send_response(401)  # Unauthorized
+            self.end_headers()
+            return
         if self.path == "/register":
             content_length = int(self.headers["Content-Length"])
+            MAX_CONTENT_LENGTH = 1024 * 1024
+            if content_length > MAX_CONTENT_LENGTH:
+                self.send_response(413)  # Payload Too Large
+                self.end_headers()
+                return
+            if content_length <= 0:
+                self.send_response(400)
+                self.end_headers()
+                return
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data)
             rank = data.get("rank")
@@ -65,6 +86,10 @@ class CoordinationHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _check_auth(self):
+        auth_header = self.headers.get("Authorization", "")
+        return auth_header == self.coordinator.auth_token
 
     def log_request(self, code="-", size="-"):
         pass
@@ -102,6 +127,7 @@ class Coordinator:
         self.lock = threading.Lock()
         self.all_registered_event = threading.Event()
         self.available_port = get_random_port()
+        self.auth_token = AUTH_TOKEN
 
     def register_rank(self, rank: int):
         with self.lock:
@@ -177,7 +203,9 @@ def check_coordination_server(host: str, port: int, timeout: float = 5.0) -> boo
     for _ in range(20):
         try:
             url = "http://{}:{}/health".format(host, port)
-            response = urlopen(url, timeout=timeout)
+            headers = {"Content-Type": "application/json", "Authorization": AUTH_TOKEN}
+            request = Request(url, headers=headers)
+            response = urlopen(request, timeout=timeout)
             if response.getcode() != 200:
                 time.sleep(1)
                 continue
@@ -289,7 +317,12 @@ def negotiation_port(
                     url = "http://{}:{}/register".format(host, current_port)
                     data = json.dumps({"rank": rank}).encode("utf-8")
                     request = Request(
-                        url, data=data, headers={"Content-Type": "application/json"}
+                        url,
+                        data=data,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": AUTH_TOKEN,
+                        },
                     )
                     response = urlopen(request, timeout=2)
                     if response.getcode() == 200:
@@ -303,4 +336,4 @@ def negotiation_port(
     logger.error(
         "Rank %s: Port negotiation timeout after %s seconds", rank, timeout_seconds
     )
-    raise TimeoutError("Port negotiation failed for rank %s", rank)
+    raise TimeoutError("Port negotiation failed for rank {}".format(rank))
