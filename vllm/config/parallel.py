@@ -419,7 +419,9 @@ class ParallelConfig:
 
         return answer
 
-    def stateless_init_dp_group(self) -> ProcessGroup:
+    def stateless_init_dp_group(
+        self, group_name: str = "default_", backend: str = "gloo"
+    ) -> ProcessGroup:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
         # condition when calling `get_open_port()`. When the first
@@ -443,7 +445,8 @@ class ParallelConfig:
                     self.get_next_dp_init_port(),
                     self.data_parallel_rank,
                     self.data_parallel_size,
-                    backend=current_platform.dist_backend,
+                    backend=backend,
+                    group_name=group_name,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.
