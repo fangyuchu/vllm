@@ -448,7 +448,7 @@ def init_gloo_process_group(
 
 
 def stateless_init_torch_distributed_process_group(
-    host: str, port: int, rank: int, world_size: int, backend: str
+    host: str, port: int, rank: int, world_size: int, backend: str, **kwargs
 ) -> ProcessGroup:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -496,25 +496,25 @@ def stateless_init_torch_distributed_process_group(
     # Use a PrefixStore to avoid accidental overrides of keys used by
     # different systems (e.g. RPC) in case the store is multi-tenant.
     prefix_store = PrefixStore(init_method, store)
-    try:
-        from vllm.platforms import current_platform
 
-        return current_platform.stateless_init_device_torch_dist_pg(
-            backend=backend,
-            prefix_store=prefix_store,
-            group_rank=group_rank,
-            group_size=group_size,
-            timeout=timeout,
-        )
-    except NotImplementedError:
-        # If platform doesn't implement stateless_init_device_torch_dist_pg, it
-        # will raise a NotImplementedError. In this case, we fall back to gloo.
+    if backend == "" or backend == "gloo":
         return init_gloo_process_group(
             prefix_store=prefix_store,
             group_rank=group_rank,
             group_size=group_size,
             timeout=timeout,
         )
+
+    from vllm.platforms import current_platform
+
+    return current_platform.stateless_init_device_torch_dist_pg(
+        backend=backend,
+        prefix_store=prefix_store,
+        group_rank=group_rank,
+        group_size=group_size,
+        timeout=timeout,
+        **kwargs,
+    )
 
 
 def stateless_destroy_torch_distributed_process_group(pg: ProcessGroup) -> None:

@@ -295,6 +295,29 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
+    enable_stateless_pg: bool = False
+    """
+    Whether to use stateless process group creation instead of
+    torch.distributed.new_group.
+    When set to True, enables stateless process group creation for distributed
+    communication, which provides better resource management and cleanup compared to
+    the standard torch.distributed.new_group approach. This is particularly useful
+    for scenarios requiring dynamic process group creation, improved isolation, and
+    deterministic resource release.
+    When set to False (default), uses torch.distributed.new_group for process group
+    creation, which is the standard PyTorch approach.
+    Key benefits of stateless process groups:
+    - Better resource cleanup and memory management
+    - Improved isolation between different process groups
+    - More deterministic initialization and destruction
+    - Enhanced debugging capabilities
+    Note:
+        This option requires proper initialization and cleanup of process group
+        resources. Ensure your distributed setup supports the chosen backend.
+        Stateless process groups may have different performance characteristics
+        compared to standard process groups.
+    """
+
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
@@ -396,7 +419,9 @@ class ParallelConfig:
 
         return answer
 
-    def stateless_init_dp_group(self) -> ProcessGroup:
+    def stateless_init_dp_group(
+        self, group_name: str = "default_", backend: str = "gloo"
+    ) -> ProcessGroup:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
         # condition when calling `get_open_port()`. When the first
@@ -420,7 +445,8 @@ class ParallelConfig:
                     self.get_next_dp_init_port(),
                     self.data_parallel_rank,
                     self.data_parallel_size,
-                    backend=current_platform.dist_backend,
+                    backend=backend,
+                    group_name=group_name,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.

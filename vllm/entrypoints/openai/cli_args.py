@@ -314,7 +314,6 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     """Quick checks for model serve args that raise prior to loading."""
     if hasattr(args, "subparser") and args.subparser != "serve":
         return
-
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
 
@@ -323,6 +322,14 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
     if args.enable_log_outputs and not args.enable_log_requests:
         raise TypeError("Error: --enable-log-outputs requires --enable-log-requests")
+    if args.enable_stateless_pg and args.tensor_parallel_size > 1:
+        raise ValueError(
+            "Error: When using --enable-stateless-pg,"
+            "tensor parallelism is not supported. "
+            f"Current tensor_parallel_size = {args.tensor_parallel_size}, "
+            f"but must be 1."
+            f"Please set --tensor-parallel-size=1 or disable stateless_pg."
+        )
 
 
 def create_parser_for_docs() -> FlexibleArgumentParser:
