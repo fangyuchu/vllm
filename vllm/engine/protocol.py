@@ -188,12 +188,6 @@ class EngineClient(ABC):
         """Perform a collective RPC call to the given path."""
         raise NotImplementedError
 
-    async def handle_fault(
-        self, instruction: str, timeout: int = 300, **kwargs
-    ) -> bool:
-        """send fault tolerance instruction to the engine"""
-        raise NotImplementedError
-
     async def get_fault_info(self):
         """report exception from engine_core"""
         raise NotImplementedError

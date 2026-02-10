@@ -55,7 +55,6 @@ def test_client_sentinel_initialization():
     assert sentinel.engine_exception_q is engine_exception_q
 
     assert sentinel.fault_receiver_socket.type == zmq.ROUTER
-    assert sentinel.downstream_cmd_socket.type == zmq.ROUTER
     assert sentinel.fault_pub_socket.type == zmq.PUB
 
     sentinel.shutdown()
@@ -157,62 +156,3 @@ def test_shutdown_sentinel():
         original_pub_sock.send(b"test")
 
     assert original_ctx.closed
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("instruction", ["pause", "retry"])
-async def test_handle_fault_async(instruction):
-    engine_exception_q: queue.Queue[FaultInfo] = queue.Queue()
-    if instruction == "retry":
-        engine_status_dict = create_test_thread_safe_dict({0: "Unhealthy"})
-    else:
-        engine_status_dict = create_test_thread_safe_dict({0: "Healthy"})
-    sentinel = create_client_sentinel(engine_exception_q, engine_status_dict)
-
-    time.sleep(0.1)
-    ctx = zmq.Context().instance()
-    cmd_socket = ctx.socket(zmq.DEALER)
-    cmd_socket.setsockopt(zmq.IDENTITY, b"engine_identity")
-    cmd_socket.connect(CMD_ADDR)
-    time.sleep(0.1)
-
-    uuid = None
-    uuid_received = threading.Event()
-
-    def receive_cmd(cmd_socket):
-        nonlocal uuid
-        time.sleep(0.1)
-
-        identity, msg = cmd_socket.recv_multipart()
-        cmd_dict = json.loads(msg.decode("utf-8"))
-        uuid = cmd_dict["method_uuid"]
-        if instruction == "retry":
-            assert cmd_dict["method"] == "retry"
-        else:
-            assert cmd_dict["method"] == "pause"
-        assert cmd_dict["timeout"] == 3
-        uuid_received.set()
-
-    def response_cmd(cmd_socket):
-        nonlocal uuid
-        if not uuid_received.wait(timeout=2):
-            pytest.fail("Timeout waiting for UUID")
-        execute_result = {"sentinel_tag": "DP_0", "success": True, "method_uuid": uuid}
-        cmd_socket.send_multipart([b"", json.dumps(execute_result).encode("utf-8")])
-
-    threading.Thread(target=receive_cmd, args=(cmd_socket,), daemon=True).start()
-    threading.Thread(target=response_cmd, args=(cmd_socket,), daemon=True).start()
-
-    if instruction == "pause":
-        result = await sentinel.handle_fault(instruction, 3, soft_pause=True)
-    else:
-        result = await sentinel.handle_fault(
-            "retry", 3, new_stateless_dp_group_port=None
-        )
-
-    assert result is True
-    assert engine_status_dict[0] == "Healthy"
-
-    cmd_socket.close()
-    ctx.term()
-    sentinel.shutdown()

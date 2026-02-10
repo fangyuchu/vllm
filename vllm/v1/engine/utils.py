@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
-import json
 import multiprocessing
 import os
-import time
 import uuid
 import weakref
 from collections.abc import Callable, Iterator, Mapping
@@ -27,14 +25,12 @@ from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.utils.network_utils import (
     get_open_zmq_ipc_path,
     make_zmq_socket,
-    recv_router_dealer_message,
     zmq_socket_ctx,
 )
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.exceptions import FaultInfo
 from vllm.v1.executor import Executor
-from vllm.v1.serial_utils import serialize_method_call
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
 
 if TYPE_CHECKING:
@@ -67,7 +63,6 @@ class EngineZmqAddresses:
     inputs: list[str]
     # ZMQ output socket addresses for each front-end client (responses)
     outputs: list[str]
-
     # ZMQ input socket address of DP coordinator if applicable
     coordinator_input: str | None = None
     # ZMQ output socket address of DP coordinator if applicable
@@ -79,8 +74,6 @@ class EngineZmqAddresses:
 
     # ZMQ fault_pub_socket address of client sentinel
     fault_pub_socket_addr: str | None = None
-    # ZMQ client_cmd socket address of client sentinel
-    client_cmd_addr: str | None = None
     # ZMQ engine_fault socket address of EngineCoreSentinel
     engine_fault_socket_addr: str | None = None
     # Identities of engine core DEALER sockets, keyed by engine index.
@@ -457,7 +450,6 @@ class CoreEngineActorManager:
                     local_dp_rank=local_index,
                 )
             )
-
             if local_client:
                 self.local_engine_actors.append(actor)
             else:
@@ -939,9 +931,6 @@ def launch_core_engines(
             host=vllm_config.parallel_config.data_parallel_master_ip,
             port=vllm_config.fault_tolerance_config.internal_fault_report_port,
         )
-        addresses.client_cmd_addr = get_engine_client_zmq_addr(
-            local_only=client_local_only, host=host
-        )
         identity_group = generate_identity_group(
             peer1="client",
             peer2="engine_core_sentinel",
@@ -1228,26 +1217,6 @@ def wait_for_engine_startup(
         )
 
 
-def generate_unique_uuids(n: int) -> set[uuid.UUID]:
-    """Generate a set of unique UUID v4 objects.
-
-    Generates a specified number of unique UUID (version 4) objects.
-    UUID v4 uses cryptographically strong random numbers, ensuring
-    an extremely low probability of collisions.
-
-    Args:
-        n: The number of unique UUIDs to generate
-
-    Returns:
-        A set containing 'n' unique UUID objects
-    """
-    uuids: set[uuid.UUID] = set()
-    while len(uuids) < n:
-        # Generate a random UUID (version 4) and add to the set
-        uuids.add(uuid.uuid4())
-    return uuids
-
-
 def generate_identity_group(peer1, peer2, use, n):
     """
     Generate n unique identities for ZMQ ROUTER nodes
@@ -1256,111 +1225,8 @@ def generate_identity_group(peer1, peer2, use, n):
     Return: list with identities in byte type as elements
     """
     identitys = list()
-    uuids = generate_unique_uuids(n)
+    uuids = [uuid.uuid4() for _ in n]
     for id in uuids:
         identity_str = f"{peer1}_{peer2}_{use}_{id}".encode()
         identitys.append(identity_str)
     return identitys
-
-
-def broadcast_instruction(
-    cmd_socket,
-    target_identities: set[bytes] | list[bytes],
-    method_name: str,
-    method_uuid: str | None = None,
-    **kwargs,
-) -> str:
-    """
-    Broadcast an instruction message to multiple remote endpoints.
-    It serializes the specified method_name along with its parameters and
-    dispatches it to all target identities via the provided ZeroMQ socket.
-    """
-    if method_uuid is None:
-        method_uuid = str(uuid.uuid4())
-
-    for identity in target_identities:
-        serialized_instruction = serialize_method_call(
-            method_name, method_uuid, **kwargs
-        )
-        cmd_socket.send_multipart(
-            [identity, b"", serialized_instruction.encode("utf-8")]
-        )
-
-    return method_uuid
-
-
-def wait_for_instruction_result(
-    cmd_socket: zmq.Socket,
-    target_identities: set[bytes] | list[bytes],
-    method_name: str,
-    timeout: int,
-    method_uuid: str,
-) -> dict[bytes, dict]:
-    """
-    Wait for acknowledgment or result messages from multiple endpoints.
-    This function listens for responses corresponding to a previously broadcasted
-    instruction, identified by the given `method_uuid`.
-
-    Args:
-        cmd_socket: The socket used to receive responses.
-        target_identities: Identities that are expected to respond.
-        method_name: The name of the method_name (used for logging).
-        timeout: The maximum wait time (in seconds).
-        method_uuid: The unique identifier associated with the method_name.
-
-    Notes:
-        - This function does not raise exceptions for timeouts or parsing errors.
-          Instead, it logs the issue and returns whatever responses have been collected.
-    """
-    start = time.monotonic()
-    responses: dict[bytes, dict] = {}
-
-    target_identities = set(target_identities)
-
-    while target_identities:
-        remaining = timeout - (time.monotonic() - start)
-        if remaining <= 0:
-            logger.debug(
-                'Timeout while waiting for responses of command "%s" '
-                "from identities: %s",
-                method_name,
-                target_identities,
-            )
-            # Return partial results collected so far
-            return responses
-
-        try:
-            has_msg, identity, response = recv_router_dealer_message(
-                cmd_socket,
-                use_poller=True,
-                poll_timeout=int(remaining * 1000),
-            )
-
-            # Skip if no message was received during this polling period
-            if not has_msg:
-                continue
-
-            assert identity is not None
-            assert response is not None
-            response_dict = json.loads(response)
-            recv_uuid = response_dict.get("method_uuid")
-
-            # Ignore outdated or unrelated messages
-            if recv_uuid != method_uuid:
-                logger.debug(
-                    "Discarding outdated response: expected method_uuid=%s, got %s",
-                    method_uuid,
-                    recv_uuid,
-                )
-                continue
-
-            # Record this engine's response
-            responses[identity] = response_dict
-            target_identities.discard(identity)
-
-        except Exception as e:
-            logger.error("Error while processing engine response: %s", e)
-            # Return partial results even on exception to avoid data loss
-            return responses
-
-    return responses

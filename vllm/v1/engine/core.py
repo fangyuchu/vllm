@@ -68,9 +68,6 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import (
     MsgpackDecoder,
     MsgpackEncoder,
-    deserialize_method_call,
-    run_method,
-    serialize_method_call,
 )
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details, get_engine_client_zmq_addr
@@ -95,9 +92,7 @@ class EngineCoreSentinel(BaseSentinel):
         self,
         engine_index: int,
         fault_signal_q: queue.Queue,
-        cmd_q: queue.Queue,
         busy_loop_active: threading.Event,
-        engine_input_q: queue.Queue,
         client_cmd_addr: str,
         worker_cmd_addr: str,
         engine_fault_socket_addr: str,
@@ -117,9 +112,7 @@ class EngineCoreSentinel(BaseSentinel):
         )
 
         self.fault_signal_q = fault_signal_q
-        self.cmd_q = cmd_q
         self.busy_loop_active = busy_loop_active
-        self.engine_input_q = engine_input_q
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.dp_size = dp_size
@@ -134,7 +127,6 @@ class EngineCoreSentinel(BaseSentinel):
         )
 
         self.poller = zmq.Poller()
-        self.communicator_aborted = False
         self.engine_running = True
         threading.Thread(
             target=self.run, daemon=True, name="EngineCoreSentinelMonitorThread"
@@ -150,12 +142,6 @@ class EngineCoreSentinel(BaseSentinel):
         while not self.sentinel_dead:
             # Check for engine fault signals
             self.poll_and_report_fault_events()
-            # Check for commands from ClientSentinel
-            has_msg, cmd_str = self.receive_upstream_cmd()
-            if has_msg:
-                assert cmd_str is not None
-                success, method_uuid, reason = self._execute_cmd(cmd_str)
-                self._send_execution_result(success, method_uuid, reason)
 
     def poll_and_report_fault_events(self):
         try:
@@ -181,97 +167,6 @@ class EngineCoreSentinel(BaseSentinel):
         msg = FaultInfo.from_exception(exception, self.engine_index).serialize()
         msg_bytes = msg.encode("utf-8")
         self.engine_fault_socket.send_multipart([b"", msg_bytes])
-
-    def pause(self, timeout: int = 1, **kwargs) -> bool:
-        """
-        Pause the busy loop safely.
-        Args:
-            timeout:wait for the busy loop to acknowledge the pause signal
-        """
-        self.logger("Start pausing EngineCore", level="info")
-        soft_pause = kwargs.get("soft_pause", False)
-        start_time = time.monotonic()
-        if self.engine_running:
-            # Clear the flag to signal busy loop should pause
-            self.busy_loop_active.clear()
-            # Put a sentinel (empty request) to unblock the busy loop
-            # if it's blocked on input_queue.get()
-            self.engine_input_q.put((EngineCoreRequestType.PAUSE, None))
-            success, _ = self._broadcast_command_to_downstream(
-                "pause",
-                self._get_target_worker_identity(),
-                timeout=timeout,
-                soft_pause=soft_pause,
-            )
-            elapsed = time.monotonic() - start_time
-            if success:
-                remaining_timeout = max(0, timeout - elapsed)
-                try:
-                    # Wait for engine to acknowledge the pause via fault_signal_q
-                    exception = self.fault_signal_q.get(timeout=remaining_timeout)
-                    self.fault_signal_q.put(exception)
-                    success = True
-                    self.engine_running = False
-                except queue.Empty:
-                    # Timeout waiting for pause acknowledgment
-                    success = False
-        else:
-            # already paused
-            success = True
-            if not soft_pause:
-                # abort the communicators
-                success, _ = self._broadcast_command_to_downstream(
-                    "pause",
-                    self._get_target_worker_identity(),
-                    timeout=timeout,
-                    soft_pause=False,
-                )
-        return success
-
-    def retry(self, timeout: int = 1, **kwargs) -> bool:
-        """
-        Handle the retry instruction from the ClientSentinel.
-        This instruction tells the EngineCore to continue its busy loop
-        after being suspended due to an exception.
-        """
-        if self.engine_running:
-            return True
-        new_stateless_dp_group_port = kwargs.get("new_stateless_dp_group_port")
-        start_time = time.monotonic()
-        identities = self._get_target_worker_identity()
-        success, _ = self._broadcast_command_to_downstream(
-            "retry", identities, timeout=timeout
-        )
-        if not success:
-            return success
-
-        if self.dp_size > 1:
-            # If the Gloo communication times out
-            # the data parallel group (dp_group) needs to be reinitialized
-            command = "reinit_dp_group_on_fault_tolerance"
-            self.cmd_q.put(
-                serialize_method_call(
-                    command, new_stateless_dp_group_port=new_stateless_dp_group_port
-                )
-            )
-        else:
-            self.cmd_q.put(None)
-
-        # Ensure busy loop has been recovered.
-        elapsed = time.monotonic() - start_time
-        remaining_timeout = max(0, timeout - elapsed)
-        success = self.busy_loop_active.wait(timeout=remaining_timeout)
-        self.engine_running = success
-        assert self.cmd_q.empty(), "cmd_q must be empty after execution"
-        return success
-
-    def _get_target_worker_identity(self):
-        identities = set()
-        for tp_rank in range(self.tp_size):
-            for pp_rank in range(self.pp_size):
-                identity = f"PP{pp_rank}_TP{tp_rank}".encode()
-                identities.add(identity)
-        return identities
 
     def shutdown(self):
         if self.engine_fault_socket is not None:
@@ -301,40 +196,8 @@ def busy_loop_wrapper(busy_loop_func):
                         "Suspended and waiting for fault tolerance "
                         "instructions."
                     )
-
-                    # Put running requests into waiting list.
-                    timestamp = time.monotonic()
-                    while self.scheduler.running:
-                        request = self.scheduler.running.pop()
-                        self.scheduler.preempt_request(request, timestamp)
-                    self.scheduler.prev_step_scheduled_req_ids.clear()
-                    if self.batch_queue is not None:
-                        self.batch_queue.clear()
-
-                    try:
-                        # Block until recovery command received
-                        cmd_str = self.cmd_q.get(timeout=self.engine_recovery_timeout)
-                        logger.debug(
-                            "[BusyLoopWrapper] Received fault tolerance command: %s",
-                            cmd_str,
-                        )
-                        if cmd_str is not None:
-                            method, _, params = deserialize_method_call(cmd_str)
-                            run_method(self, method, args=(), kwargs=params)
-                        # recovery succeeded; restart the busy loop
-                        continue
-                    except queue.Empty:
-                        # No handling instruction received within predefined
-                        # timeout period.
-                        logger.error(
-                            "[BusyLoopWrapper] Fault tolerance instruction not received"
-                            " within timeout. Proceeding with default exception "
-                            "handling."
-                        )
-                    except Exception as cmd_exc:
-                        raise RuntimeError(
-                            "Fault tolerance execution failed."
-                        ) from cmd_exc
+                    # todo: abort all existing requests
+                    # todo: wait for engine-recovery-timeout before shutdown
 
                 # Fault tolerance not enabled OR no instruction received
                 # before timeout. Re-raise the original exception
@@ -960,7 +823,6 @@ class EngineCoreProc(EngineCore):
                 # Track whether the busy loop is currently active.
                 self.busy_loop_active = threading.Event()
                 self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
-                self.cmd_q: queue.Queue[str | None] = queue.Queue(maxsize=1)
                 self.engine_recovery_timeout = ft_config.engine_recovery_timeout
                 engine_core_sentinel_ids = addresses.engine_core_sentinel_identities
                 assert engine_core_sentinel_ids is not None
@@ -971,9 +833,7 @@ class EngineCoreProc(EngineCore):
                 self.engine_core_sentinel = EngineCoreSentinel(
                     engine_index=self.engine_index,
                     fault_signal_q=self.fault_signal_q,
-                    cmd_q=self.cmd_q,
                     busy_loop_active=self.busy_loop_active,
-                    engine_input_q=self.input_queue,
                     engine_fault_socket_addr=addresses.engine_fault_socket_addr,
                     client_cmd_addr=addresses.client_cmd_addr,
                     worker_cmd_addr=worker_cmd_addr,
@@ -1267,15 +1127,9 @@ class EngineCoreProc(EngineCore):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
-            self._check_busy_loop_active()
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
-            self._check_busy_loop_active()
             self._process_engine_step()
-
-    def _check_busy_loop_active(self):
-        if self.enable_fault_tolerance and not self.busy_loop_active.is_set():
-            raise EngineLoopPausedError("Engine busy loop is paused.")
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -1334,8 +1188,6 @@ class EngineCoreProc(EngineCore):
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
-        elif request_type == EngineCoreRequestType.PAUSE:
-            self._check_busy_loop_active()
         elif request_type == EngineCoreRequestType.UTILITY:
             client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)
@@ -1616,9 +1468,7 @@ class DPEngineCoreProc(EngineCoreProc):
         assert 0 <= local_dp_rank <= dp_rank < dp_size
 
         self.dp_rank = dp_rank
-        self.dp_group = vllm_config.parallel_config.stateless_init_dp_group(
-            fault_tolerance_config=vllm_config.fault_tolerance_config
-        )
+        self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
 
     def shutdown(self):
         super().shutdown()
@@ -1673,11 +1523,9 @@ class DPEngineCoreProc(EngineCoreProc):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
-            self._check_busy_loop_active()
             self._process_input_queue()
 
             # 2) Step the engine core.
-            self._check_busy_loop_active()
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
@@ -1689,11 +1537,9 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                self._check_busy_loop_active()
                 self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            self._check_busy_loop_active()
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )
@@ -1725,14 +1571,6 @@ class DPEngineCoreProc(EngineCoreProc):
             return True
 
         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
-
-    def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port: int):
-        stateless_destroy_torch_distributed_process_group(self.dp_group)
-        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group(
-            fault_tolerance_config=self.vllm_config.fault_tolerance_config,
-            dp_init_port=new_stateless_dp_group_port,
-        )
-        self.step_counter = 0
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
