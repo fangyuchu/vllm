@@ -6,6 +6,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -47,6 +48,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     EngineCoreRequestType,
+    FaultToleranceRequest,
     FinishReason,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -68,9 +70,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import (
     MsgpackDecoder,
     MsgpackEncoder,
-    deserialize_method_call,
     run_method,
-    serialize_method_call,
 )
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details, get_engine_client_zmq_addr
@@ -151,11 +151,7 @@ class EngineCoreSentinel(BaseSentinel):
             # Check for engine fault signals
             self.poll_and_report_fault_events()
             # Check for commands from ClientSentinel
-            has_msg, cmd_str = self.receive_upstream_cmd()
-            if has_msg:
-                assert cmd_str is not None
-                success, method_uuid, reason = self._execute_cmd(cmd_str)
-                self._send_execution_result(success, method_uuid, reason)
+            self.receive_and_execute_upstream_cmd()
 
     def poll_and_report_fault_events(self):
         try:
@@ -249,11 +245,12 @@ class EngineCoreSentinel(BaseSentinel):
             # If the Gloo communication times out
             # the data parallel group (dp_group) needs to be reinitialized
             command = "reinit_dp_group_on_fault_tolerance"
-            self.cmd_q.put(
-                serialize_method_call(
-                    command, new_stateless_dp_group_port=new_stateless_dp_group_port
-                )
+            reinit_request = FaultToleranceRequest(
+                instruction=command,
+                request_id=str(uuid.uuid4()),
+                params={"new_stateless_dp_group_port": new_stateless_dp_group_port},
             )
+            self.cmd_q.put(reinit_request)
         else:
             self.cmd_q.put(None)
 
@@ -313,13 +310,17 @@ def busy_loop_wrapper(busy_loop_func):
 
                     try:
                         # Block until recovery command received
-                        cmd_str = self.cmd_q.get(timeout=self.engine_recovery_timeout)
-                        logger.debug(
-                            "[BusyLoopWrapper] Received fault tolerance command: %s",
-                            cmd_str,
+                        ft_request = self.cmd_q.get(
+                            timeout=self.engine_recovery_timeout
                         )
-                        if cmd_str is not None:
-                            method, _, params = deserialize_method_call(cmd_str)
+
+                        if ft_request is not None:
+                            logger.debug(
+                                "[BusyLoopWrapper] Received fault tolerance "
+                                "command: %s",
+                                ft_request.instruction,
+                            )
+                            method, params = (ft_request.instruction, ft_request.params)
                             run_method(self, method, args=(), kwargs=params)
                         # recovery succeeded; restart the busy loop
                         continue
