@@ -79,8 +79,9 @@ async def process_fault_tolerance_instruction(request: Request) -> Response:
     serialized_instruction = serialize_method_call(
         fault_tolerance_instruction, **kwargs
     )
-    success = await engine.handle_fault(serialized_instruction)
-    if success == "True":
+    #todo:修改
+    success, reason = await engine.handle_fault(serialized_instruction)
+    if success:
         return JSONResponse(
             status_code=200,
             content={"message": "Instruction executed successfully."},
@@ -90,7 +91,7 @@ async def process_fault_tolerance_instruction(request: Request) -> Response:
     engine.shutdown()
     raise HTTPException(
         status_code=400,
-        detail="Instruction execution failed.",
+        detail=f"Instruction execution failed. Reason: {reason}",
     )
 
 

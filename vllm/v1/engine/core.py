@@ -180,7 +180,6 @@ class EngineCoreSentinel(BaseSentinel):
     def _report_exception_to_client_sentinel(self, exception: Exception) -> None:
         msg = FaultInfo.from_exception(exception, self.engine_index).serialize()
         msg_bytes = msg.encode("utf-8")
-        self.engine_fault_socket.send_multipart([b"", msg_bytes])
 
     def pause(self, timeout: int = 1, **kwargs) -> bool:
         """

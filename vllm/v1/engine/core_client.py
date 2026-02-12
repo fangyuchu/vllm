@@ -20,6 +20,7 @@ from typing import Any, TypeAlias, TypeVar, cast
 import msgspec.msgpack
 import zmq
 import zmq.asyncio
+from pydantic_core.core_schema import plain_serializer_function_ser_schema
 from ray.util.state import get_actor
 
 from vllm.config import VllmConfig
@@ -41,6 +42,8 @@ from vllm.v1.engine import (
     ReconfigureDistributedRequest,
     ReconfigureRankType,
     UtilityOutput,
+    FaultToleranceRequest,
+    FaultToleranceResult,
 )
 from vllm.v1.engine.base_sentinel import BaseSentinel
 from vllm.v1.engine.coordinator import DPCoordinator
@@ -266,7 +269,7 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
-    async def handle_fault(self, serialized_instruction: str) -> str:
+    async def handle_fault(self, fault_tolerance_request: FaultToleranceRequest) -> FaultToleranceResult:
         raise NotImplementedError
 
     async def fault_reporter(self):
@@ -387,7 +390,8 @@ class ClientSentinel(BaseSentinel):
             fault_tolerance_config=vllm_config.fault_tolerance_config,
         )
 
-        self.upstream_cmd_socket = make_zmq_socket(
+        #todo: change the name here
+        self.fault_tolerance_req_socket = make_zmq_socket(
             ctx=self.ctx,
             path=client_sentinel_cmd_addr,
             socket_type=zmq.ROUTER,
@@ -404,14 +408,14 @@ class ClientSentinel(BaseSentinel):
         self.fault_pub_socket = make_zmq_socket(
             ctx=self.ctx, path=fault_pub_socket_addr, socket_type=zmq.PUB, bind=True
         )
-
-        self.executing_cmd: dict[str, str | None] = {"command": None, "identity": None}
-
+        self.ft_lock = threading.Lock()
+        self.current_ft_cmd: None |FaultToleranceRequest = None
+        self.current_src_client_identity: None|bytes = None
         self.inproc_comm_addr = get_engine_client_zmq_addr(local_only=True, host=host)
-        self.execute_result_socket = make_zmq_socket(
+        self.inproc_res_notify_socket = make_zmq_socket(
             ctx=self.ctx, path=self.inproc_comm_addr, socket_type=zmq.PAIR, bind=True
         )
-        self.inproc_cmd_socket = make_zmq_socket(
+        self.inproc_cmd_socket = make_zmq_socket( #todo
             ctx=self.ctx, path=self.inproc_comm_addr, socket_type=zmq.PAIR, bind=False
         )
 
@@ -446,7 +450,7 @@ class ClientSentinel(BaseSentinel):
                 serialized_cmd = self.inproc_cmd_socket.recv_string()
                 # block until command is finished
                 success, _, reason = self._execute_cmd(serialized_cmd)
-                self.inproc_cmd_socket.send_string(str(success))
+                self.inproc_cmd_socket.send_string(str(success)) #todo:这里改成发送success和reason
             except zmq.ZMQError as e:
                 # Socket is closed.
                 self.logger("zmq error happened: %s", e, level="error")
@@ -510,64 +514,9 @@ class ClientSentinel(BaseSentinel):
         )
         return success
 
-    def recv_msg_and_dispatch_cmd(self):
-        poller = zmq.Poller()
-        poller.register(self.fault_receiver_socket, zmq.POLLIN)
-        poller.register(self.upstream_cmd_socket, zmq.POLLIN)
-        poller.register(self.execute_result_socket, zmq.POLLIN)
-        while not self.sentinel_dead:
-            events = poller.poll(timeout=5000)
-            if not events:
-                continue
-            events = dict(events)
-            if self.fault_receiver_socket in events:
-                self.listen_and_publish_fault_status()
-                if self.executing_cmd["command"] is not None:
-                    self.executing_cmd["command"] = "pause"
-                    params = {
-                        "timeout": self.ft_config.gloo_comm_timeout,
-                        "soft_pause": False,
-                    }
-                    self.execute_result_socket.send_string(
-                        serialize_method_call(
-                            "pause",
-                            None,
-                            **params,
-                        )
-                    )
-            elif self.upstream_cmd_socket in events:
-                identity, _, cmd_str = self.upstream_cmd_socket.recv_multipart()
-                if self.executing_cmd["command"] is not None:
-                    msg = (
-                        f"system busy, vllm is executing fault tolerance command:"
-                        f" {self.executing_cmd.get('command')}"
-                    )
-                    self.upstream_cmd_socket.send_multipart(
-                        [identity, b"", msg.encode("utf-8")]
-                    )
-                    continue
-                cmd_str = cmd_str.decode("utf-8")
-                self.executing_cmd.update(
-                    {
-                        "command": deserialize_method_call(cmd_str)[0],
-                        "identity": identity.decode("utf-8"),
-                    }
-                )
-                self.execute_result_socket.send_string(cmd_str)
-
-            elif self.execute_result_socket in events:
-                msg = self.execute_result_socket.recv_string()
-                identity = self.executing_cmd["identity"]
-                if identity is not None:
-                    self.upstream_cmd_socket.send_multipart(
-                        [identity.encode("utf-8"), b"", msg.encode("utf-8")]
-                    )
-                self.executing_cmd.update({"command": None, "identity": None})
-
-    def listen_and_publish_fault_status(self):
+    def _alert_and_pause(self):
         try:
             identity, _, message = self.fault_receiver_socket.recv_multipart()
-
             fault_info = FaultInfo.from_json(message.decode("utf-8"))
             self.engine_exception_q.put_nowait(fault_info)
             engine_status = "Dead" if "dead" in fault_info.type else "Unhealthy"
@@ -577,19 +526,84 @@ class ClientSentinel(BaseSentinel):
             self.fault_pub_socket.send_string(
                 f"vllm_fault|{json.dumps(self.engine_status_dict)}"
             )
-            self.is_faulted.set()
-            return True
+            if not self.is_faulted:
+                self.is_faulted.set()
+                pause_request = FaultToleranceRequest(
+                    request_id=str(uuid.uuid4()),
+                    instruction="pause",
+                    params={
+                        "timeout": self.ft_config.gloo_comm_timeout,
+                        "soft_pause": False,
+                    },
+                )
+                with self.ft_lock:
+                    assert self.ft_lock is None
+                    self.current_ft_cmd = pause_request
+                    self.current_src_client_identity=None
         except zmq.ZMQError:
             # Socket was closed during polling, exit loop.
             self.logger("Fault receiver socket closed, stopping thread.", level="info")
             raise
 
-    def shutdown(self):
-        self.upstream_cmd_socket.close()
+    def _dispatch_fault_tolerance_request(self,ft_request:FaultToleranceRequest,identity:bytes)->bool:
+        if self.current_ft_cmd is not None:
+            # Currently executing another fault tolerance instruction.
+            return False
+
+        with self.ft_lock:
+            assert self.ft_lock is None
+            self.current_ft_cmd = ft_request
+            self.current_src_client_identity = identity
+        return True
+
+
+    def recv_msg_and_dispatch_cmd(self):
+        poller = zmq.Poller()
+        poller.register(self.fault_receiver_socket, zmq.POLLIN)
+        poller.register(self.fault_tolerance_req_socket, zmq.POLLIN)
+        poller.register(self.inproc_res_notify_socket, zmq.POLLIN)
+        while not self.sentinel_dead:
+            events = poller.poll(timeout=5000)
+            if not events:
+                continue
+            events = dict(events)
+            if self.fault_receiver_socket in events:
+                # If a fault message is received, alert and attempt to pause the engines.
+                self._alert_and_pause()
+            elif self.fault_tolerance_req_socket in events:
+                # Received fault tolerance command from client. Add corresponding command to the queue.
+                parts = self.fault_tolerance_req_socket.recv_multipart()
+                identity = parts[0]
+                msg_bytes = parts[-1]
+                ft_request = msgspec.msgpack.decode(msg_bytes)
+                success = self._dispatch_fault_tolerance_request(ft_request, identity)
+                if not success:
+                    # If we're busy, reply with a busy message.
+                    msg = (
+                        f"System busy, vLLM is executing another fault tolerance instruction."
+                    )
+                    res = FaultToleranceResult(ft_request.request_id,False,msg)
+                    resp = msgspec.msgpack.encode(res)
+                    self.fault_tolerance_req_socket.send_multipart([identity, b"", resp])
+                    continue
+
+            elif self.inproc_res_notify_socket in events:
+                # Send FT execution result back to client.
+                msg = self.inproc_res_notify_socket.recv_string()
+                ft_result = msgspec.msgpack.decode(msg)
+                with self.ft_lock:
+                    assert  self.current_ft_cmd is not None
+                    assert self.current_ft_cmd.request_id == ft_result.request_id
+                    if self.current_src_client_identity is not None:
+                        self.fault_tolerance_req_socket.send_multipart(
+                            [self.current_src_client_identity, b"", msg]
+                        )
+                    self.current_ft_cmd = self.current_src_client_identity = None
+
         self.fault_receiver_socket.close()
         self.fault_pub_socket.close()
         self.inproc_cmd_socket.close()
-        self.execute_result_socket.close()
+        self.inproc_res_notify_socket.close()
         self.ctx.term()
         super().shutdown()
 
@@ -1197,6 +1211,7 @@ class AsyncMPClient(MPClient):
                 if vllm_config.parallel_config.local_engines_only
                 else dp_size
             )
+            #todo:这里的engine_index不对
             self.engine_status_dict: dict[int, dict[str, Any]] = {
                 engine_index: {"status": "Healthy"}
                 for engine_index in range(num_dp_managed)
@@ -1408,26 +1423,24 @@ class AsyncMPClient(MPClient):
             "collective_rpc", method, timeout, args, kwargs
         )
 
-    async def handle_fault(self, serialized_cmd: str) -> str:
-        """handle fault of current instance by instruction"""
+    async def handle_fault(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        if getattr(self.resources, "engine_dead", False):
+            return FaultToleranceResult(request_id = ft_request.request_id,success=False, reason="engine is dead")
+        def _send_and_recv():
+            # send the FaultToleranceRequest to ClientSentinel and recv corresponding result.
+            payload = msgspec.msgpack.encode(ft_request)
+            self.client_sentinel_cmd_socket.send_multipart([b"", payload])
+            parts = self.client_sentinel_cmd_socket.recv_multipart()
+            # reply is expected to be in the last frame
+            msg_bytes = parts[-1]
+            res = msgspec.msgpack.decode(msg_bytes)
+            return res
 
-        def _send_and_recv() -> bytes:
-            # Blocking ZeroMQ operations are executed in a worker thread to avoid
-            # blocking the asyncio event loop.
-            self.client_sentinel_cmd_socket.send_multipart(
-                [b"", serialized_cmd.encode("utf-8")]
-            )
-            _, msg_bytes = self.client_sentinel_cmd_socket.recv_multipart()
-            return msg_bytes
+        # Perform blocking ZMQ send/recv in a worker thread to avoid
+        # blocking the asyncio event loop.
+        ft_result = await asyncio.to_thread(_send_and_recv)
+        return ft_result
 
-        msg_bytes = await asyncio.to_thread(_send_and_recv)
-        msg = msg_bytes.decode("utf-8")
-        ft_config = self.vllm_config.fault_tolerance_config
-        if "False" in msg and ft_config.shutdown_on_fault_tolerance_failure:
-            logger.error("Fault tolerance failed. Shutting down the application.")
-            self.resources.engine_dead = True
-            self.shutdown()
-        return msg
 
     def _engine_status_listener(self):
         while True:
