@@ -233,7 +233,7 @@ class FaultToleranceRequest(msgspec.Struct):
 
     request_id: str
     instruction: str
-    params: dict[str, Any] | None = None
+    params: dict[str, Any]
 
 
 class FaultToleranceResult(msgspec.Struct):
@@ -244,3 +244,10 @@ class FaultToleranceResult(msgspec.Struct):
     request_id: str
     success: bool
     reason: str | None = None
+
+
+class EngineStatusType(enum.IntEnum):
+    HEALTHY = 0
+    DEAD = 1
+    UNHEALTHY = 2
+    PAUSED = 3
