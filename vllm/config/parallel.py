@@ -13,7 +13,7 @@ from torch.distributed import ProcessGroup, ReduceOp
 from typing_extensions import Self
 
 import vllm.envs as envs
-from vllm.config import FaultToleranceConfig
+from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
@@ -115,6 +115,8 @@ class ParallelConfig:
     data_parallel_rank_local: int | None = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
+    data_parallel_start_rank: int = 0
+    """Rank of the data parallel group."""
     data_parallel_master_ip: str = "127.0.0.1"
     """IP of the data parallel master."""
     data_parallel_rpc_port: int = 29550

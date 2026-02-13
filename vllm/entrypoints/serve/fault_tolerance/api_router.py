@@ -58,7 +58,7 @@ async def process_fault_tolerance_instruction(raw_request: Request):
         )
     # Supported instructions: ["pause", "retry"].
     # More instruction types may be added in future updates.
-    elif fault_tolerance_instruction not in ["pause", "retry"]:
+    elif fault_tolerance_instruction not in ["pause", "retry","descale"]:
         raise HTTPException(
             status_code=400, detail="Invalid 'fault_tolerance_instruction' value."
         )
