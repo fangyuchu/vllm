@@ -108,6 +108,8 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
+    expert_parallel_size: int = 1
+    """Number of expert parallel groups."""
     data_parallel_size_local: int = 1
     """Number of local data parallel groups."""
     data_parallel_rank: int = 0

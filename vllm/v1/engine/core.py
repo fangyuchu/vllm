@@ -111,7 +111,7 @@ class EngineCoreSentinel(BaseSentinel):
         pp_size: int,
         dp_size: int,
         fault_tolerance_config: FaultToleranceConfig,
-        engine_core: 'EngineCore',
+        engine_core: "EngineCore" = None,
     ):
         self.engine_index = engine_index
         super().__init__(
@@ -188,7 +188,9 @@ class EngineCoreSentinel(BaseSentinel):
             pass
 
     def _report_exception_to_client_sentinel(self, exception: Exception) -> None:
-        msg = FaultInfo.from_exception(exception, self.engine_index, self.dealer_socket_identity).serialize()
+        msg = FaultInfo.from_exception(
+            exception, self.engine_index, self.dealer_socket_identity
+        ).serialize()
         msg_bytes = msg.encode("utf-8")
         self.engine_fault_socket.send_multipart([b"", msg_bytes])
 
@@ -245,11 +247,18 @@ class EngineCoreSentinel(BaseSentinel):
         start_time = time.monotonic()
         self.engine_index = original_to_new[str(self.engine_index)]
         self.logger = self._make_logger()
-        tensor_model_parallel_size = self.engine_core.vllm_config.parallel_config.tensor_parallel_size
+        tensor_model_parallel_size = (
+            self.engine_core.vllm_config.parallel_config.tensor_parallel_size
+        )
 
-        dp_start_rank = self.engine_core.vllm_config.parallel_config.data_parallel_start_rank
-        dp_end_rank = (self.engine_core.vllm_config.parallel_config.data_parallel_start_rank
-                       + self.engine_core.vllm_config.parallel_config.data_parallel_size_local - 1)
+        dp_start_rank = (
+            self.engine_core.vllm_config.parallel_config.data_parallel_start_rank
+        )
+        dp_end_rank = (
+            self.engine_core.vllm_config.parallel_config.data_parallel_start_rank
+            + self.engine_core.vllm_config.parallel_config.data_parallel_size_local
+            - 1
+        )
         local_exclude_dp_rank = 0
         for exclude_dp_rank in exclude_dp_ranks:
             if 0 <= exclude_dp_rank < dp_start_rank:
@@ -257,14 +266,23 @@ class EngineCoreSentinel(BaseSentinel):
             elif dp_start_rank <= exclude_dp_rank <= dp_end_rank:
                 local_exclude_dp_rank += 1
 
-        self.engine_core.vllm_config.parallel_config.data_parallel_size_local -= local_exclude_dp_rank
-        self.engine_core.vllm_config.parallel_config.data_parallel_start_rank = dp_start_rank
+        self.engine_core.vllm_config.parallel_config.data_parallel_size_local -= (
+            local_exclude_dp_rank
+        )
+        self.engine_core.vllm_config.parallel_config.data_parallel_start_rank = (
+            dp_start_rank
+        )
 
-        exclude_ep_ranks = sorted(list(set([
-            i
-            for rank in exclude_dp_ranks
-            for i in range(rank * tensor_model_parallel_size, (rank + 1) * tensor_model_parallel_size)])))
-        new_ep_size, data_parallel_size, rank_mapping = self.engine_core.parse_exclude_dp_ranks(exclude_dp_ranks)
+        exclude_ep_ranks = []
+        for dp_rank in exclude_dp_ranks:
+            start = dp_rank * tensor_model_parallel_size
+            end = (dp_rank + 1) * tensor_model_parallel_size
+            exclude_ep_ranks.extend(range(start, end))
+
+        exclude_ep_ranks = sorted(list(set(exclude_ep_ranks)))
+        new_ep_size, data_parallel_size, rank_mapping = (
+            self.engine_core.parse_exclude_dp_ranks(exclude_dp_ranks)
+        )
 
         with set_current_vllm_config(self.engine_core.vllm_config):
             self.engine_core.update_parallel_config(data_parallel_size, rank_mapping)
@@ -276,8 +294,8 @@ class EngineCoreSentinel(BaseSentinel):
                 "data_parallel_rank": parallel_config.data_parallel_rank,
                 "data_parallel_size_local": parallel_config.data_parallel_size_local,
                 "expert_parallel_size": data_parallel_size
-                                        * parallel_config.pipeline_parallel_size
-                                        * parallel_config.tensor_parallel_size,
+                * parallel_config.pipeline_parallel_size
+                * parallel_config.tensor_parallel_size,
                 "data_parallel_master_port": parallel_config.data_parallel_master_port,
             }
             success = self._broadcast_command_to_downstream(
@@ -285,16 +303,22 @@ class EngineCoreSentinel(BaseSentinel):
                 timeout=timeout,
                 target_downstream_sentinels=self._get_target_worker_identity(),
                 exclude_ep_ranks=exclude_ep_ranks,
-                vllm_config_updata_dict=vllm_config_update_dict,
+                vllm_config_update_dict=vllm_config_update_dict,
             )
 
             if not success:
                 return success
 
             assert self.dp_size > 1, "dp_size should be greater than 1 currently"
+            self.engine_core.engine_index = self.engine_index
+
             command = "reinit_dp_group_on_fault_tolerance"
-            self.cmd_q.put(serialize_method_call(command, engine_index=self.engine_index,
-                                                 new_stateless_dp_group_port = new_stateless_dp_group_port))
+            self.cmd_q.put(
+                serialize_method_call(
+                    command,
+                    new_stateless_dp_group_port=new_stateless_dp_group_port,
+                )
+            )
 
             elapsed = time.monotonic() - start_time
             remaining_timeout = max(0, timeout - elapsed)
@@ -666,7 +690,7 @@ class EngineCore:
 
         self.scheduler.add_request(request)
 
-    def parse_exclude_dp_ranks(self, exclude_dp_ranks: list[int]):
+    def parse_exclude_dp_ranks(self, exclude_dp_ranks_list: list[int]):
         if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallel is not supported for scaling down."
@@ -674,9 +698,9 @@ class EngineCore:
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         old_dp_size = self.vllm_config.parallel_config.data_parallel_size
 
-        new_dp_size = old_dp_size - len(exclude_dp_ranks)
+        new_dp_size = old_dp_size - len(exclude_dp_ranks_list)
         new_ep_size = new_dp_size * tp_size
-        exclude_dp_ranks = set(exclude_dp_ranks)
+        exclude_dp_ranks = set(exclude_dp_ranks_list)
 
         dp_rank_mapping = {}
         rank_left = [i for i in range(old_dp_size) if i not in exclude_dp_ranks]
@@ -686,16 +710,19 @@ class EngineCore:
 
     def update_parallel_config(self, data_parallel_size, rank_mapping):
         self.vllm_config.parallel_config.data_parallel_size = (
-            self.vllm_config.parallel_config).data_parallel_size_local = data_parallel_size
+            self.vllm_config.parallel_config
+        ).data_parallel_size_local = data_parallel_size
         self.vllm_config.parallel_config.data_parallel_rank = rank_mapping.get(
             self.vllm_config.parallel_config.data_parallel_rank,
-            self.vllm_config.parallel_config.data_parallel_rank)
+            self.vllm_config.parallel_config.data_parallel_rank,
+        )
         self.vllm_config.parallel_config.data_parallel_rank_local = rank_mapping.get(
             self.vllm_config.parallel_config.data_parallel_rank_local,
-            self.vllm_config.parallel_config.data_parallel_rank_local
+            self.vllm_config.parallel_config.data_parallel_rank_local,
         )
-        self.vllm_config.parallel_config.expert_parallel_size \
-            = (data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size)
+        self.vllm_config.parallel_config.expert_parallel_size = (
+            data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
+        )
         self.vllm_config.parallel_config.data_parallel_master_port += 1000
 
     def abort_requests(self, request_ids: list[str]):
@@ -1844,8 +1871,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
 
-    def reinit_dp_group_on_fault_tolerance(self, engine_index: int,new_stateless_dp_group_port: int):
-        self.engine_index = engine_index
+    def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port: int):
         stateless_destroy_torch_distributed_process_group(self.dp_group)
         self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group(
             fault_tolerance_config=self.vllm_config.fault_tolerance_config,
