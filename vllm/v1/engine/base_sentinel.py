@@ -164,6 +164,13 @@ class BaseSentinel:
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def descale(self, timeout: int = 60, **kwargs) -> bool:
+        """
+        descale execution after a transient recoverable fault.
+        """
+        raise NotImplementedError
+
     def _send_execution_result(
         self, success: bool, method_uuid: str, reason: str | None
     ):
