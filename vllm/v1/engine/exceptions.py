@@ -79,7 +79,8 @@ class FaultInfo:
     def serialize(self) -> str:
         """Serialize to JSON string."""
         fault_info_dict = self.to_dict()
-        fault_info_dict['engine_identity'] = self.engine_identity.decode('utf-8')
+        if self.engine_identity is not None:
+            fault_info_dict["engine_identity"] = self.engine_identity.decode("utf-8")
         return json.dumps(fault_info_dict)
 
     @classmethod
@@ -91,6 +92,8 @@ class FaultInfo:
             message=data["message"],
             timestamp=data["timestamp"],
             engine_id=data["engine_id"],
-            engine_identity=data["engine_identity"].encode("utf-8"),
+            engine_identity=data.get("engine_identity").encode("utf-8")
+            if data.get("engine_identity") is not None
+            else None,
             additional_info=data["additional_info"],
         )
