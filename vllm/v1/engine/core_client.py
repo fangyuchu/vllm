@@ -28,7 +28,6 @@ from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.utils.async_utils import in_loop
 from vllm.utils.collection_utils import ThreadSafeDict
-from vllm.utils.func_utils import identity
 from vllm.utils.network_utils import (
     close_sockets,
     get_open_port,
@@ -51,9 +50,9 @@ from vllm.v1.engine.exceptions import EngineDeadError, FaultInfo
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
+    broadcast_instruction,
     launch_core_engines,
     serialize_method_call,
-    broadcast_instruction,
 )
 from vllm.v1.executor import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -403,7 +402,7 @@ class ClientSentinel(BaseSentinel):
         # The dispatcher runs in the event loop and dequeues tasks one by one,
         # executing them in FIFO order
         self._dispatcher_task = self._loop.create_task(self._dispatcher())
-
+        self.has_faulted = False
         threading.Thread(
             target=self.run, daemon=True, name="ClientSentinelMonitorThread"
         ).start()
@@ -515,7 +514,6 @@ class ClientSentinel(BaseSentinel):
         return success
 
     def descale(self, timeout: int = 60, **kwargs) -> bool:
-
         original_to_new = kwargs["original_to_new"]
         exclude_dp_ranks: list[int] = kwargs["exclude_dp_ranks"]
 
@@ -537,9 +535,14 @@ class ClientSentinel(BaseSentinel):
             self.engine_running.set()
             exclude_dp_ranks = kwargs["exclude_dp_ranks"]
             original_to_new = kwargs["original_to_new"]
-            logger.info(f'original_to_new: {original_to_new} exclude_dp_ranks: {exclude_dp_ranks}')
-            dead_engine_identities = [self.engine_registry[dead_engine] for
-                                      dead_engine in exclude_dp_ranks]
+            logger.info(
+                "original_to_new: %s exclude_dp_ranks: %s",
+                original_to_new,
+                exclude_dp_ranks,
+            )
+            dead_engine_identities = [
+                self.engine_registry[dead_engine] for dead_engine in exclude_dp_ranks
+            ]
             temp_kwargs = {"exclude_dp_ranks": exclude_dp_ranks}
             broadcast_instruction(
                 self.downstream_cmd_socket,
@@ -550,8 +553,11 @@ class ClientSentinel(BaseSentinel):
             for engine_index in exclude_dp_ranks:
                 self.engine_status_dict.pop(engine_index)
                 self.engine_registry.pop(engine_index)
-                key_to_del = [identity for identity, engine_id in self.engine_identity_to_index.items()
-                              if engine_id == engine_index]
+                key_to_del = [
+                    identity
+                    for identity, engine_id in self.engine_identity_to_index.items()
+                    if engine_id == engine_index
+                ]
                 for key in key_to_del:
                     del self.engine_identity_to_index[key]
 
@@ -559,16 +565,22 @@ class ClientSentinel(BaseSentinel):
                 old_engine_index_int = int(old_engine_index)
                 engine_status = self.engine_status_dict[old_engine_index_int]
                 del self.engine_status_dict[old_engine_index_int]
-                self.engine_status_dict[
-                    original_to_new[old_engine_index]] = engine_status
+                self.engine_status_dict[original_to_new[old_engine_index]] = (
+                    engine_status
+                )
 
                 engine_identity = self.engine_registry[old_engine_index_int]
-                # del self.engine_registry[original_to_new[old_engine_index]]
-                self.engine_registry[original_to_new[old_engine_index]] = engine_identity
+
+                self.engine_registry[original_to_new[old_engine_index]] = (
+                    engine_identity
+                )
 
                 for identity, engine_index in self.engine_identity_to_index.items():
-                    if engine_index == old_engine_index:
-                        self.engine_identity_to_index[identity] = original_to_new[old_engine_index]
+                    if engine_index == old_engine_index_int:
+                        self.engine_identity_to_index[identity] = original_to_new[
+                            old_engine_index
+                        ]
+        return success
 
     async def handle_fault(self, instruction: str, timeout: int, **kwargs) -> bool:
         """
@@ -590,8 +602,14 @@ class ClientSentinel(BaseSentinel):
             )
 
             fault_info = FaultInfo.from_json(message)
+            if fault_info.engine_identity not in self.engine_registry.values():
+                return
             self.engine_exception_q.put_nowait(fault_info)
             engine_status = "Dead" if "dead" in fault_info.type else "Unhealthy"
+            for engine_index, identity in self.engine_registry.items():
+                if fault_info.engine_identity == identity:
+                    self.engine_status_dict[engine_index] = engine_status
+            self.has_faulted = True
             self.engine_status_dict[int(fault_info.engine_id)] = engine_status
             self.fault_pub_socket.send_string(
                 f"vllm_fault|{json.dumps(self.engine_status_dict.to_dict())}"
@@ -719,6 +737,7 @@ class MPClient(EngineCoreClient):
         log_stats: bool,
         client_addresses: dict[str, str] | None = None,
     ):
+        self.descaled_core_engine_dicts = None
         self.vllm_config = vllm_config
         # Serialization setup.
         self.encoder = MsgpackEncoder()
@@ -838,8 +857,10 @@ class MPClient(EngineCoreClient):
                 self.engine_status_dict: ThreadSafeDict[int, str] = ThreadSafeDict()
                 for engine_id in range(vllm_config.parallel_config.data_parallel_size):
                     self.engine_status_dict[engine_id] = "Healthy"
-                self.descaled_core_engines_dict = {engine_identity: engine_index
-                                                   for engine_index, engine_identity in enumerate(self.core_engines)}
+                self.descaled_core_engines_dict = {
+                    engine_identity: engine_index
+                    for engine_index, engine_identity in enumerate(self.core_engines)
+                }
                 self.client_sentinel = ClientSentinel(
                     fault_receiver_addr=addresses.engine_fault_socket_addr,
                     cmd_addr=addresses.client_cmd_addr,
@@ -934,7 +955,7 @@ class MPClient(EngineCoreClient):
         engine_manager = cast(CoreEngineProcManager, self.resources.engine_manager)
         self_ref = weakref.ref(self)
 
-        def shutdown_callback(engine_rank, died_proc):
+        def shutdown_callback(engine_rank, died_proc, engine_registry):
             """
             Callback to shutdown the client.
             """
@@ -957,7 +978,7 @@ class MPClient(EngineCoreClient):
 
         Thread(
             target=engine_manager.monitor_engine_process,
-            args=(engine_down_callback,self.engine_registry),
+            args=(engine_down_callback, self.engine_registry),
             daemon=True,
             name="MPClientEngineMonitor",
         ).start()
@@ -965,20 +986,22 @@ class MPClient(EngineCoreClient):
     async def handle_fault(self, instruction: str, timeout: int, **kwargs) -> bool:
         def get_mapping(original_list, to_remove, is_byte=False):
             if is_byte:
-                original_list = [int.from_bytes(engine_id_b, "little") for engine_id_b in original_list]
-            remaining = [num for num in original_list if
-                         num not in to_remove]
-            original_to_new = {original_num: new_index for
-                               new_index, original_num
-                               in enumerate(remaining)}
-            new_to_original = {new_index: original_num for
-                               new_index, original_num
-                               in enumerate(remaining)}
-            new_list = list(
-                original_to_new.values())
+                original_list = [
+                    int.from_bytes(engine_id_b, "little")
+                    for engine_id_b in original_list
+                ]
+            remaining = [num for num in original_list if num not in to_remove]
+            original_to_new_dp_rank = {
+                original_num: new_index
+                for new_index, original_num in enumerate(remaining)
+            }
+
+            new_list = list(original_to_new_dp_rank.values())
             if is_byte:
-                new_list = [engine_id_new.to_bytes(2, "little") for engine_id_new in new_list]
-            return original_to_new, new_list
+                new_list = [
+                    engine_id_new.to_bytes(2, "little") for engine_id_new in new_list
+                ]
+            return original_to_new_dp_rank, new_list
 
         if instruction == "descale":
             exclude_dp_ranks = kwargs["exclude_dp_ranks"]
@@ -988,11 +1011,15 @@ class MPClient(EngineCoreClient):
                     self.engine_status_dict[faulty_rank] = "Dead"
             for engine_id, _ in self.engine_status_dict.items():
                 healthy_ranks_old.append(engine_id)
-            logger.info(f'healthy_ranks_old is {healthy_ranks_old}'
-                        f'exclude_dp_ranks {exclude_dp_ranks}')
+            logger.info(
+                "healthy_ranks_old is %s",
+                {healthy_ranks_old},
+                "exclude_dp_ranks %s",
+                {exclude_dp_ranks},
+            )
             original_to_new, _ = get_mapping(healthy_ranks_old, exclude_dp_ranks)
             kwargs["original_to_new"] = original_to_new
-        logger.info(f'will handle fault of {instruction}')
+        logger.info("will handle fault of %s", instruction)
 
         """handle fault of current instance by instruction"""
         success = await self.client_sentinel.handle_fault(
@@ -1001,21 +1028,33 @@ class MPClient(EngineCoreClient):
         if success and instruction == "descale":
             exclude_dp_ranks = kwargs["exclude_dp_ranks"]
             original_to_new = kwargs["original_to_new"]
-            self.descaled_core_engine_dicts = {engine_identity: original_to_new[engine_index]
-                                               for engine_identity, engine_index
-                                               in self.descaled_core_engines_dict.items() if
-                                               engine_index in original_to_new}
-            self.core_engines = [engine_identity
-                                 for engine_identity in self.core_engines
-                                 if engine_identity in self.descaled_core_engine_dicts]
-            _, self.engine_ranks_managed = get_mapping(self.engine_ranks_managed, exclude_dp_ranks)
+
+            self.descaled_core_engine_dicts = {
+                engine_identity: original_to_new[engine_index]
+                for engine_identity, engine_index in (
+                    self.descaled_core_engines_dict.items()
+                )
+                if engine_index in original_to_new
+            }
+            self.core_engines = [
+                engine_identity
+                for engine_identity in self.core_engines
+                if engine_identity in self.descaled_core_engine_dicts
+            ]
+            _, self.engine_ranks_managed = get_mapping(
+                self.engine_ranks_managed, exclude_dp_ranks
+            )
             scale_down_marker = msgspec.msgpack.encode(
-                ("SCALE_ELASTIC_EP", len(original_to_new)))
-            await self.resources.first_req_send_socket.send(scale_down_marker)
+                ("SCALE_ELASTIC_EP", len(original_to_new))
+            )
+            if self.resources.first_req_send_socket:
+                await self.resources.first_req_send_socket.send(scale_down_marker)
             for dead_engine in exclude_dp_ranks:
                 dp_rank = self.vllm_config.parallel_config.data_parallel_rank
                 local_rank = dead_engine - dp_rank
-                if hasattr(self, 'lb_engines') and local_rank in range(len(self.lb_engines)):
+                if hasattr(self, "lb_engines") and local_rank in range(
+                    len(self.lb_engines)
+                ):
                     del self.lb_engines[local_rank]
         ft_config = self.vllm_config.fault_tolerance_config
         if not success and ft_config.shutdown_on_fault_tolerance_failure:
