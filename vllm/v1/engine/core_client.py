@@ -544,10 +544,12 @@ class ClientSentinel(BaseSentinel):
                 self.engine_registry[dead_engine] for dead_engine in exclude_dp_ranks
             ]
             temp_kwargs = {"exclude_dp_ranks": exclude_dp_ranks}
+
             broadcast_instruction(
                 self.downstream_cmd_socket,
                 dead_engine_identities,
                 "shutdown_engine_core",
+                method_uuid=None,
                 **temp_kwargs,
             )
             for engine_index in exclude_dp_ranks:
@@ -737,7 +739,7 @@ class MPClient(EngineCoreClient):
         log_stats: bool,
         client_addresses: dict[str, str] | None = None,
     ):
-        self.descaled_core_engine_dicts = None
+        self.descaled_core_engine_dicts: dict[bytes, Any] = {}
         self.vllm_config = vllm_config
         # Serialization setup.
         self.encoder = MsgpackEncoder()
@@ -984,23 +986,14 @@ class MPClient(EngineCoreClient):
         ).start()
 
     async def handle_fault(self, instruction: str, timeout: int, **kwargs) -> bool:
-        def get_mapping(original_list, to_remove, is_byte=False):
-            if is_byte:
-                original_list = [
-                    int.from_bytes(engine_id_b, "little")
-                    for engine_id_b in original_list
-                ]
+        def get_mapping(original_list, to_remove):
             remaining = [num for num in original_list if num not in to_remove]
             original_to_new_dp_rank = {
                 original_num: new_index
                 for new_index, original_num in enumerate(remaining)
             }
-
             new_list = list(original_to_new_dp_rank.values())
-            if is_byte:
-                new_list = [
-                    engine_id_new.to_bytes(2, "little") for engine_id_new in new_list
-                ]
+
             return original_to_new_dp_rank, new_list
 
         if instruction == "descale":
@@ -1011,12 +1004,7 @@ class MPClient(EngineCoreClient):
                     self.engine_status_dict[faulty_rank] = "Dead"
             for engine_id, _ in self.engine_status_dict.items():
                 healthy_ranks_old.append(engine_id)
-            logger.info(
-                "healthy_ranks_old is %s",
-                {healthy_ranks_old},
-                "exclude_dp_ranks %s",
-                {exclude_dp_ranks},
-            )
+
             original_to_new, _ = get_mapping(healthy_ranks_old, exclude_dp_ranks)
             kwargs["original_to_new"] = original_to_new
         logger.info("will handle fault of %s", instruction)

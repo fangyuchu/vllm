@@ -230,7 +230,7 @@ class CoreEngineProcManager:
         )
         logger.error("Engine core proc %s died unexpectedly", died_proc.name)
 
-    def monitor_engine_process(self, engine_down_callback, engine_registry):
+    def monitor_engine_process(self, engine_down_callback, engine_registry=None):
         """
         Monitor engine core process liveness.
         """
