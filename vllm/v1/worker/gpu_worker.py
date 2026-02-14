@@ -93,7 +93,7 @@ class WorkerSentinel(BaseSentinel):
             downstream_cmd_addr=None,
             sentinel_identity=identity.encode(),
             sentinel_tag=f"{self.dp_rank}_{identity}",
-            fault_tolerance_config=vllm_config.fault_tolerance_config,
+            vllm_config=vllm_config,
         )
         self.vllm_config = vllm_config
         self.zmq_ctx = zmq.Context()
