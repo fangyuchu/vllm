@@ -177,8 +177,6 @@ class APIServerProcessManager:
         output_addresses: list[str],
         stats_update_address: str | None = None,
         engine_fault_socket_addr: str | None = None,
-        client_sentinel_cmd_addr: str | None = None,
-        engine_core_sentinel_cmd_addr: str | None = None,
         engine_core_sentinel_identities: dict[int, bytes] | None = None,
         fault_state_pub_socket_addr: str | None = None,
     ):
@@ -215,10 +213,6 @@ class APIServerProcessManager:
                 client_config["stats_update_address"] = stats_update_address
             if engine_fault_socket_addr is not None:
                 client_config["engine_fault_socket_addr"] = engine_fault_socket_addr
-                client_config["client_sentinel_cmd_addr"] = client_sentinel_cmd_addr
-                client_config["engine_core_sentinel_cmd_addr"] = (
-                    engine_core_sentinel_cmd_addr
-                )
                 client_config["engine_core_sentinel_identities"] = json.dumps(
                     {
                         k: v.decode("utf-8")
