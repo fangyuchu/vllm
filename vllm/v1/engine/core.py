@@ -111,7 +111,7 @@ class EngineCoreSentinel(BaseSentinel):
         pp_size: int,
         dp_size: int,
         fault_tolerance_config: FaultToleranceConfig,
-        engine_core: "EngineCore" = None,
+        engine_core: "EngineCoreProc",
     ):
         self.engine_index = engine_index
         super().__init__(
@@ -273,7 +273,7 @@ class EngineCoreSentinel(BaseSentinel):
             dp_start_rank
         )
 
-        exclude_ep_ranks = []
+        exclude_ep_ranks: list[int] = []
         for dp_rank in exclude_dp_ranks:
             start = dp_rank * tensor_model_parallel_size
             end = (dp_rank + 1) * tensor_model_parallel_size
@@ -689,41 +689,6 @@ class EngineCore:
             )
 
         self.scheduler.add_request(request)
-
-    def parse_exclude_dp_ranks(self, exclude_dp_ranks_list: list[int]):
-        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Pipeline parallel is not supported for scaling down."
-            )
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        old_dp_size = self.vllm_config.parallel_config.data_parallel_size
-
-        new_dp_size = old_dp_size - len(exclude_dp_ranks_list)
-        new_ep_size = new_dp_size * tp_size
-        exclude_dp_ranks = set(exclude_dp_ranks_list)
-
-        dp_rank_mapping = {}
-        rank_left = [i for i in range(old_dp_size) if i not in exclude_dp_ranks]
-        for i in range(new_dp_size):
-            dp_rank_mapping[rank_left[i]] = i
-        return new_ep_size, new_dp_size, dp_rank_mapping
-
-    def update_parallel_config(self, data_parallel_size, rank_mapping):
-        self.vllm_config.parallel_config.data_parallel_size = (
-            self.vllm_config.parallel_config
-        ).data_parallel_size_local = data_parallel_size
-        self.vllm_config.parallel_config.data_parallel_rank = rank_mapping.get(
-            self.vllm_config.parallel_config.data_parallel_rank,
-            self.vllm_config.parallel_config.data_parallel_rank,
-        )
-        self.vllm_config.parallel_config.data_parallel_rank_local = rank_mapping.get(
-            self.vllm_config.parallel_config.data_parallel_rank_local,
-            self.vllm_config.parallel_config.data_parallel_rank_local,
-        )
-        self.vllm_config.parallel_config.expert_parallel_size = (
-            data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
-        )
-        self.vllm_config.parallel_config.data_parallel_master_port += 1000
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -1417,6 +1382,41 @@ class EngineCoreProc(EngineCore):
             # 2) Step the engine core and return the outputs.
             self._check_busy_loop_active()
             self._process_engine_step()
+
+    def parse_exclude_dp_ranks(self, exclude_dp_ranks_list: list[int]):
+        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Pipeline parallel is not supported for scaling down."
+            )
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        old_dp_size = self.vllm_config.parallel_config.data_parallel_size
+
+        new_dp_size = old_dp_size - len(exclude_dp_ranks_list)
+        new_ep_size = new_dp_size * tp_size
+        exclude_dp_ranks = set(exclude_dp_ranks_list)
+
+        dp_rank_mapping = {}
+        rank_left = [i for i in range(old_dp_size) if i not in exclude_dp_ranks]
+        for i in range(new_dp_size):
+            dp_rank_mapping[rank_left[i]] = i
+        return new_ep_size, new_dp_size, dp_rank_mapping
+
+    def update_parallel_config(self, data_parallel_size, rank_mapping):
+        self.vllm_config.parallel_config.data_parallel_size = (
+            self.vllm_config.parallel_config
+        ).data_parallel_size_local = data_parallel_size
+        self.vllm_config.parallel_config.data_parallel_rank = rank_mapping.get(
+            self.vllm_config.parallel_config.data_parallel_rank,
+            self.vllm_config.parallel_config.data_parallel_rank,
+        )
+        self.vllm_config.parallel_config.data_parallel_rank_local = rank_mapping.get(
+            self.vllm_config.parallel_config.data_parallel_rank_local,
+            self.vllm_config.parallel_config.data_parallel_rank_local,
+        )
+        self.vllm_config.parallel_config.expert_parallel_size = (
+            data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
+        )
+        self.vllm_config.parallel_config.data_parallel_master_port += 1000
 
     def _check_busy_loop_active(self):
         if self.enable_fault_tolerance and not self.busy_loop_active.is_set():
