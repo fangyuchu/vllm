@@ -16,10 +16,6 @@ class FaultToleranceConfig:
     such as scaling down fault DPEngineCore.
     """
 
-    shutdown_on_fault_tolerance_failure: bool = False
-    """Whether to shut down vLLM when a fault tolerance action fails.
-    """
-
     engine_recovery_timeout: int = 60
     """Timeout (in seconds) to wait for error handling instructions
     before raising an exception. If the EngineCore encounters an
@@ -41,13 +37,6 @@ class FaultToleranceConfig:
     gloo_comm_timeout: int = 30
     """
     The timeout for gloo communication.
-    """
-
-    worker_cmd_addr: str | None = None
-    """
-    ZMQ address used by EngineCoreSentinel to dispatch instructions to 
-    WorkerSentinel instances. This address is assigned dynamically during 
-    runtime.
     """
 
     def compute_hash(self) -> str:
