@@ -383,7 +383,7 @@ class ClientSentinel(BaseSentinel):
         self,
         vllm_config: VllmConfig,
         engine_fault_socket_addr: str,
-        client_sentinel_cmd_addr: str,
+        client_sentinel_request_addr: str,
         engine_core_sentinel_cmd_addr: str,
         engine_core_sentinel_identities: dict[int, bytes],
         fault_state_pub_socket_addr: str,
@@ -408,7 +408,7 @@ class ClientSentinel(BaseSentinel):
 
         self.fault_tolerance_req_socket = make_zmq_socket(
             ctx=self.ctx,
-            path=client_sentinel_cmd_addr,
+            path=client_sentinel_request_addr,
             socket_type=zmq.ROUTER,
             bind=True,
         )
@@ -550,7 +550,7 @@ class ClientSentinel(BaseSentinel):
 
     def _pub_engine_status(self):
         engine_status = self.engine_status_dict.to_dict()
-        topic = self.vllm_config.fault_tolerance_config.fault_state_pub_topic.encode()
+        topic = self.ft_config.fault_state_pub_topic.encode()
         self.fault_state_pub_socket.send_multipart(
             (topic, msgspec.msgpack.encode(engine_status))
         )
@@ -682,7 +682,7 @@ class BackgroundResources:
     stats_update_task: asyncio.Task | None = None
     shutdown_path: str | None = None
     client_sentinel: ClientSentinel | None = None
-    client_sentinel_cmd_socket: zmq.Socket | None = None
+    client_sentinel_req_socket: zmq.Socket | None = None
     fault_state_sub_socket: zmq.Socket | None = None
 
     # Set if any of the engines are dead. Here so that the output
@@ -710,7 +710,7 @@ class BackgroundResources:
                 self.first_req_send_socket,
                 self.first_req_rcv_socket,
                 self.stats_update_socket,
-                self.client_sentinel_cmd_socket,
+                self.client_sentinel_req_socket,
                 self.fault_state_sub_socket,
             )
 
@@ -799,7 +799,7 @@ class MPClient(EngineCoreClient):
 
             self.stats_update_address: str | None = None
             self.engine_fault_socket_addr: str | None = None
-            self.client_sentinel_cmd_addr: str | None = None
+            self.client_sentinel_request_addr: str | None = None
             self.engine_core_sentinel_cmd_addr: str | None = None
             self.engine_core_sentinel_identities: dict[int, bytes] | None = None
             self.fault_state_pub_socket_addr: str | None = None
@@ -812,8 +812,8 @@ class MPClient(EngineCoreClient):
                     self.engine_fault_socket_addr = client_addresses[
                         "engine_fault_socket_addr"
                     ]
-                    self.client_sentinel_cmd_addr = client_addresses[
-                        "client_sentinel_cmd_addr"
+                    self.client_sentinel_request_addr = client_addresses[
+                        "client_sentinel_request_addr"
                     ]
                     self.engine_core_sentinel_cmd_addr = client_addresses[
                         "engine_core_sentinel_cmd_addr"
@@ -842,7 +842,9 @@ class MPClient(EngineCoreClient):
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if vllm_config.fault_tolerance_config.enable_fault_tolerance:
                     self.engine_fault_socket_addr = addresses.engine_fault_socket_addr
-                    self.client_sentinel_cmd_addr = addresses.client_sentinel_cmd_addr
+                    self.client_sentinel_request_addr = (
+                        addresses.client_sentinel_request_addr
+                    )
                     self.engine_core_sentinel_cmd_addr = (
                         addresses.engine_core_sentinel_cmd_addr
                     )
@@ -1205,7 +1207,7 @@ class AsyncMPClient(MPClient):
         if vllm_config.fault_tolerance_config.enable_fault_tolerance:
             self.is_faulted = threading.Event()
             assert self.engine_fault_socket_addr is not None
-            assert self.client_sentinel_cmd_addr is not None
+            assert self.client_sentinel_request_addr is not None
             assert self.engine_core_sentinel_cmd_addr is not None
             assert self.engine_core_sentinel_identities is not None
             assert self.fault_state_pub_socket_addr is not None
@@ -1213,7 +1215,7 @@ class AsyncMPClient(MPClient):
                 self.client_sentinel = ClientSentinel(
                     vllm_config,
                     self.engine_fault_socket_addr,
-                    self.client_sentinel_cmd_addr,
+                    self.client_sentinel_request_addr,
                     self.engine_core_sentinel_cmd_addr,
                     self.engine_core_sentinel_identities,
                     self.fault_state_pub_socket_addr,
@@ -1231,9 +1233,9 @@ class AsyncMPClient(MPClient):
             )
             self.sync_ctx = self.resources.ctx
 
-            self.client_sentinel_cmd_socket = make_zmq_socket(
+            self.client_sentinel_req_socket = make_zmq_socket(
                 self.sync_ctx,
-                self.client_sentinel_cmd_addr,
+                self.client_sentinel_request_addr,
                 zmq.DEALER,
                 bind=False,
                 identity=self.identity,
@@ -1245,7 +1247,7 @@ class AsyncMPClient(MPClient):
                 self.vllm_config.fault_tolerance_config.fault_state_pub_topic.encode()
             )
             self.fault_state_sub_socket.setsockopt(zmq.SUBSCRIBE, topic)
-            self.resources.client_sentinel_cmd_socket = self.client_sentinel_cmd_socket
+            self.resources.client_sentinel_req_socket = self.client_sentinel_req_socket
             self.resources.fault_state_sub_socket = self.fault_state_sub_socket
             threading.Thread(
                 target=self._engine_status_listener,
@@ -1472,7 +1474,7 @@ class AsyncMPClient(MPClient):
                 # handle_fault call can send/recv on the socket at a time, so
                 # that each request gets the correct corresponding result.
                 payload = msgspec.msgpack.encode(ft_request)
-                sock = self.client_sentinel_cmd_socket
+                sock = self.client_sentinel_req_socket
                 sock.send_multipart([b"", payload])
 
                 # Determine timeout if provided (add 1 second buffer).
