@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from functools import cached_property
 from multiprocessing import Lock
 from typing import Any
@@ -97,12 +97,25 @@ class UniProcExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
-        return self.collective_rpc(
+        res = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
             non_block=non_block,
             single_value=True,
         )
+        if non_block:
+            # Ensure we propagate any exception now. If the future is not
+            # finished yet, we simply return the Future to inspect later.
+            try:
+                exc = res.exception(timeout=0)
+            except TimeoutError:
+                # The future is not done yet; return it to be inspected later.
+                pass
+            else:
+                if exc is not None:
+                    # This will raise the original exception.
+                    res.result()
+        return res
 
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
