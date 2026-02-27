@@ -3,6 +3,7 @@
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -429,6 +430,8 @@ def busy_loop_wrapper(busy_loop_func):
                         )
                         if cmd_str is not None:
                             method, _, params = deserialize_method_call(cmd_str)
+                            if method == "shutdown":
+                                sys.exit()
                             run_method(self, method, args=(), kwargs=params)
                         # recovery succeeded; restart the busy loop
                         continue

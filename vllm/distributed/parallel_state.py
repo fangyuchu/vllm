@@ -1004,6 +1004,11 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.recv(size, dtype, src)
 
+    def destroy_cpu_group(self):
+        if hasattr(self, "cpu_group"):
+            torch.distributed.destroy_process_group(self.cpu_group)
+            del self.cpu_group
+
     def destroy(self):
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
