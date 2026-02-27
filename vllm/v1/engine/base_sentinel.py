@@ -131,20 +131,20 @@ class BaseSentinel:
         """
         method, method_uuid, method_params = deserialize_method_call(cmd_str)
         self.logger("Executing command: %s", method, level="info")
-        try:
-            success: bool = run_method(self, method, args=(), kwargs=method_params)
-            self.logger("Command (%s) succeeded: %s", method, success, level="info")
-            reason = None
-        except Exception as e:
-            self.logger(
-                "Error executing method %s: %s, %s",
-                method,
-                type(e).__name__,
-                e,
-                level="error",
-            )
-            success = False
-            reason = f"{type(e).__name__}: {e}"
+        # try:
+        success: bool = run_method(self, method, args=(), kwargs=method_params)
+        self.logger("Command (%s) succeeded: %s", method, success, level="info")
+        reason = None
+        # except Exception as e:
+        #     self.logger(
+        #         "Error executing method %s: %s, %s",
+        #         method,
+        #         type(e).__name__,
+        #         e,
+        #         level="error",
+        #     )
+        #     success = False
+        #     reason = f"{type(e).__name__}: {e}"
         return success, method_uuid, reason
 
     @abstractmethod
@@ -161,6 +161,12 @@ class BaseSentinel:
     def retry(self, timeout: int = 1, **kwargs) -> bool:
         """
         Retry execution after a transient recoverable fault.
+        """
+        raise NotImplementedError
+
+    def descale(self, timeout: int = 60, **kwargs) -> bool:
+        """
+        descale execution after a transient recoverable fault.
         """
         raise NotImplementedError
 
