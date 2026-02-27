@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import contextlib
-import json
 import multiprocessing
 import time
 import weakref
@@ -214,11 +213,8 @@ class APIServerProcessManager:
                 assert engine_core_sentinel_identities is not None
                 assert fault_state_pub_socket_addr is not None
                 client_config["engine_fault_socket_addr"] = engine_fault_socket_addr
-                client_config["engine_core_sentinel_identities"] = json.dumps(
-                    {
-                        k: v.decode("utf-8")
-                        for k, v in engine_core_sentinel_identities.items()
-                    }
+                client_config["engine_core_sentinel_identities"] = (
+                    engine_core_sentinel_identities
                 )
                 client_config["fault_state_pub_socket_addr"] = (
                     fault_state_pub_socket_addr
