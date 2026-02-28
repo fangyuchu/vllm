@@ -50,6 +50,7 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
+from vllm.v1.fault_tolerance import WorkerSentinel
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -122,6 +123,8 @@ class Worker(WorkerBase):
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
+
+        self.worker_sentinel: WorkerSentinel | None = None
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -312,6 +315,12 @@ class Worker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            self.worker_sentinel = WorkerSentinel(
+                self.vllm_config,
+                self.device,
+            )
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -1100,6 +1109,8 @@ class Worker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
+        if self.worker_sentinel is not None:
+            self.worker_sentinel.shutdown()
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()

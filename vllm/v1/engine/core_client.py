@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
-import multiprocessing
 import queue
 import sys
+import threading
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -26,6 +26,7 @@ from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.async_utils import in_loop
+from vllm.utils.collection_utils import ThreadSafeDict
 from vllm.utils.network_utils import (
     close_sockets,
     get_open_port,
@@ -36,6 +37,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     EngineCoreRequestType,
+    EngineStatusType,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -50,6 +52,8 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.fault_tolerance import ClientSentinel
+from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
@@ -265,6 +269,9 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    async def fault_reporter(self):
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -377,6 +384,8 @@ class BackgroundResources:
     output_queue_task: asyncio.Task | None = None
     stats_update_task: asyncio.Task | None = None
     shutdown_path: str | None = None
+    client_sentinel: ClientSentinel | None = None
+    fault_state_sub_socket: zmq.Socket | None = None
 
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
@@ -386,6 +395,8 @@ class BackgroundResources:
         """Clean up background resources."""
 
         self.engine_dead = True
+        if self.client_sentinel is not None:
+            self.client_sentinel.shutdown()
         if self.engine_manager is not None:
             self.engine_manager.close()
         if self.coordinator is not None:
@@ -401,6 +412,7 @@ class BackgroundResources:
                 self.first_req_send_socket,
                 self.first_req_rcv_socket,
                 self.stats_update_socket,
+                self.fault_state_sub_socket,
             )
 
             tasks = (self.output_queue_task, self.stats_update_task)
@@ -504,6 +516,13 @@ class MPClient(EngineCoreClient):
                 (input_address,) = addresses.inputs
                 (output_address,) = addresses.outputs
                 self.stats_update_address = addresses.frontend_stats_publish_address
+                if vllm_config.fault_tolerance_config.enable_fault_tolerance:
+                    assert client_addresses is not None
+                    assert addresses.fault_tolerance_addresses is not None
+                    client_addresses["fault_tolerance_addresses"] = (
+                        addresses.fault_tolerance_addresses.to_str()
+                    )
+
                 if coordinator is not None:
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
@@ -593,43 +612,41 @@ class MPClient(EngineCoreClient):
         return self.engines_running
 
     def start_engine_core_monitor(self):
-        """Start a monitor thread for engine core processes."""
+        """Start a monitor thread for engine core processes or actors."""
         engine_manager = self.resources.engine_manager
-        if (
-            engine_manager is None
-            or not hasattr(engine_manager, "processes")
-            or not engine_manager.processes
+        if engine_manager is None:
+            return
+        self_ref = weakref.ref(self)
+
+        def shutdown_callback(engine_rank, target):
+            _self = self_ref()
+            if not _self:
+                return True
+            target_desc = getattr(target, "name", target)
+            logger.error(
+                "Engine core %s died unexpectedly, shutting down client.",
+                target_desc,
+            )
+            engine_manager.shutdown_monitor = True
+            _self.resources.engine_dead = True
+            _self.shutdown()
+
+        if isinstance(engine_manager, CoreEngineProcManager) and not getattr(
+            engine_manager, "processes", None
         ):
             # No engine processes to monitor
             return
-
-        engine_processes = engine_manager.processes
-        self_ref = weakref.ref(self)
-
-        # Monitor engine core process liveness. If any die unexpectedly,
-        # logs an error, shuts down the client and invokes the failure
-        # callback to inform the engine.
-        def monitor_engine_cores():
-            sentinels = [proc.sentinel for proc in engine_processes]
-            died = multiprocessing.connection.wait(sentinels)
-            _self = self_ref()
-            if not _self or _self.resources.engine_dead:
-                return
-            _self.resources.engine_dead = True
-            proc_name = next(
-                proc.name for proc in engine_processes if proc.sentinel == died[0]
-            )
-            logger.error(
-                "Engine core proc %s died unexpectedly, shutting down client.",
-                proc_name,
-            )
-            _self.shutdown()
-            # Note: For MPClient, we don't have a failure callback mechanism
-            # like MultiprocExecutor, but we set engine_dead flag which will
-            # cause subsequent operations to raise EngineDeadError
+        engine_down_callback = (
+            shutdown_callback
+            if not self.vllm_config.fault_tolerance_config.enable_fault_tolerance
+            else engine_manager.notify_engine_down
+        )
 
         Thread(
-            target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
+            target=engine_manager.monitor_engine_liveness,
+            args=(engine_down_callback,),
+            daemon=True,
+            name="ClientEngineMonitor",
         ).start()
 
 
@@ -839,6 +856,8 @@ class AsyncMPClient(MPClient):
         client_count: int = 1,
         client_index: int = 0,
     ):
+        if vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            client_addresses = client_addresses or {}
         super().__init__(
             asyncio_mode=True,
             vllm_config=vllm_config,
@@ -846,10 +865,50 @@ class AsyncMPClient(MPClient):
             log_stats=log_stats,
             client_addresses=client_addresses,
         )
-
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+
+        if vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            assert client_addresses is not None
+            self.is_faulted = threading.Event()
+            ft_addr = FaultToleranceZmqAddresses.from_str(
+                client_addresses["fault_tolerance_addresses"]
+            )
+            if self.client_index == 0:
+                self.client_sentinel = ClientSentinel(
+                    vllm_config=vllm_config,
+                    fault_tolerance_addresses=ft_addr,
+                    shutdown_callback=self._finalizer,
+                )
+                self.resources.client_sentinel = self.client_sentinel
+            self.engine_status_dict: ThreadSafeDict[
+                int, dict[str, EngineStatusType]
+            ] = ThreadSafeDict()
+            self.engine_status_dict.update(
+                {
+                    engine_index: {"status": EngineStatusType.HEALTHY}
+                    for engine_index in self.engine_ranks_managed
+                }.items()
+            )
+
+            self.fault_state_sub_socket = make_zmq_socket(
+                self.resources.ctx,
+                ft_addr.fault_state_pub_socket_addr,
+                zmq.SUB,
+                bind=False,
+            )
+            self.fault_state_sub_socket.setsockopt(
+                zmq.SUBSCRIBE,
+                self.vllm_config.fault_tolerance_config.fault_state_pub_topic.encode(),
+            )
+            self.resources.fault_state_sub_socket = self.fault_state_sub_socket
+            threading.Thread(
+                target=self._engine_status_listener,
+                daemon=True,
+                name="EngineStatusListenerThread",
+            ).start()
+
         try:
             # If we are running in an asyncio event loop, start the queue task.
             # Otherwise, it will be started lazily. If it is not started here,
@@ -1051,6 +1110,34 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+
+    def _engine_status_listener(self):
+        while True:
+            try:
+                # Expect multipart: [topic, payload].
+                frames = self.fault_state_sub_socket.recv_multipart()
+                payload = frames[-1]
+                status_dict = msgspec.msgpack.decode(payload)
+                self.engine_status_dict.set_from_dict(status_dict)
+                status_set = {v["status"] for v in status_dict.values()}
+                healthy = (
+                    len(status_set) == 1 and EngineStatusType.HEALTHY in status_set
+                )
+                if healthy:
+                    self.is_faulted.clear()
+                else:
+                    self.is_faulted.set()
+            except zmq.ZMQError:
+                break
+
+    async def fault_reporter(self):
+        raw = self.engine_status_dict.to_dict()
+        result = {}
+        for k, v in raw.items():
+            status_val = v["status"]
+            status_enum = EngineStatusType(status_val)
+            result[k] = {"status": status_enum.name.title()}
+        return result
 
 
 class DPAsyncMPClient(AsyncMPClient):

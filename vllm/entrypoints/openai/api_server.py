@@ -180,7 +180,7 @@ def build_app(
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
-    register_vllm_serve_api_routers(app)
+    register_vllm_serve_api_routers(app, args=args)
 
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
