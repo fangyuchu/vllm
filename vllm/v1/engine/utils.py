@@ -129,6 +129,7 @@ class CoreEngineProcManager:
             )
 
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self.shutdown_monitor = False
 
         data_parallel = vllm_config.parallel_config.data_parallel_size > 1
         try:
@@ -157,9 +158,43 @@ class CoreEngineProcManager:
         """Shutdown all procs."""
         self._finalizer()
 
-    def join_first(self):
-        """Wait for any process to exit."""
-        connection.wait(proc.sentinel for proc in self.processes)
+    def monitor_engine_liveness(
+        self,
+        engine_down_callback: Callable[..., None] | None = None,
+    ) -> None:
+        """
+        Monitor engine core process liveness.
+
+        Args:
+            engine_down_callback:
+                Optional callback invoked once for each detected dead process.
+                The callback is called with keyword arguments:
+                    dead_proc: The process that exited.
+                    all_processes: The full list of engine processes.
+        """
+
+        sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
+        sentinels = set(sentinel_to_proc.keys())
+
+        while sentinels and not self.shutdown_monitor:
+            died_sentinels = connection.wait(sentinels, timeout=1)
+
+            for sentinel in died_sentinels:
+                proc = sentinel_to_proc[sentinel]
+                exitcode = proc.exitcode
+                if exitcode != 0:
+                    logger.error(
+                        "Engine core proc %s died unexpectedly.",
+                        proc.name,
+                    )
+
+                if engine_down_callback is not None:
+                    engine_down_callback(
+                        dead_proc=proc,
+                        all_processes=self.processes,
+                    )
+
+            sentinels -= set(died_sentinels)
 
     def sentinels(self) -> list:
         return [proc.sentinel for proc in self.processes]
@@ -271,6 +306,7 @@ class CoreEngineActorManager:
         self.log_stats = log_stats
         local_engine_count = vllm_config.parallel_config.data_parallel_size_local
         world_size = vllm_config.parallel_config.world_size
+        self.shutdown_monitor = False
 
         if ray.is_initialized():
             logger.info("Ray is already initialized. Skipping Ray initialization.")
@@ -767,6 +803,37 @@ class CoreEngineActorManager:
 
     def get_run_refs(self):
         return self.run_refs
+
+    def monitor_engine_liveness(
+        self,
+        engine_down_callback: Callable[..., None] | None = None,
+    ) -> None:
+        import ray
+
+        processed_done_refs: set[ray.ObjectRef] = set()
+        while not self.shutdown_monitor:
+            actor_run_refs = self.get_run_refs()
+            if not actor_run_refs:
+                logger.info(
+                    "There are no actors to monitor currently. "
+                    "The monitoring function is about to terminate."
+                )
+                break
+
+            actor_done_refs, _ = ray.wait(actor_run_refs, timeout=5)
+            for actor_ref in actor_done_refs:
+                if actor_ref in processed_done_refs:
+                    continue
+
+                logger.error("Engine core actor died.")
+
+                if engine_down_callback is not None:
+                    engine_down_callback(
+                        actor_ref,
+                        actor_run_refs,
+                    )
+
+                processed_done_refs.add(actor_ref)
 
     def close(self):
         import ray
