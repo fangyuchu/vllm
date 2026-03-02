@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+import time
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -820,11 +821,17 @@ class CoreEngineActorManager:
                 )
                 break
 
-            actor_done_refs, _ = ray.wait(actor_run_refs, timeout=5)
-            for actor_ref in actor_done_refs:
-                if actor_ref in processed_done_refs:
-                    continue
+            # Filter out already-processed done refs to avoid busy-spinning
+            # on refs that ray.wait() would return immediately.
+            refs_to_watch = [
+                r for r in actor_run_refs if r not in processed_done_refs
+            ]
+            if not refs_to_watch:
+                time.sleep(5)
+                continue
 
+            actor_done_refs, _ = ray.wait(refs_to_watch, timeout=5)
+            for actor_ref in actor_done_refs:
                 logger.error("Engine core actor died.")
 
                 if engine_down_callback is not None:
