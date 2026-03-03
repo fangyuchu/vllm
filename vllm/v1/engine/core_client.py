@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from threading import Thread
 from typing import Any, TypeAlias, TypeVar, cast
 
+import msgpack
 import msgspec.msgpack
 import ray
 import zmq
@@ -366,6 +367,7 @@ class ClientSentinel(BaseSentinel):
         engine_status_dict: ThreadSafeDict[int, str],
         fault_tolerance_config: FaultToleranceConfig,
         core_client: "MPClient",
+        dp_size_info: tuple[int, int],
     ):
         super().__init__(
             upstream_cmd_addr=None,
@@ -415,9 +417,37 @@ class ClientSentinel(BaseSentinel):
         # executing them in FIFO order
         self._dispatcher_task = self._loop.create_task(self._dispatcher())
         self.has_faulted = False
+        dp_size_local, dp_size = dp_size_info
+        self.send_engine_registry(dp_size, dp_size_local)
         threading.Thread(
             target=self.run, daemon=True, name="ClientSentinelMonitorThread"
         ).start()
+
+    def send_engine_registry(self, dp_size, dp_size_local) -> None:
+        recv_engine_count = dp_size_local
+        while recv_engine_count < dp_size:
+            _, sender_identity, start_engine_index = recv_router_dealer_message(
+                self.fault_receiver_socket
+            )
+            _, sender_identity, node_engine_count = recv_router_dealer_message(
+                self.fault_receiver_socket
+            )
+            assert node_engine_count is not None, "node_engine_count cannot be None"
+            assert start_engine_index is not None, "start_engine_index cannot be None"
+            recv_engine_count += int(node_engine_count)
+            send_engine_registry = {
+                key: self.engine_registry[key]
+                for key in range(
+                    int(start_engine_index),
+                    int(start_engine_index) + int(node_engine_count),
+                )
+            }
+            send_engine_registry_byte = msgpack.dumps(
+                send_engine_registry, use_bin_type=True
+            )
+            self.fault_receiver_socket.send_multipart(
+                [sender_identity, b"", send_engine_registry_byte]
+            )
 
     def run(self) -> None:
         """
@@ -929,6 +959,7 @@ class MPClient(EngineCoreClient):
                     engine_status_dict=self.engine_status_dict,
                     fault_tolerance_config=vllm_config.fault_tolerance_config,
                     core_client=self,
+                    dp_size_info=(dp_local_size, dp_size),
                 )
                 self.resources.client_sentinel = self.client_sentinel
             success = True
@@ -1038,7 +1069,7 @@ class MPClient(EngineCoreClient):
 
         Thread(
             target=engine_manager.monitor_engine_process,
-            args=(engine_down_callback, self.engine_registry),
+            args=(engine_down_callback, self.engine_registry, False),
             daemon=True,
             name="MPClientEngineMonitor",
         ).start()

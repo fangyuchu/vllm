@@ -45,6 +45,7 @@ from torch.distributed import Backend, ProcessGroup
 
 import vllm.envs as envs
 from vllm.config import FaultToleranceConfig
+from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -323,7 +324,7 @@ class GroupCoordinator:
 
         self_device_group = None
         self_cpu_group = None
-
+        self.group_type = "normal"
         gloo_comm_timeout = None
         options = None
         if torch_distributed_backend == "nccl":
@@ -1006,7 +1007,10 @@ class GroupCoordinator:
 
     def destroy_cpu_group(self):
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
+            if self.group_type == "normal":
+                torch.distributed.destroy_process_group(self.cpu_group)
+            else:
+                stateless_destroy_torch_distributed_process_group(self.cpu_group)
             del self.cpu_group
 
     def destroy(self):
