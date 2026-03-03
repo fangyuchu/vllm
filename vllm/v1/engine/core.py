@@ -175,6 +175,10 @@ class EngineCoreSentinel(BaseSentinel):
                 self.logger("Engine paused", level="info")
             elif "FORCE STOP" in str(engine_exception):
                 self.logger("NPU Stop device and Engine paused", level="info")
+            elif "gloo" in str(engine_exception) and "Timed out waiting" in str(
+                engine_exception
+            ):
+                self.logger("gloo Timed out waiting", level="info")
             else:
                 self.logger(
                     "Detected exception %s: %s\n Call Stack:\n%s",

@@ -15,6 +15,7 @@ from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
+import msgpack
 import msgspec
 import regex as re
 import zmq
@@ -173,6 +174,7 @@ class CoreEngineProcManager:
         self.vllm_config = vllm_config
 
         data_parallel = vllm_config.parallel_config.data_parallel_size > 1
+        self.engine_identity: dict[int, bytes] = {}
         try:
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
                 # Adjust device control in DP for non-CUDA platforms
@@ -190,10 +192,18 @@ class CoreEngineProcManager:
                     else contextlib.nullcontext()
                 ):
                     proc.start()
+            if not local_client:
+                self.recv_engine_identity(start_index, local_engine_count)
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():
                 self.close()
+
+    def recv_engine_identity(self, start_engine_index, local_engine_count):
+        start_engine_bytes = str(start_engine_index).encode("utf-8")
+        local_engine_count_bytes = str(local_engine_count).encode("utf-8")
+        self.engine_down_socket.send_multipart([b"", start_engine_bytes])
+        self.engine_down_socket.send_multipart([b"", local_engine_count_bytes])
 
     def _report_engine_dead(self, dead_message):
         """Send engine dead message to ClientSentinel"""
@@ -230,14 +240,23 @@ class CoreEngineProcManager:
         )
         logger.error("Engine core proc %s died unexpectedly", died_proc.name)
 
-    def monitor_engine_process(self, engine_down_callback, engine_registry=None):
+    def monitor_engine_process(
+        self, engine_down_callback, engine_identity, run_headless=False
+    ):
         """
         Monitor engine core process liveness.
         """
+        if run_headless:
+            self.engine_identity = msgpack.loads(
+                self.engine_down_socket.recv_multipart()[1], strict_map_key=False
+            )
+        else:
+            self.engine_identity = engine_identity
         sentinels = [proc.sentinel for proc in self.processes]
         pids = [proc.pid for proc in self.processes]
         pid_mapping = {
-            proc: byte_data for proc, byte_data in zip(pids, engine_registry.values())
+            proc: byte_data
+            for proc, byte_data in zip(pids, self.engine_identity.values())
         }
         while sentinels and not self.shutdown_monitor:
             died = multiprocessing.connection.wait(sentinels)
