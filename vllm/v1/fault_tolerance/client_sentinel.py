@@ -147,7 +147,7 @@ class ClientSentinel(BaseSentinel):
         results = await asyncio.gather(*coroutines)
         return FaultToleranceResult(ft_request.request_id, all(results), reason=None)
 
-    def handle_fault(self, ft_request: FaultToleranceRequest) -> bool:
+    def handle_ft_command(self, ft_request: FaultToleranceRequest) -> bool:
         return self._execute_cmd(ft_request).success
 
     def _alert_and_pause(self):
@@ -197,67 +197,11 @@ class ClientSentinel(BaseSentinel):
             return False
         return True
 
-    def run(self):
-        """Poll for fault messages and commands, dispatch to handlers."""
-        poller = zmq.Poller()
-        poller.register(self.fault_receiver_socket, zmq.POLLIN)
-        poller.register(self.fault_tolerance_req_socket, zmq.POLLIN)
-        poller.register(self.inproc_res_recv_socket, zmq.POLLIN)
-        try:
-            while not self.sentinel_dead:
-                events = poller.poll(timeout=5000)
-                if not events:
-                    continue
-                events = dict(events)
-                if self.fault_receiver_socket in events:
-                    # If a fault message is received, alert and attempt to pause.
-                    self._alert_and_pause()
-                if self.fault_tolerance_req_socket in events:
-                    # Received fault tolerance command from client.
-                    # Add corresponding command to the queue.
-                    parts = self.fault_tolerance_req_socket.recv_multipart()
-                    identity = parts[0]
-                    msg_bytes = parts[-1]
-                    ft_request = msgspec.msgpack.decode(
-                        msg_bytes, type=FaultToleranceRequest
-                    )
-                    success = self._dispatch_fault_tolerance_request(
-                        ft_request, identity
-                    )
-                    if not success:
-                        # If we're busy, reply with a busy message.
-                        msg = (
-                            "System busy, vLLM is executing another fault "
-                            "tolerance instruction."
-                        )
-                        res = FaultToleranceResult(ft_request.request_id, False, msg)
-                        resp = msgspec.msgpack.encode(res)
-                        self.fault_tolerance_req_socket.send_multipart(
-                            [identity, b"", resp]
-                        )
-                if self.inproc_res_recv_socket in events:
-                    # Send FT execution result back to client.
-                    msg = self.inproc_res_recv_socket.recv()
-                    recv_res = msgspec.msgpack.decode(msg, type=FaultToleranceResult)
-                    identity, ft_result = self.ft_result_queue.get_nowait()
-                    assert recv_res.request_id == ft_result.request_id
-                    if identity is not None:
-                        self.fault_tolerance_req_socket.send_multipart(
-                            [identity, b"", msg]
-                        )
-                    self._pub_engine_status()
-        except zmq.ZMQError:
-            # Context terminated, exit thread cleanly.
-            pass
-
     def shutdown(self):
         close_sockets(
             [
                 self.fault_receiver_socket,
                 self.fault_state_pub_socket,
-                self.inproc_res_send_socket,
-                self.inproc_res_recv_socket,
-                self.fault_tolerance_req_socket,
             ]
         )
         super().shutdown()
