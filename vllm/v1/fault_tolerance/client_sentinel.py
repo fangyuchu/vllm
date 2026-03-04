@@ -10,7 +10,8 @@ import zmq
 
 from vllm.config import VllmConfig
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
-from vllm.v1.engine import EngineStatusType
+from vllm.v1.engine import EngineCoreOutputs as FTUtilityOutputs
+from vllm.v1.engine import EngineStatusType, UtilityOutput
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
 from vllm.v1.fault_tolerance.utils import (
     FaultInfo,
@@ -18,6 +19,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceResult,
     FaultToleranceZmqAddresses,
 )
+from vllm.v1.serial_utils import MsgpackEncoder, UtilityResult
 
 
 class ClientSentinel(BaseSentinel):
@@ -52,6 +54,7 @@ class ClientSentinel(BaseSentinel):
             bind=True,
         )
 
+        self._utility_encoder = MsgpackEncoder()
         threading.Thread(
             target=self.run, daemon=True, name="ClientSentinelCmdAndFaultReceiverThread"
         ).start()
@@ -61,6 +64,20 @@ class ClientSentinel(BaseSentinel):
             daemon=True,
             name="ClientSentinelFtRequestsLoopThread",
         ).start()
+
+    def _send_utility_result(
+        self,
+        client_index: int,
+        call_id: int,
+        result: FaultToleranceResult = None,
+    ) -> None:
+        uo = UtilityOutput(call_id=call_id)
+        uo.result = UtilityResult(result)
+
+        outputs = FTUtilityOutputs(utility_output=uo)
+        buffers = self._utility_encoder.encode(outputs)
+        # todo: create output sockets for each client/api server
+        self.output_sockets[client_index].send_multipart(buffers, copy=False)
 
     async def retry(self, timeout: int = 1, **kwargs) -> bool:
         retry_request = FaultToleranceRequest(
