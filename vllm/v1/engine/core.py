@@ -1357,11 +1357,12 @@ class EngineCoreProc(EngineCore):
                     else:
                         request = generic_decoder.decode(data_frames)
 
-                        if request is not None:
-                            self.engine_core_sentinel.handle_fault(request)
-                            self.output_queue.put_nowait(
-                                EngineCoreProc.ENGINE_CORE_DEAD
-                            )
+                        # TODO
+                        # if request is not None:
+                        #     self.engine_core_sentinel.handle_fault(request)
+                        #     self.output_queue.put_nowait(
+                        #         EngineCoreProc.ENGINE_CORE_DEAD
+                        #     )
 
                         if request_type == EngineCoreRequestType.ABORT:
                             # Aborts are added to *both* queues, allows us to eagerly

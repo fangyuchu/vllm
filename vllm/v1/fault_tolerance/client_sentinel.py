@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import queue
 import threading
-import time
 import uuid
 from collections.abc import Callable
 
@@ -34,7 +32,7 @@ class ClientSentinel(BaseSentinel):
         self.fault_callback = fault_callback
         super().__init__(
             upstream_cmd_addr=None,
-            downstream_cmd_addr=fault_tolerance_addresses.engine_core_sentinel_cmd_addr,
+            downstream_cmd_addr=None,
             sentinel_identity=None,
             sentinel_tag=None,
             vllm_config=vllm_config,
@@ -59,27 +57,10 @@ class ClientSentinel(BaseSentinel):
         ).start()
 
         threading.Thread(
-            target=self._process_ft_requests_loop,
+            target=self._alert_and_pause,
             daemon=True,
             name="ClientSentinelFtRequestsLoopThread",
         ).start()
-
-    def _process_ft_requests_loop(self) -> None:
-        """
-        Worker loop to process Fault Tolerance (FT) requests
-        """
-        try:
-            while not self.sentinel_dead:
-                try:
-                    identity, ft_request = self.ft_request_queue.get(timeout=1)
-                    ft_result = self._execute_cmd(ft_request)
-                    self.ft_result_queue.put((identity, ft_result))
-                    self.inproc_res_send_socket.send(msgspec.msgpack.encode(ft_result))
-                except queue.Empty:
-                    pass
-        except zmq.ZMQError:
-            # Socket is closed.
-            pass
 
     async def retry(self, timeout: int = 1, **kwargs) -> bool:
         retry_request = FaultToleranceRequest(
@@ -92,7 +73,7 @@ class ClientSentinel(BaseSentinel):
         ft_result = await self._broad_cast_cmd(retry_request)
         return ft_result.success
 
-    def pause(self, timeout: int = 1, **kwargs) -> bool:
+    async def pause(self, timeout: int = 1, **kwargs) -> bool:
         """Pause engine cores, return True if successful. Best-effort operation."""
         self.logger(
             "Pause operation is best-effort only. Due to the complexity of "
@@ -103,33 +84,15 @@ class ClientSentinel(BaseSentinel):
             "the instance.",
             level="warning",
         )
-        exclude_engine_index = kwargs.get("exclude_engine_index")
-        soft_pause = kwargs.get("soft_pause", False)
-        with self.engine_status_lock:
-            alive_engines = {
-                identity
-                for index, identity in self.engine_core_sentinel_identities.items()
-                if self.engine_status_dict[index]["status"] != EngineStatusType.DEAD
-                and (exclude_engine_index is None or index not in exclude_engine_index)
-            }
-        success, responses = self._execute_command_on_downstreams(
-            "pause",
-            alive_engines,
-            timeout=timeout,
-            soft_pause=soft_pause,
+        retry_request = FaultToleranceRequest(
+            request_id=str(uuid.uuid4()),
+            instruction="retry",
+            params={
+                "timeout": timeout,
+            },
         )
-        identity_to_index = {
-            identity: index
-            for index, identity in self.engine_core_sentinel_identities.items()
-        }
-        with self.engine_status_lock:
-            for engine_identity, ft_result in responses.items():
-                if ft_result.success:
-                    i = identity_to_index[engine_identity]
-                    engine_status = self.engine_status_dict[i]["status"]
-                    if engine_status == EngineStatusType.HEALTHY:
-                        self.engine_status_dict[i] = {"status": EngineStatusType.PAUSED}
-        return success
+        ft_result = await self._broad_cast_cmd(retry_request)
+        return ft_result.success
 
     def _pub_engine_status(self, engine_status: EngineStatusType) -> None:
         topic = self.ft_config.fault_state_pub_topic.encode()
@@ -160,42 +123,12 @@ class ClientSentinel(BaseSentinel):
                 if "dead" in fault_info.type
                 else EngineStatusType.UNHEALTHY
             )
-            with self.engine_status_lock:
-                self.engine_status_dict[int(fault_info.engine_id)] = {
-                    "status": engine_status
-                }
-            self._pub_engine_status()
-            if not self.is_faulted.is_set():
-                self.is_faulted.set()
-                pause_request = FaultToleranceRequest(
-                    request_id=str(uuid.uuid4()),
-                    instruction="pause",
-                    params={
-                        "timeout": self.ft_config.gloo_comm_timeout + 5,
-                        "soft_pause": False,
-                    },
-                )
-                while not self._dispatch_fault_tolerance_request(pause_request, None):
-                    # If the queue is full, it means another fault tolerance
-                    # command is being executed.
-                    # Wait and retry until we can add the pause command to
-                    # the queue.
-                    time.sleep(0.1)
+            self._pub_engine_status(engine_status)
 
         except zmq.ZMQError:
             # Socket was closed during polling, exit loop.
             self.logger("Fault receiver socket closed, stopping thread.", level="info")
             raise
-
-    def _dispatch_fault_tolerance_request(
-        self, ft_request: FaultToleranceRequest, identity: bytes | None
-    ) -> bool:
-        """Add fault tolerance request to queue, return False if busy."""
-        try:
-            self.ft_request_queue.put_nowait((identity, ft_request))
-        except queue.Full:
-            return False
-        return True
 
     def shutdown(self):
         close_sockets(
