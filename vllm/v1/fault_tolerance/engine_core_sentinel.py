@@ -14,7 +14,10 @@ from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
-from vllm.v1.fault_tolerance.utils import FaultInfo, FaultToleranceRequest
+from vllm.v1.fault_tolerance.utils import (
+    FaultInfo,
+    FaultToleranceRequest,
+)
 from vllm.v1.serial_utils import run_method
 
 
@@ -81,6 +84,9 @@ class EngineCoreSentinel(BaseSentinel):
             self.poll_and_report_fault_events()
             # Check for commands from ClientSentinel
             self.poll_and_execute_upstream_cmd()
+
+    def handle_fault(self, ft_request: FaultToleranceRequest) -> bool:
+        return self._execute_cmd(ft_request).success
 
     def poll_and_report_fault_events(self):
         try:

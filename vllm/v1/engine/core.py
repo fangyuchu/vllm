@@ -1357,6 +1357,12 @@ class EngineCoreProc(EngineCore):
                     else:
                         request = generic_decoder.decode(data_frames)
 
+                        if request is not None:
+                            self.engine_core_sentinel.handle_fault(request)
+                            self.output_queue.put_nowait(
+                                EngineCoreProc.ENGINE_CORE_DEAD
+                            )
+
                         if request_type == EngineCoreRequestType.ABORT:
                             # Aborts are added to *both* queues, allows us to eagerly
                             # process aborts while also ensuring ordering in the input
@@ -1745,6 +1751,9 @@ class DPEngineCoreProc(EngineCoreProc):
             logger.info(
                 "Distributed environment reinitialized for DP rank %s", self.dp_rank
             )
+
+    def handle_fault(self, ft_request: FaultToleranceRequest) -> bool:
+        return self.engine_core_sentinel.handle_fault(ft_request)
 
 
 class EngineCoreActorMixin:

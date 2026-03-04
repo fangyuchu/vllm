@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import queue
 import threading
 import time
 import uuid
+from collections.abc import Callable
 
 import msgspec.msgpack
 import zmq
 
 from vllm.config import VllmConfig
-from vllm.utils.network_utils import close_sockets, get_open_port, make_zmq_socket
+from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.engine import EngineStatusType
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
 from vllm.v1.fault_tolerance.utils import (
@@ -18,7 +20,6 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceResult,
     FaultToleranceZmqAddresses,
 )
-from vllm.v1.utils import get_engine_client_zmq_addr
 
 
 class ClientSentinel(BaseSentinel):
@@ -26,30 +27,17 @@ class ClientSentinel(BaseSentinel):
         self,
         vllm_config: VllmConfig,
         fault_tolerance_addresses: FaultToleranceZmqAddresses,
+        fault_callback: Callable,
+        core_engines: list[bytes],
     ):
-        dp_rank = vllm_config.parallel_config.data_parallel_index
-        dp_size = vllm_config.parallel_config.data_parallel_size
-        dp_local_size = vllm_config.parallel_config.data_parallel_size_local
-        # Client manages local+remote EngineCores in pure internal LB case.
-        # Client manages local EngineCores in hybrid and external LB case.
-        num_dp_managed = (
-            dp_local_size if vllm_config.parallel_config.local_engines_only else dp_size
-        )
-        host = vllm_config.parallel_config.data_parallel_master_ip
-
+        self.core_engines = core_engines
+        self.fault_callback = fault_callback
         super().__init__(
             upstream_cmd_addr=None,
             downstream_cmd_addr=fault_tolerance_addresses.engine_core_sentinel_cmd_addr,
             sentinel_identity=None,
             sentinel_tag=None,
             vllm_config=vllm_config,
-        )
-
-        self.fault_tolerance_req_socket = make_zmq_socket(
-            ctx=self.ctx,
-            path=fault_tolerance_addresses.client_sentinel_request_addr,
-            socket_type=zmq.ROUTER,
-            bind=True,
         )
 
         self.fault_receiver_socket = make_zmq_socket(
@@ -64,35 +52,6 @@ class ClientSentinel(BaseSentinel):
             path=fault_tolerance_addresses.fault_state_pub_socket_addr,
             socket_type=zmq.PUB,
             bind=True,
-        )
-        # Queue to serialize fault tolerance instruction execution:
-        # (client_identity, FaultToleranceRequest)
-        self.ft_request_queue: queue.Queue[
-            tuple[bytes | None, FaultToleranceRequest]
-        ] = queue.Queue(
-            maxsize=2
-        )  # allow one pause command and another fault tolerance command
-        self.ft_result_queue: queue.Queue[tuple[bytes | None, FaultToleranceResult]] = (
-            queue.Queue(maxsize=2)
-        )
-        inproc_comm_addr = get_engine_client_zmq_addr(local_only=True, host=host)
-        self.inproc_res_recv_socket = make_zmq_socket(
-            ctx=self.ctx, path=inproc_comm_addr, socket_type=zmq.PAIR, bind=True
-        )
-        self.inproc_res_send_socket = make_zmq_socket(
-            ctx=self.ctx, path=inproc_comm_addr, socket_type=zmq.PAIR, bind=False
-        )
-
-        self.is_faulted = threading.Event()
-        self.engine_status_dict: dict[int, dict[str, EngineStatusType]] = {
-            engine_index: {"status": EngineStatusType.HEALTHY}
-            for engine_index in range(dp_rank, dp_rank + num_dp_managed)
-        }
-        self.engine_status_lock = threading.Lock()
-        # todo: use identities as the key, indexes as the value as the index may
-        # change in dp scale down and up
-        self.engine_core_sentinel_identities = (
-            fault_tolerance_addresses.engine_core_sentinel_identities
         )
 
         threading.Thread(
@@ -122,33 +81,16 @@ class ClientSentinel(BaseSentinel):
             # Socket is closed.
             pass
 
-    def retry(self, timeout: int = 1, **kwargs) -> bool:
-        with self.engine_status_lock:
-            for engine_status in self.engine_status_dict.values():
-                if engine_status["status"] == EngineStatusType.DEAD:
-                    self.logger(
-                        "Engine core is dead; retry won't work.",
-                        level="warning",
-                    )
-                    return False
-
-        target_engines = set(self.engine_core_sentinel_identities.values())
-        new_stateless_dp_group_port = get_open_port()
-        success, _ = self._execute_command_on_downstreams(
-            "retry",
-            target_engines,
-            new_stateless_dp_group_port=new_stateless_dp_group_port,
-            timeout=timeout,
+    async def retry(self, timeout: int = 1, **kwargs) -> bool:
+        retry_request = FaultToleranceRequest(
+            request_id=str(uuid.uuid4()),
+            instruction="retry",
+            params={
+                "timeout": timeout,
+            },
         )
-
-        with self.engine_status_lock:
-            for index in self.engine_status_dict:
-                self.engine_status_dict[index] = {"status": EngineStatusType.HEALTHY}
-
-        if success:
-            self.is_faulted.clear()
-            self._pub_engine_status()
-        return success
+        ft_result = await self._broad_cast_cmd(retry_request)
+        return ft_result.success
 
     def pause(self, timeout: int = 1, **kwargs) -> bool:
         """Pause engine cores, return True if successful. Best-effort operation."""
@@ -189,13 +131,24 @@ class ClientSentinel(BaseSentinel):
                         self.engine_status_dict[i] = {"status": EngineStatusType.PAUSED}
         return success
 
-    def _pub_engine_status(self):
-        with self.engine_status_lock:
-            engine_status = self.engine_status_dict.copy()
+    def _pub_engine_status(self, engine_status: EngineStatusType) -> None:
         topic = self.ft_config.fault_state_pub_topic.encode()
         self.fault_state_pub_socket.send_multipart(
             (topic, msgspec.msgpack.encode(engine_status))
         )
+
+    async def _broad_cast_cmd(
+        self, ft_request: FaultToleranceRequest
+    ) -> FaultToleranceResult:
+        coroutines = []
+        for core_engine in self.core_engines:
+            coro = self.fault_callback("handle_fault", ft_request, engine=core_engine)
+            coroutines.append(coro)
+        results = await asyncio.gather(*coroutines)
+        return FaultToleranceResult(ft_request.request_id, all(results), reason=None)
+
+    def handle_fault(self, ft_request: FaultToleranceRequest) -> bool:
+        return self._execute_cmd(ft_request).success
 
     def _alert_and_pause(self):
         """Receive fault info from engine and pause engines if first fault."""
