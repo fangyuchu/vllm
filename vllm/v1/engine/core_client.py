@@ -891,6 +891,8 @@ class AsyncMPClient(MPClient):
                 self.client_sentinel = ClientSentinel(
                     vllm_config=vllm_config,
                     fault_tolerance_addresses=ft_addr,
+                    fault_callback=self._call_utility_async,
+                    core_engines=self.core_engines,
                 )
                 self.resources.client_sentinel = self.client_sentinel
             self.ft_request_lock = threading.Lock()
