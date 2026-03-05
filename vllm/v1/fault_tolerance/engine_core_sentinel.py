@@ -17,6 +17,7 @@ from vllm.v1.fault_tolerance.sentinel import BaseSentinel
 from vllm.v1.fault_tolerance.utils import (
     FaultInfo,
     FaultToleranceRequest,
+    FaultToleranceResult,
 )
 from vllm.v1.serial_utils import run_method
 
@@ -85,8 +86,8 @@ class EngineCoreSentinel(BaseSentinel):
             # Check for commands from ClientSentinel
             self.poll_and_execute_upstream_cmd()
 
-    def handle_fault(self, ft_request: FaultToleranceRequest) -> bool:
-        return self._execute_cmd(ft_request).success
+    def handle_fault(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        return self._execute_cmd(ft_request)
 
     def poll_and_report_fault_events(self):
         try:
