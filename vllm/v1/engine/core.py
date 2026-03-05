@@ -66,7 +66,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     EngineCoreSentinel,
     busy_loop_wrapper,
 )
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -1354,18 +1354,19 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
-                    elif request_type == EngineCoreRequestType.ABORT:
-                        # Aborts are added to *both* queues, allows us to eagerly
-                        # process aborts while also ensuring ordering in the input
-                        # queue to avoid leaking requests. This is ok because
-                        # aborting in the scheduler is idempotent.
-                        self.aborts_queue.put_nowait(request)
                     else:
                         request = generic_decoder.decode(data_frames)
-                        if (
-                            result := self._process_fault_tolerance_request(request)
-                        ) is not None:
-                            self.output_queue.put_nowait(result)
+                        if self._process_fault_tolerance_request(request):
+                            # TODO
+                            # self.output_queue.put_nowait(result)
+                            pass
+
+                        if request_type == EngineCoreRequestType.ABORT:
+                            # Aborts are added to *both* queues, allows us to eagerly
+                            # process aborts while also ensuring ordering in the input
+                            # queue to avoid leaking requests. This is ok because
+                            # aborting in the scheduler is idempotent.
+                            self.aborts_queue.put_nowait(request)
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
@@ -1409,8 +1410,9 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
-                if isinstance(output, FaultToleranceResult):
-                    continue
+                # TODO
+                # if isinstance(output, FaultToleranceResult):
+                #     continue
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
@@ -1466,31 +1468,33 @@ class EngineCoreProc(EngineCore):
             )
         )
 
-    def _process_fault_tolerance_request(self, request):
+    def _process_fault_tolerance_request(self, request: Any) -> bool | None:
         """
         Process fault tolerance request if the request matches the expected structure.
         Args:
             request: The decoded request object
         Returns:
-            FaultToleranceResult if the request is a valid fault tolerance request,
-            None otherwise
+            True if the request is a valid fault tolerance request,
+            False otherwise
         """
         # Check if request is a valid fault tolerance request
-        is_fault_request = (
+        if not (
             isinstance(request, (list, tuple))
             and len(request) >= 4
             and request[2] == "handle_fault"
             and isinstance(request[3], list)
             and len(request[3]) > 0
-        )
-        if is_fault_request:
-            fault_data = request[3][0]
-            if isinstance(fault_data, dict) and all(
-                key in fault_data for key in ["request_id", "instruction", "params"]
-            ):
-                ft_request = FaultToleranceRequest(**fault_data)
-                return self.engine_core_sentinel.handle_fault(ft_request)
-        return None
+        ):
+            return False
+
+        fault_data = request[3][0]
+        required_keys = {"request_id", "instruction", "params"}
+        if isinstance(fault_data, dict) and required_keys.issubset(fault_data):
+            ft_request = FaultToleranceRequest(**fault_data)
+            self.engine_core_sentinel.handle_fault(ft_request)
+            return True
+
+        return False
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
