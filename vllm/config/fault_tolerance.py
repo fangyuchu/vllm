@@ -19,7 +19,7 @@ class FaultToleranceConfig:
     shutdown_on_fault_tolerance_failure: bool = False
     """Whether to shut down vLLM when a fault tolerance action fails.
     """
-
+    # todo: change it to engine_recovery_timeout_sec
     engine_recovery_timeout: int = 60
     """Timeout (in seconds) to wait for error handling instructions
     before raising an exception. If the EngineCore encounters an
@@ -27,7 +27,8 @@ class FaultToleranceConfig:
     to handle the error. If no instructions are received within this
     time, the original error is raised.
     """
-
+    # todo: explain more in comments, set this port to be self-created rather
+    #  than an arg.
     internal_fault_report_port: int = 22866
     """
     The port to use for internal fault reporting.
