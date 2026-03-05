@@ -61,6 +61,12 @@ class FaultToleranceRequest(msgspec.Struct):
     instruction: str
     params: dict[str, Any]
 
+    @classmethod
+    def builder(
+        cls, request_id: str, instruction: str, params: dict[str, Any]
+    ) -> "FaultToleranceRequest":
+        return cls(request_id=request_id, instruction=instruction, params=params)
+
 
 @dataclass
 class FaultToleranceZmqAddresses:

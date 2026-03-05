@@ -508,6 +508,7 @@ class MPClient(EngineCoreClient):
             self.engines_running = False
 
             self.stats_update_address: str | None = None
+            self.addresses = None
             if client_addresses:
                 # Engines are managed externally to this client.
                 input_address = client_addresses["input_address"]
@@ -522,7 +523,7 @@ class MPClient(EngineCoreClient):
                 ):
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
-
+                self.addresses = addresses
                 (input_address,) = addresses.inputs
                 (output_address,) = addresses.outputs
                 self.stats_update_address = addresses.frontend_stats_publish_address
@@ -893,6 +894,8 @@ class AsyncMPClient(MPClient):
                     fault_tolerance_addresses=ft_addr,
                     fault_callback=self._call_utility_async,
                     core_engines=self.core_engines,
+                    input_addresses=self.addresses.inputs,
+                    output_addresses=self.addresses.outputs,
                 )
                 self.resources.client_sentinel = self.client_sentinel
             self.ft_request_lock = threading.Lock()
@@ -950,7 +953,7 @@ class AsyncMPClient(MPClient):
             Callable[[AsyncMPClient, EngineCoreOutputs], Awaitable[None]] | None
         ) = getattr(self.__class__, "process_engine_outputs", None)
         _self_ref = weakref.ref(self) if output_handler else None
-        output_socket = resources.output_socket
+        output_socket: zmq.asyncio.Socket = resources.output_socket
         assert output_socket is not None
 
         async def process_outputs_socket():
@@ -1131,14 +1134,9 @@ class AsyncMPClient(MPClient):
     async def handle_fault(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
-        coroutines = []
-        for core_engine in self.core_engines:
-            coro = self._call_utility_async(
-                "handle_fault", ft_request, engine=core_engine
-            )
-            coroutines.append(coro)
-        results = await asyncio.gather(*coroutines)
-        return FaultToleranceResult(ft_request.request_id, all(results), reason=None)
+        return await self._call_utility_async(
+            "handle_fault", ft_request, engine=b"client_sentinel"
+        )
 
     def _engine_status_listener(self):
         while True:
