@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import uuid
+from asyncio import AbstractEventLoop
 from collections.abc import Callable
 
 import msgspec.msgpack
@@ -31,6 +32,8 @@ class ClientSentinel(BaseSentinel):
         core_engines: list[bytes],
     ):
         self.core_engines = core_engines
+        # This func is call_utility_async from AsyncMPClient
+        # todo: change variable name.
         self.fault_callback = fault_callback
         super().__init__(
             upstream_cmd_addr=None,
@@ -40,6 +43,13 @@ class ClientSentinel(BaseSentinel):
             vllm_config=vllm_config,
         )
 
+        try:
+            self._loop: AbstractEventLoop = asyncio.get_running_loop()
+        except RuntimeError as err:
+            raise RuntimeError(
+                "ClientSentinel must be initialized within an asyncio event loop."
+            ) from err
+        self.is_faulted = threading.Event()
         self.fault_receiver_socket = make_zmq_socket(
             ctx=self.ctx,
             path=fault_tolerance_addresses.engine_fault_socket_addr,
@@ -60,16 +70,16 @@ class ClientSentinel(BaseSentinel):
         ).start()
 
         threading.Thread(
-            target=self._alert_and_pause,
+            target=self._monitor_and_pause_on_fault,
             daemon=True,
-            name="ClientSentinelFtRequestsLoopThread",
+            name="ClientSentinelMonitorThread",
         ).start()
 
     def _send_utility_result(
         self,
         client_index: int,
         call_id: int,
-        result: FaultToleranceResult = None,
+        result: FaultToleranceResult,
     ) -> None:
         uo = UtilityOutput(call_id=call_id)
         uo.result = UtilityResult(result)
@@ -130,17 +140,25 @@ class ClientSentinel(BaseSentinel):
     def handle_ft_command(self, ft_request: FaultToleranceRequest) -> bool:
         return self._execute_cmd(ft_request).success
 
-    def _alert_and_pause(self):
-        """Receive fault info from engine and pause engines if first fault."""
+    def _monitor_and_pause_on_fault(self):
+        """Receive fault info from engine and pause engines."""
         try:
-            identity, _, message = self.fault_receiver_socket.recv_multipart()
-            fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
-            engine_status = (
-                EngineStatusType.DEAD
-                if "dead" in fault_info.type
-                else EngineStatusType.UNHEALTHY
-            )
-            self._pub_engine_status(engine_status)
+            while True:
+                _, _, message = self.fault_receiver_socket.recv_multipart()
+                fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
+                engine_status = (
+                    EngineStatusType.DEAD
+                    if "dead" in fault_info.type
+                    else EngineStatusType.UNHEALTHY
+                )
+                self._pub_engine_status(engine_status)
+                if not self.is_faulted.is_set():
+                    self.is_faulted.set()
+                    # Schedule the pause coroutine safely from this thread.
+                    asyncio.run_coroutine_threadsafe(
+                        self.pause(timeout=self.ft_config.gloo_comm_timeout + 5),
+                        self._loop,
+                    )
 
         except zmq.ZMQError:
             # Socket was closed during polling, exit loop.
