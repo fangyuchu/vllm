@@ -1356,10 +1356,15 @@ class EngineCoreProc(EngineCore):
                             continue
                     else:
                         request = generic_decoder.decode(data_frames)
-                        if self._process_fault_tolerance_request(request):
-                            # TODO
-                            # self.output_queue.put_nowait(result)
-                            pass
+                        client_index, call_id, _, _ = request
+                        ft_result = self._process_fault_tolerance_request(request)
+                        if ft_result:
+                            uo = UtilityOutput(call_id=call_id)
+                            uo.result = UtilityResult(ft_result)
+
+                            outputs = EngineCoreOutputs(utility_output=uo)
+                            self.output_queue.put_nowait((client_index, outputs))
+                            continue
 
                         if request_type == EngineCoreRequestType.ABORT:
                             # Aborts are added to *both* queues, allows us to eagerly
@@ -1491,8 +1496,8 @@ class EngineCoreProc(EngineCore):
         required_keys = {"request_id", "instruction", "params"}
         if isinstance(fault_data, dict) and required_keys.issubset(fault_data):
             ft_request = FaultToleranceRequest(**fault_data)
-            self.engine_core_sentinel.handle_fault(ft_request)
-            return True
+            ft_result = self.engine_core_sentinel.handle_fault(ft_request)
+            return ft_result.success
 
         return False
 
