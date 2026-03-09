@@ -70,6 +70,8 @@ class FaultToleranceRequest(msgspec.Struct):
 
 @dataclass
 class FaultToleranceZmqAddresses:
+    all_client_input_addresses: list[str]
+    all_client_output_addresses: list[str]
     # ZMQ fault_state_pub_socket address of client sentinel
     fault_state_pub_socket_addr: str
     # ZMQ client_sentinel_request socket address of client sentinel
@@ -84,7 +86,15 @@ class FaultToleranceZmqAddresses:
     engine_core_sentinel_identities: dict[int, bytes]
 
     @classmethod
-    def build(cls, host, local_engines_only, dp_size, ft_config: FaultToleranceConfig):
+    def build(
+        cls,
+        host,
+        local_engines_only,
+        dp_size,
+        inputs,
+        outputs,
+        ft_config: FaultToleranceConfig,
+    ):
         engine_fault_socket_addr = get_engine_client_zmq_addr(
             local_only=False,
             host=host,
@@ -111,6 +121,8 @@ class FaultToleranceZmqAddresses:
             engine_core_sentinel_cmd_addr=engine_core_sentinel_cmd_addr,
             engine_fault_socket_addr=engine_fault_socket_addr,
             engine_core_sentinel_identities=engine_core_sentinel_identities,
+            all_client_input_addresses=inputs,
+            all_client_output_addresses=outputs,
         )
 
     def to_str(self) -> str:
@@ -119,6 +131,8 @@ class FaultToleranceZmqAddresses:
             "client_sentinel_request_addr": self.client_sentinel_request_addr,
             "engine_core_sentinel_cmd_addr": self.engine_core_sentinel_cmd_addr,
             "engine_fault_socket_addr": self.engine_fault_socket_addr,
+            "all_client_input_addresses": self.all_client_input_addresses,
+            "all_client_output_addresses": self.all_client_output_addresses,
             "engine_core_sentinel_identities": {
                 str(rank): identity.hex()
                 for rank, identity in self.engine_core_sentinel_identities.items()
@@ -136,6 +150,8 @@ class FaultToleranceZmqAddresses:
         }
 
         return cls(
+            all_client_input_addresses=payload["all_client_input_addresses"],
+            all_client_output_addresses=payload["all_client_output_addresses"],
             fault_state_pub_socket_addr=payload["fault_state_pub_socket_addr"],
             client_sentinel_request_addr=payload["client_sentinel_request_addr"],
             engine_core_sentinel_cmd_addr=payload["engine_core_sentinel_cmd_addr"],

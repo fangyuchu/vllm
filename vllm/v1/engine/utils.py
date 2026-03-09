@@ -932,7 +932,12 @@ def launch_core_engines(
 
     if vllm_config.fault_tolerance_config.enable_fault_tolerance is True:
         addresses.fault_tolerance_addresses = FaultToleranceZmqAddresses.build(
-            host, local_engines_only, dp_size, vllm_config.fault_tolerance_config
+            host,
+            local_engines_only,
+            dp_size,
+            addresses.inputs,
+            addresses.outputs,
+            vllm_config.fault_tolerance_config,
         )
 
     # Run the DP Coordinator process with rank 0 when in online DP mode.

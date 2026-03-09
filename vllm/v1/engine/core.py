@@ -1354,17 +1354,14 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                    elif request_type == EngineCoreRequestType.UTILITY:
+                        request = generic_decoder.decode(data_frames)
+                        client_index, call_id, method, args = request
+                        if method == "handle_fault":
+                            self.handle_fault(call_id, client_index, args[0])
+                            continue
                     else:
                         request = generic_decoder.decode(data_frames)
-                        client_index, call_id, _, _ = request
-                        ft_result = self._process_fault_tolerance_request(request)
-                        if ft_result:
-                            uo = UtilityOutput(call_id=call_id)
-                            uo.result = UtilityResult(ft_result)
-
-                            outputs = EngineCoreOutputs(utility_output=uo)
-                            self.output_queue.put_nowait((client_index, outputs))
-                            continue
 
                         if request_type == EngineCoreRequestType.ABORT:
                             # Aborts are added to *both* queues, allows us to eagerly
@@ -1415,9 +1412,6 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
-                # TODO
-                # if isinstance(output, FaultToleranceResult):
-                #     continue
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
@@ -1449,6 +1443,16 @@ class EngineCoreProc(EngineCore):
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
 
+    def handle_fault(self, call_id: int, client_index: int, args: dict):
+        """Call engine_core_sentinel to perform fault tolerance."""
+        ft_result = self.engine_core_sentinel.handle_fault(
+            FaultToleranceRequest(**args)
+        )
+        uo = UtilityOutput(call_id=call_id)
+        uo.result = UtilityResult(ft_result)
+        outputs = EngineCoreOutputs(utility_output=uo)
+        self.output_queue.put_nowait((client_index, outputs))
+
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised
         from the add request preprocessing in the input socket processing thread.
@@ -1472,34 +1476,6 @@ class EngineCoreProc(EngineCore):
                 ),
             )
         )
-
-    def _process_fault_tolerance_request(self, request: Any) -> bool | None:
-        """
-        Process fault tolerance request if the request matches the expected structure.
-        Args:
-            request: The decoded request object
-        Returns:
-            True if the request is a valid fault tolerance request,
-            False otherwise
-        """
-        # Check if request is a valid fault tolerance request
-        if not (
-            isinstance(request, (list, tuple))
-            and len(request) >= 4
-            and request[2] == "handle_fault"
-            and isinstance(request[3], list)
-            and len(request[3]) > 0
-        ):
-            return False
-
-        fault_data = request[3][0]
-        required_keys = {"request_id", "instruction", "params"}
-        if isinstance(fault_data, dict) and required_keys.issubset(fault_data):
-            ft_request = FaultToleranceRequest(**fault_data)
-            ft_result = self.engine_core_sentinel.handle_fault(ft_request)
-            return ft_result.success
-
-        return False
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -1785,9 +1761,6 @@ class DPEngineCoreProc(EngineCoreProc):
             logger.info(
                 "Distributed environment reinitialized for DP rank %s", self.dp_rank
             )
-
-    def handle_fault(self, ft_request: FaultToleranceRequest) -> bool:
-        return self.engine_core_sentinel.handle_fault(ft_request)
 
 
 class EngineCoreActorMixin:

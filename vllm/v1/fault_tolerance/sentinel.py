@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
+import traceback
 import uuid
 from abc import abstractmethod
 
@@ -124,13 +125,9 @@ class BaseSentinel:
             self.logger("Command (%s) succeeded: %s", method, success, level="info")
             reason = None
         except Exception as e:
-            self.logger(
-                "Error executing ft request: %s",
-                ft_request,
-                level="error",
-            )
+            self.logger("Error executing ft request: %s", ft_request, level="error")
             success = False
-            reason = f"{type(e).__name__}: {e}"
+            reason = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
         return FaultToleranceResult(
             success=success, request_id=ft_request.request_id, reason=reason
         )
