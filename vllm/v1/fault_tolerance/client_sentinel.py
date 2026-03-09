@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import threading
+import traceback
 import uuid
-from asyncio import AbstractEventLoop
 from collections.abc import Callable
 
 import msgspec.msgpack
-import zmq
+import zmq.asyncio
 
 from vllm.config import VllmConfig
 from vllm.utils.network_utils import close_sockets, get_open_port, make_zmq_socket
@@ -28,23 +27,24 @@ class ClientSentinel(BaseSentinel):
         self,
         vllm_config: VllmConfig,
         fault_tolerance_addresses: FaultToleranceZmqAddresses,
-        fault_callback: Callable,
+        call_utility_async: Callable,
         core_engines: list[bytes],
-        input_addresses: list[str],
-        output_addresses: list[str],
     ):
-        self.core_engines = core_engines
-        # This func is call_utility_async from AsyncMPClient
-        # todo: change variable name.
-        self.fault_callback = fault_callback
-
+        self.engine_identities = core_engines
         super().__init__(
+            vllm_config=vllm_config,
             upstream_cmd_addr=None,
             downstream_cmd_addr=None,
-            sentinel_identity=None,
+            sentinel_identity=b"client_sentinel",
             sentinel_tag=None,
-            vllm_config=vllm_config,
         )
+
+        self.call_utility_async = call_utility_async
+        self.ctx = zmq.asyncio.Context()
+
+        self.sentinel_dead = False
+        self.logger = self._make_logger()
+
         self.input_sockets = [
             make_zmq_socket(
                 self.ctx,
@@ -53,21 +53,15 @@ class ClientSentinel(BaseSentinel):
                 identity=b"client_sentinel",
                 bind=False,
             )
-            for input_address in input_addresses
+            for input_address in fault_tolerance_addresses.all_client_input_addresses
         ]
 
         self.output_sockets = [
             make_zmq_socket(self.ctx, output_address, zmq.PUSH, linger=4000)
-            for output_address in output_addresses
+            for output_address in fault_tolerance_addresses.all_client_output_addresses
         ]
 
-        try:
-            self._loop: AbstractEventLoop = asyncio.get_running_loop()
-        except RuntimeError as err:
-            raise RuntimeError(
-                "ClientSentinel must be initialized within an asyncio event loop."
-            ) from err
-        self.is_faulted = threading.Event()
+        self.is_faulted = asyncio.Event()
         self.fault_receiver_socket = make_zmq_socket(
             ctx=self.ctx,
             path=fault_tolerance_addresses.engine_fault_socket_addr,
@@ -83,28 +77,22 @@ class ClientSentinel(BaseSentinel):
         )
 
         self._utility_encoder = MsgpackEncoder()
-        self.is_faulted = threading.Event()
+
+        self.start_rank = vllm_config.parallel_config.data_parallel_index
+        dp_size = vllm_config.parallel_config.data_parallel_size
+        dp_local_size = vllm_config.parallel_config.data_parallel_size_local
+        num_dp_managed = (
+            dp_local_size if vllm_config.parallel_config.local_engines_only else dp_size
+        )
         self.engine_status_dict: dict[int, dict[str, EngineStatusType]] = {
-            int.from_bytes(core_engine, byteorder="little"): {
-                "status": EngineStatusType.HEALTHY
-            }
-            for core_engine in self.core_engines
+            engine_index: {"status": EngineStatusType.HEALTHY}
+            for engine_index in range(self.start_rank, self.start_rank + num_dp_managed)
         }
-        self.engine_status_lock = threading.Lock()
 
-        threading.Thread(
-            target=self.run,
-            daemon=True,
-            name="ClientSentinelFtRequestsLoopThread",
-        ).start()
+        asyncio.create_task(self.run())
+        asyncio.create_task(self._monitor_and_pause_on_fault())
 
-        threading.Thread(
-            target=self._monitor_and_pause_on_fault,
-            daemon=True,
-            name="ClientSentinelMonitorThread",
-        ).start()
-
-    def _send_utility_result(
+    async def _send_utility_result(
         self,
         client_index: int,
         call_id: int,
@@ -112,67 +100,45 @@ class ClientSentinel(BaseSentinel):
     ) -> None:
         uo = UtilityOutput(call_id=call_id)
         uo.result = UtilityResult(result)
-
         outputs = FTUtilityOutputs(utility_output=uo)
         buffers = self._utility_encoder.encode(outputs)
-        # todo: create output sockets for each client/api server
-        self.output_sockets[client_index].send_multipart(buffers, copy=False)
+        await self.output_sockets[client_index].send_multipart(buffers, copy=False)
 
-    def retry(self, timeout: int = 1, **kwargs) -> bool:
-        """Retry engine cores, return True if successful."""
+    async def retry(self, timeout: int = 1, **kwargs) -> bool:  # type: ignore[override]
+        for engine_status in self.engine_status_dict.values():
+            if engine_status["status"] == EngineStatusType.DEAD:
+                self.logger(
+                    "Engine core is dead; retry won't work.",
+                    level="warning",
+                )
+                return False
 
-        # 定义内部异步函数，封装所有原异步逻辑
-        async def _async_retry():
-            with self.engine_status_lock:
-                # 先检查是否有DEAD的引擎核心，有则直接返回False
-                for engine_status in self.engine_status_dict.values():
-                    if engine_status["status"] == EngineStatusType.DEAD:
-                        self.logger(
-                            "Engine core is dead; retry won't work.",
-                            level="warning",
-                        )
-                        return False
+        new_stateless_dp_group_port = get_open_port()
+        ft_results = await self._execute_cmd_on_engines(
+            ft_request=FaultToleranceRequest(
+                request_id=str(uuid.uuid4()),
+                instruction="retry",
+                params={
+                    "new_stateless_dp_group_port": new_stateless_dp_group_port,
+                    "timeout": timeout,
+                },
+            ),
+            target_engines=self.engine_identities,
+        )
 
-            # 构造重试请求参数
-            params = {
-                "timeout": timeout,
-                "new_stateless_dp_group_port": get_open_port(),
-            }
-            request = FaultToleranceRequest(
-                str(uuid.uuid4()),
-                "retry",
-                params,
-            )
-            # 调用异步的广播命令方法
-            ft_result = await self._broad_cast_cmd(request, self.core_engines)
+        for i, res in enumerate(ft_results):
+            if res.success:
+                self.engine_status_dict[i + self.start_rank] = {
+                    "status": EngineStatusType.HEALTHY
+                }
 
-            # 更新引擎状态为HEALTHY
-            with self.engine_status_lock:
-                for index in self.engine_status_dict:
-                    self.engine_status_dict[index] = {
-                        "status": EngineStatusType.HEALTHY
-                    }
+        success = all([res.success for res in ft_results])
+        if success:
+            self.is_faulted.clear()
+        await self._pub_engine_status()
+        return success
 
-            # 重置故障标记
-            if ft_result.success:
-                self.is_faulted.clear()
-                # self._pub_engine_status()  # 如需启用可取消注释
-
-            return ft_result.success
-
-        # 同步执行异步逻辑，添加异常处理保证健壮性
-        try:
-            # 核心：用asyncio.run执行内部异步函数（Python 3.7+推荐）
-            return asyncio.run(_async_retry())
-        except Exception as e:
-            # 捕获所有异常，记录日志并返回False
-            self.logger(f"Retry operation failed with error: {str(e)}", level="error")
-            # 异常时可选择重置状态（根据业务需求调整）
-            with self.engine_status_lock:
-                self.is_faulted.set()  # 标记为故障状态（可选）
-            return False
-
-    def pause(self, timeout: int = 1, **kwargs) -> bool:
+    async def pause(self, timeout: int = 1, **kwargs) -> bool:  # type: ignore[override]
         """Pause engine cores, return True if successful. Best-effort operation."""
         self.logger(
             "Pause operation is best-effort only. Due to the complexity of "
@@ -184,131 +150,139 @@ class ClientSentinel(BaseSentinel):
             level="warning",
         )
         exclude_engine_index = kwargs.get("exclude_engine_index")
-
-        async def _async_pause():
-            with self.engine_status_lock:
-                alive_engines = await self._get_alive_engines(exclude_engine_index)
-            params = {
-                "timeout": timeout,
-                "soft_pause": kwargs.get("soft_pause", False),
-            }
-            request = FaultToleranceRequest(str(uuid.uuid4()), "retry", params)
-            ft_result = await self._broad_cast_cmd(request, alive_engines)
-            with self.engine_status_lock:
-                if ft_result.success:
-                    for ind, engine_status in self.engine_status_dict.items():
-                        if engine_status == EngineStatusType.HEALTHY:
-                            self.engine_status_dict[ind] = {
-                                "status": EngineStatusType.PAUSED
-                            }
-            return ft_result.success
-
-        try:
-            # 检查是否有正在运行的事件循环
-            loop = asyncio.get_running_loop()
-            # 如果有，使用create_task + run_until_complete（注意：仅主线程可用）
-            task = loop.create_task(_async_pause())
-            return loop.run_until_complete(task)
-        except RuntimeError:
-            # 没有正在运行的循环，使用asyncio.run
-            return asyncio.run(_async_pause())
-        except Exception as e:
-            self.logger(f"Pause operation failed: {str(e)}", level="error")
-            return False
-
-    async def _get_alive_engines(self, exclude_engine_index):
+        soft_pause = kwargs.get("soft_pause", False)
         alive_engines = [
-            core_engine
-            for core_engine in self.core_engines
-            if self.engine_status_dict[int.from_bytes(core_engine, byteorder="little")][
-                "status"
-            ]
-            != EngineStatusType.DEAD
-            and (
-                exclude_engine_index is None
-                or int.from_bytes(core_engine, byteorder="little")
-                not in exclude_engine_index
-            )
+            i
+            for i, status in self.engine_status_dict.items()
+            if status["status"] != EngineStatusType.DEAD
+            and (exclude_engine_index is None or i not in exclude_engine_index)
         ]
-        return alive_engines
 
-    def _pub_engine_status(self, engine_status: EngineStatusType) -> None:
+        kwargs["timeout"] = timeout
+        kwargs["soft_pause"] = soft_pause
+
+        ft_results = await self._execute_cmd_on_engines(
+            ft_request=FaultToleranceRequest(
+                request_id=str(uuid.uuid4()),
+                instruction="pause",
+                params=kwargs,
+            ),
+            target_engines=[
+                self.engine_identities[i - self.start_rank] for i in alive_engines
+            ],
+        )
+
+        for engine, res in zip(alive_engines, ft_results):
+            if res.success:
+                engine_status = self.engine_status_dict[engine]["status"]
+                if engine_status == EngineStatusType.HEALTHY:
+                    self.engine_status_dict[engine] = {
+                        "status": EngineStatusType.PAUSED
+                    }
+        await self._pub_engine_status()
+        return all([res.success for res in ft_results])
+
+    async def _pub_engine_status(self):
+        # No lock needed since we're single-threaded in asyncio
+        engine_status = self.engine_status_dict.copy()
         topic = self.ft_config.fault_state_pub_topic.encode()
-        self.fault_state_pub_socket.send_multipart(
+        await self.fault_state_pub_socket.send_multipart(
             (topic, msgspec.msgpack.encode(engine_status))
         )
 
-    async def _broad_cast_cmd(
+    async def _execute_cmd_on_engines(
         self, ft_request: FaultToleranceRequest, target_engines: list[bytes]
-    ) -> FaultToleranceResult:
+    ) -> list[FaultToleranceResult]:
         coroutines = []
         for core_engine in target_engines:
-            coro = self.fault_callback("handle_fault", ft_request, engine=core_engine)
+            coro = self.call_utility_async(
+                "handle_fault", ft_request, engine=core_engine
+            )
             coroutines.append(coro)
         results = await asyncio.gather(*coroutines)
-        return FaultToleranceResult(ft_request.request_id, all(results), reason=None)
+        results = [FaultToleranceResult(**res) for res in results]
+        return results
 
-    def handle_ft_command(self, ft_request: FaultToleranceRequest) -> bool:
-        return self._execute_cmd(ft_request).success
+    async def _monitor_and_pause_on_fault(self):
+        """Receive fault info from engine and pause engines if happened."""
+        poller = zmq.asyncio.Poller()
+        poller.register(self.fault_receiver_socket, zmq.POLLIN)
 
-    def _monitor_and_pause_on_fault(self):
-        """Receive fault info from engine and pause engines."""
         try:
-            while True:
-                _, _, message = self.fault_receiver_socket.recv_multipart()
-                fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
-                engine_status = (
-                    EngineStatusType.DEAD
-                    if "dead" in fault_info.type
-                    else EngineStatusType.UNHEALTHY
-                )
-                self._pub_engine_status(engine_status)
+            while not self.sentinel_dead:
+                events = await poller.poll(timeout=100)
+                if not events:
+                    continue
+                for sock, event in events:
+                    _, _, message = await sock.recv_multipart(copy=False)
+                    fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
+                    engine_status = (
+                        EngineStatusType.DEAD
+                        if "dead" in fault_info.type
+                        else EngineStatusType.UNHEALTHY
+                    )
+                    # Update engine status
+                    self.engine_status_dict[int(fault_info.engine_id)] = {
+                        "status": engine_status
+                    }
+
+                await self._pub_engine_status()
                 if not self.is_faulted.is_set():
                     self.is_faulted.set()
-                    # Schedule the pause coroutine safely from this thread.
-                    asyncio.run_coroutine_threadsafe(
-                        self.pause(timeout=self.ft_config.gloo_comm_timeout + 5),
-                        self._loop,
-                    )
+                    await self.pause(timeout=self.ft_config.gloo_comm_timeout + 5)
 
         except zmq.ZMQError:
-            # Socket was closed during polling, exit loop.
-            self.logger("Fault receiver socket closed, stopping thread.", level="info")
-            raise
+            self.logger(
+                "Fault receiver socket closed, stopping async monitor.", level="info"
+            )
 
-    def run(self):
+    async def run(self):
         """Poll for fault messages and commands, dispatch to handlers."""
-        poller = zmq.Poller()
         generic_decoder = MsgpackDecoder()
 
+        # Initialize input sockets
         for input_socket in self.input_sockets:
-            input_socket.send(b"")
-            poller.register(input_socket, zmq.POLLIN)
-        while not self.sentinel_dead:
-            # Received fault tolerance command from client.
-            # Add corresponding command to the queue.
-            for input_socket, _ in poller.poll():
-                _, *data_frames = input_socket.recv_multipart(copy=False)
-                client_index, call_id, method_name, args = generic_decoder.decode(
-                    data_frames
-                )
-                self.logger(
-                    f"####################{method_name}, ####{args}", level="info"
-                )
-                ft_request = FaultToleranceRequest(**args[0])
-                ft_result = self._execute_cmd(ft_request)
+            await input_socket.send(b"")
 
-                if not ft_result.success:
-                    # If we're busy, reply with a busy message.
-                    msg = (
-                        "System busy, vLLM is executing another fault "
-                        "tolerance instruction."
+        # Use a ZMQ Poller to avoid creating/cancelling many one-shot recv futures
+        poller = zmq.asyncio.Poller()
+        for sock in self.input_sockets:
+            poller.register(sock, zmq.POLLIN)
+
+        while not self.sentinel_dead:
+            try:
+                events = await poller.poll(timeout=100)
+                if not events:
+                    continue
+                for sock, event in events:
+                    _, *data_frames = await sock.recv_multipart(copy=False)
+                    client_index, call_id, _, ft_args = generic_decoder.decode(
+                        data_frames
                     )
-                    ft_result = FaultToleranceResult(ft_request.request_id, False, msg)
-                    self._send_utility_result(client_index, call_id, ft_result)
-                self._send_utility_result(client_index, call_id, ft_result)
+                    ft_request = FaultToleranceRequest(**ft_args[0])
+                    success, reason = False, None
+                    try:
+                        success = await getattr(self, ft_request.instruction)(
+                            **ft_request.params
+                        )
+                    except Exception as e:
+                        self.logger(f"Error processing command: {e}", level="error")
+                        reason = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+
+                    ft_result = FaultToleranceResult(
+                        success=success,
+                        request_id=ft_request.request_id,
+                        reason=reason if not success else None,
+                    )
+                    await self._send_utility_result(client_index, call_id, ft_result)
+            except zmq.ZMQError:
+                # Sockets were likely closed during shutdown; exit loop.
+                self.logger("Input sockets closed, stopping run loop.", level="info")
+                break
 
     def shutdown(self):
+        # Unregister input sockets from the poller if it exists to avoid
+        # lingering references in the Poller during teardown.
         close_sockets(
             [
                 self.fault_receiver_socket,

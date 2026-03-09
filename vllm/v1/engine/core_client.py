@@ -393,7 +393,6 @@ class BackgroundResources:
     stats_update_task: asyncio.Task | None = None
     shutdown_path: str | None = None
     client_sentinel: ClientSentinel | None = None
-    client_sentinel_req_socket: zmq.Socket | None = None
     fault_state_sub_socket: zmq.Socket | None = None
 
     # Set if any of the engines are dead. Here so that the output
@@ -421,7 +420,6 @@ class BackgroundResources:
                 self.first_req_send_socket,
                 self.first_req_rcv_socket,
                 self.stats_update_socket,
-                self.client_sentinel_req_socket,
                 self.fault_state_sub_socket,
             )
 
@@ -892,25 +890,15 @@ class AsyncMPClient(MPClient):
                 self.client_sentinel = ClientSentinel(
                     vllm_config=vllm_config,
                     fault_tolerance_addresses=ft_addr,
-                    fault_callback=self._call_utility_async,
+                    call_utility_async=self._call_utility_async,
                     core_engines=self.core_engines,
-                    input_addresses=self.addresses.inputs,
-                    output_addresses=self.addresses.outputs,
                 )
                 self.resources.client_sentinel = self.client_sentinel
-            self.ft_request_lock = threading.Lock()
             self.engine_status_dict: dict[int, dict[str, EngineStatusType]] = {
                 engine_index: {"status": EngineStatusType.HEALTHY}
                 for engine_index in self.engine_ranks_managed
             }
             self.engine_status_lock = threading.Lock()
-            self.client_sentinel_req_socket = make_zmq_socket(
-                self.resources.ctx,
-                ft_addr.client_sentinel_request_addr,
-                zmq.DEALER,
-                bind=False,
-                identity=str(uuid.uuid4()).encode("utf8"),
-            )
             self.fault_state_sub_socket = make_zmq_socket(
                 self.resources.ctx,
                 ft_addr.fault_state_pub_socket_addr,
@@ -921,7 +909,6 @@ class AsyncMPClient(MPClient):
                 zmq.SUBSCRIBE,
                 self.vllm_config.fault_tolerance_config.fault_state_pub_topic.encode(),
             )
-            self.resources.client_sentinel_req_socket = self.client_sentinel_req_socket
             self.resources.fault_state_sub_socket = self.fault_state_sub_socket
             threading.Thread(
                 target=self._engine_status_listener,
@@ -953,7 +940,7 @@ class AsyncMPClient(MPClient):
             Callable[[AsyncMPClient, EngineCoreOutputs], Awaitable[None]] | None
         ) = getattr(self.__class__, "process_engine_outputs", None)
         _self_ref = weakref.ref(self) if output_handler else None
-        output_socket: zmq.asyncio.Socket = resources.output_socket
+        output_socket = resources.output_socket
         assert output_socket is not None
 
         async def process_outputs_socket():
@@ -1134,23 +1121,25 @@ class AsyncMPClient(MPClient):
     async def handle_fault(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
-        return await self._call_utility_async(
-            "handle_fault", ft_request, engine=b"client_sentinel"
+        res = await self._call_utility_async(
+            ft_request.instruction, ft_request, engine=b"client_sentinel"
         )
+        return FaultToleranceResult(**res)
 
     def _engine_status_listener(self):
+        decoder = msgspec.msgpack.Decoder()
         while True:
             try:
                 # Expect multipart: [topic, payload].
                 frames = self.fault_state_sub_socket.recv_multipart()
                 payload = frames[-1]
-                status_dict = msgspec.msgpack.decode(payload)
+                status_dict = decoder.decode(payload)
                 with self.engine_status_lock:
                     self.engine_status_dict.clear()
                     self.engine_status_dict.update(status_dict)
-                status_set = {v["status"] for v in status_dict.values()}
-                healthy = (
-                    len(status_set) == 1 and EngineStatusType.HEALTHY in status_set
+                healthy = all(
+                    v["status"] == EngineStatusType.HEALTHY
+                    for v in status_dict.values()
                 )
                 if healthy:
                     self.is_faulted.clear()
@@ -1163,10 +1152,9 @@ class AsyncMPClient(MPClient):
         with self.engine_status_lock:
             raw = self.engine_status_dict.copy()
         result = {}
-        for k, v in raw.items():
-            status_val = v["status"]
-            status_enum = EngineStatusType(status_val)
-            result[k] = {"status": status_enum.name.title()}
+        for engine_id, status_value in raw.items():
+            status_enum = EngineStatusType(status_value["status"])
+            result[engine_id] = {"status": status_enum.name.title()}
         return result
 
 
