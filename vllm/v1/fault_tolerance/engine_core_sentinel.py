@@ -223,7 +223,7 @@ def busy_loop_wrapper(busy_loop_func):
                     try:
                         # Block until recovery command received
                         ft_request = self.cmd_q.get(
-                            timeout=self.engine_recovery_timeout
+                            timeout=self.engine_recovery_timeout_sec
                         )
 
                         if ft_request is not None:

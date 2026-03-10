@@ -824,7 +824,7 @@ class EngineCoreProc(EngineCore):
                 self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue(
                     maxsize=1
                 )
-                self.engine_recovery_timeout = ft_config.engine_recovery_timeout
+                self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
                 assert addresses.fault_tolerance_addresses is not None
                 ft_addresses = addresses.fault_tolerance_addresses
                 engine_core_sentinel_ids = ft_addresses.engine_core_sentinel_identities
