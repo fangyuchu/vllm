@@ -104,16 +104,12 @@ class ClientSentinel(BaseSentinel):
                     level="warning",
                 )
                 return False
-
-        new_stateless_dp_group_port = get_open_port()
+        kwargs["timeout"] = timeout
+        if "new_stateless_dp_group_port" not in kwargs:
+            kwargs["new_stateless_dp_group_port"] = get_open_port()
         ft_results = await self._execute_cmd_on_engines(
             ft_request=FaultToleranceRequest(
-                request_id=str(uuid.uuid4()),
-                instruction="retry",
-                params={
-                    "new_stateless_dp_group_port": new_stateless_dp_group_port,
-                    "timeout": timeout,
-                },
+                request_id=str(uuid.uuid4()), instruction="retry", params=kwargs
             ),
             target_engines=self.engine_identities,
         )
