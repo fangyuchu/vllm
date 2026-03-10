@@ -838,7 +838,6 @@ class EngineCoreProc(EngineCore):
                     busy_loop_active=self.busy_loop_active,
                     engine_input_q=self.input_queue,
                     engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
-                    upstream_cmd_addr=ft_addresses.engine_core_sentinel_cmd_addr,
                     downstream_cmd_addr=worker_cmd_addr,
                     sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     vllm_config=vllm_config,

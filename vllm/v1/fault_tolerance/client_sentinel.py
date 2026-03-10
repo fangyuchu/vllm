@@ -32,11 +32,7 @@ class ClientSentinel(BaseSentinel):
     ):
         self.engine_identities = core_engines
         super().__init__(
-            vllm_config=vllm_config,
-            upstream_cmd_addr=None,
-            downstream_cmd_addr=None,
-            sentinel_identity=b"client_sentinel",
-            sentinel_tag=None,
+            vllm_config=vllm_config, sentinel_tag=None, identity=b"client_sentinel"
         )
 
         self.call_utility_async = call_utility_async
@@ -47,11 +43,7 @@ class ClientSentinel(BaseSentinel):
 
         self.input_sockets = [
             make_zmq_socket(
-                self.ctx,
-                input_address,
-                zmq.DEALER,
-                identity=b"client_sentinel",
-                bind=False,
+                self.ctx, input_address, zmq.DEALER, identity=self.identity, bind=False
             )
             for input_address in fault_tolerance_addresses.all_client_input_addresses
         ]
@@ -232,19 +224,15 @@ class ClientSentinel(BaseSentinel):
                     await self.pause(timeout=self.ft_config.gloo_comm_timeout + 5)
 
         except zmq.ZMQError:
-            self.logger(
-                "Fault receiver socket closed, stopping async monitor.", level="info"
-            )
+            self.logger("Fault receiver socket closed, stopping async monitor.")
 
     async def run(self):
-        """Poll for fault messages and commands, dispatch to handlers."""
+        """Poll and execute fault tolerance commands."""
         generic_decoder = MsgpackDecoder()
-
         # Initialize input sockets
         for input_socket in self.input_sockets:
             await input_socket.send(b"")
 
-        # Use a ZMQ Poller to avoid creating/cancelling many one-shot recv futures
         poller = zmq.asyncio.Poller()
         for sock in self.input_sockets:
             poller.register(sock, zmq.POLLIN)
@@ -255,38 +243,28 @@ class ClientSentinel(BaseSentinel):
                 if not events:
                     continue
                 for sock, event in events:
-                    _, *data_frames = await sock.recv_multipart(copy=False)
-                    client_index, call_id, _, ft_args = generic_decoder.decode(
-                        data_frames
-                    )
+                    _, *msg = await sock.recv_multipart(copy=False)
+                    client_index, call_id, _, ft_args = generic_decoder.decode(msg)
                     ft_request = FaultToleranceRequest(**ft_args[0])
-                    success, reason = False, None
-                    try:
-                        success = await getattr(self, ft_request.instruction)(
-                            **ft_request.params
-                        )
-                    except Exception as e:
-                        self.logger(f"Error processing command: {e}", level="error")
-                        reason = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-
-                    ft_result = FaultToleranceResult(
-                        success=success,
-                        request_id=ft_request.request_id,
-                        reason=reason if not success else None,
-                    )
+                    ft_result = await self._execute_cmd(ft_request)
                     await self._send_utility_result(client_index, call_id, ft_result)
             except zmq.ZMQError:
-                # Sockets were likely closed during shutdown; exit loop.
-                self.logger("Input sockets closed, stopping run loop.", level="info")
-                break
+                self.logger("Sockets closed, terminating.")
+                self.sentinel_dead = True
+
+    async def _execute_cmd(self, ft_request):
+        success, reason = False, None
+        try:
+            success = await getattr(self, ft_request.instruction)(**ft_request.params)
+        except Exception as e:
+            self.logger(f"Error processing command: {e}", level="error")
+            reason = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        return FaultToleranceResult(
+            success=success,
+            request_id=ft_request.request_id,
+            reason=reason if not success else None,
+        )
 
     def shutdown(self):
-        # Unregister input sockets from the poller if it exists to avoid
-        # lingering references in the Poller during teardown.
-        close_sockets(
-            [
-                self.fault_receiver_socket,
-                self.fault_state_pub_socket,
-            ]
-        )
+        close_sockets([self.fault_receiver_socket, self.fault_state_pub_socket])
         super().shutdown()

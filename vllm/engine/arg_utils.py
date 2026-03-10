@@ -1259,7 +1259,7 @@ class EngineArgs:
             **fault_tolerance_kwargs["shutdown_on_fault_tolerance_failure"],
         )
         fault_tolerance_group.add_argument(
-            "--engine-recovery-timeout_sec",
+            "--engine-recovery-timeout-sec",
             **fault_tolerance_kwargs["engine_recovery_timeout_sec"],
         )
         fault_tolerance_group.add_argument(
