@@ -36,33 +36,37 @@ class ClientSentinel(BaseSentinel):
         )
 
         self.call_utility_async = call_utility_async
-        self.ctx = zmq.asyncio.Context()
+        self.ctx_async = zmq.asyncio.Context()
 
         self.sentinel_dead = False
         self.logger = self._make_logger()
 
         self.input_sockets = [
             make_zmq_socket(
-                self.ctx, input_address, zmq.DEALER, identity=self.identity, bind=False
+                self.ctx_async,
+                input_address,
+                zmq.DEALER,
+                identity=self.identity,
+                bind=False,
             )
             for input_address in fault_tolerance_addresses.all_client_input_addresses
         ]
 
         self.output_sockets = [
-            make_zmq_socket(self.ctx, output_address, zmq.PUSH, linger=4000)
+            make_zmq_socket(self.ctx_async, output_address, zmq.PUSH, linger=4000)
             for output_address in fault_tolerance_addresses.all_client_output_addresses
         ]
 
         self.is_faulted = asyncio.Event()
         self.fault_receiver_socket = make_zmq_socket(
-            ctx=self.ctx,
+            ctx=self.ctx_async,
             path=fault_tolerance_addresses.engine_fault_socket_addr,
             socket_type=zmq.ROUTER,
             bind=True,
         )
 
         self.fault_state_pub_socket = make_zmq_socket(
-            ctx=self.ctx,
+            ctx=self.ctx_async,
             path=fault_tolerance_addresses.fault_state_pub_socket_addr,
             socket_type=zmq.PUB,
             bind=True,
@@ -263,4 +267,6 @@ class ClientSentinel(BaseSentinel):
 
     def shutdown(self):
         close_sockets([self.fault_receiver_socket, self.fault_state_pub_socket])
+        close_sockets(self.input_sockets + self.output_sockets)
+        self.ctx_async.term()
         super().shutdown()
