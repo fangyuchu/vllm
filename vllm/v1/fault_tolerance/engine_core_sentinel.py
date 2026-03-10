@@ -37,7 +37,6 @@ class EngineCoreSentinel(BaseSentinel):
         cmd_q: queue.Queue,
         busy_loop_active: threading.Event,
         engine_input_q: queue.Queue,
-        upstream_cmd_addr: str,
         downstream_cmd_addr: str,
         engine_fault_socket_addr: str,
         sentinel_identity: bytes,
@@ -45,11 +44,9 @@ class EngineCoreSentinel(BaseSentinel):
     ):
         self.engine_index = engine_index
         super().__init__(
-            upstream_cmd_addr=upstream_cmd_addr,
-            downstream_cmd_addr=downstream_cmd_addr,
-            sentinel_identity=sentinel_identity,
             sentinel_tag=f"DP_{engine_index}",
             vllm_config=vllm_config,
+            identity=sentinel_identity,
         )
 
         self.fault_signal_q = fault_signal_q
@@ -61,6 +58,15 @@ class EngineCoreSentinel(BaseSentinel):
         self.pp_size = parallel_config.pipeline_parallel_size
         self.dp_size = parallel_config.data_parallel_size
 
+        self.worker_cmd_socket = make_zmq_socket(
+            ctx=self.ctx,
+            path=downstream_cmd_addr,
+            socket_type=zmq.ROUTER,
+            bind=True,
+        )
+        self.worker_cmd_poller = zmq.Poller()
+        self.worker_cmd_poller.register(self.worker_cmd_socket, zmq.POLLIN)
+
         # Client <-> EngineCoreSentinel sockets
         self.engine_fault_socket = make_zmq_socket(
             self.ctx,
@@ -71,28 +77,17 @@ class EngineCoreSentinel(BaseSentinel):
         )
 
         self.communicator_aborted = False
-        self.engine_running = True
+        self.engine_paused = threading.Event()
         threading.Thread(
             target=self.run, daemon=True, name="EngineCoreSentinelMonitorThread"
         ).start()
 
     def run(self):
-        """
-        Continuously poll for fault signals and commands.
-        """
+        """Continuously poll for fault signals and report to client sentinel."""
         while not self.sentinel_dead:
-            # Check for engine fault signals
-            self.poll_and_report_fault_events()
-            # Check for commands from ClientSentinel
-            self.poll_and_execute_upstream_cmd()
-
-    def handle_fault(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
-        return self._execute_cmd(ft_request)
-
-    def poll_and_report_fault_events(self):
-        try:
-            engine_exception = self.fault_signal_q.get_nowait()
-            self.engine_running = False
+            # poll and report fault events
+            engine_exception = self.fault_signal_q.get()
+            self.engine_paused.set()
             if isinstance(engine_exception, EngineLoopPausedError):
                 self.logger("Engine paused", level="info")
             else:
@@ -106,8 +101,9 @@ class EngineCoreSentinel(BaseSentinel):
                 msg = FaultInfo.from_exception(engine_exception, self.engine_index)
                 msg_bytes = msgspec.msgpack.encode(msg)
                 self.engine_fault_socket.send_multipart([b"", msg_bytes])
-        except queue.Empty:
-            pass
+
+    def handle_fault(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        return self._execute_cmd(ft_request)
 
     def pause(self, timeout: int = 1, **kwargs) -> bool:
         """
@@ -118,26 +114,18 @@ class EngineCoreSentinel(BaseSentinel):
         deadline = time.monotonic() + timeout
         # Clear the flag to signal busy loop should pause
         self.busy_loop_active.clear()
-        success, _ = self._execute_command_on_downstreams(
+        success, _ = self._execute_command_on_workers(
             "pause",
             self._get_target_worker_identity(),
             timeout=timeout,
             soft_pause=soft_pause,
         )
-        if self.engine_running:
+        if success and not self.engine_paused.is_set():
             # Put a sentinel (empty request) to unblock the busy loop
             # if it's blocked on input_queue.get()
             self.engine_input_q.put((EngineCoreRequestType.PAUSE, None))
             remaining_timeout = max(0, deadline - time.monotonic())
-            if success:
-                try:
-                    # Wait for engine to acknowledge the pause via fault_signal_q
-                    exception = self.fault_signal_q.get(timeout=remaining_timeout)
-                    self.fault_signal_q.put(exception)
-                    self.engine_running = False
-                except queue.Empty:
-                    # Timeout waiting for pause acknowledgment
-                    success = False
+            success = self.engine_paused.wait(remaining_timeout)
         return success
 
     def retry(self, timeout: int = 1, **kwargs) -> bool:
@@ -146,12 +134,12 @@ class EngineCoreSentinel(BaseSentinel):
         This instruction tells the EngineCore to continue its busy loop
         after being suspended due to an exception.
         """
-        if self.engine_running:
+        if not self.engine_paused.is_set():
             return True
         new_stateless_dp_group_port = kwargs.get("new_stateless_dp_group_port")
         deadline = time.monotonic() + timeout
         identities = self._get_target_worker_identity()
-        success, _ = self._execute_command_on_downstreams(
+        success, _ = self._execute_command_on_workers(
             "retry", identities, timeout=timeout
         )
         if not success:
@@ -171,19 +159,108 @@ class EngineCoreSentinel(BaseSentinel):
 
         # Ensure busy loop has been recovered.
         remaining_timeout = max(0, deadline - time.monotonic())
-        self.engine_running = self.busy_loop_active.wait(timeout=remaining_timeout)
-        return self.engine_running
+        success = self.busy_loop_active.wait(timeout=remaining_timeout)
+        if success:
+            self.engine_paused.clear()
+        return success
 
     def _get_target_worker_identity(self):
-        identities = set()
-        for tp_rank in range(self.tp_size):
-            for pp_rank in range(self.pp_size):
-                identity = f"PP{pp_rank}_TP{tp_rank}".encode()
-                identities.add(identity)
-        return identities
+        return {
+            f"PP{pp_rank}_TP{tp_rank}".encode()
+            for tp_rank in range(self.tp_size)
+            for pp_rank in range(self.pp_size)
+        }
+
+    def _execute_command_on_workers(
+        self,
+        method_name: str,
+        target_worker_sentinels: set[bytes],
+        timeout: int = 5,
+        **kwargs,
+    ) -> tuple[bool, dict[bytes, FaultToleranceResult]]:
+        """
+        Broadcast a command to worker sentinels and collect responses.
+        """
+        # Create fault tolerance request
+        kwargs["timeout"] = timeout
+        ft_request = FaultToleranceRequest(
+            request_id=str(uuid.uuid4()),
+            instruction=method_name,
+            params=kwargs,
+        )
+        # Broadcast the instruction
+        msg_bytes = msgspec.msgpack.encode(ft_request)
+        for identity in target_worker_sentinels:
+            self.worker_cmd_socket.send_multipart([identity, b"", msg_bytes])
+        # Wait for responses
+        responses = self._wait_for_execution_result(
+            target_worker_sentinels,
+            timeout,
+            ft_request,
+        )
+        # check the execution results
+        for sentinel_identity in target_worker_sentinels:
+            response = responses.get(sentinel_identity)
+            if response is None:
+                self.logger(
+                    'Worker sentinels timed out on "%s".',
+                    method_name,
+                    level="error",
+                )
+                return False, responses
+            elif not response.success:
+                self.logger(
+                    'Worker sentinels failed to "%s" (reason: %s)',
+                    method_name,
+                    response.reason or "unknown",
+                    level="error",
+                )
+                return False, responses
+
+        return True, responses
+
+    def _wait_for_execution_result(
+        self,
+        target_identities: set[bytes] | list[bytes],
+        timeout: int,
+        ft_request: "FaultToleranceRequest",
+    ) -> dict[bytes, "FaultToleranceResult"]:
+        """Collect responses for the given request.
+        Returns partial results on timeout or error.
+        """
+        assert self.worker_cmd_socket is not None
+        deadline = time.monotonic() + timeout
+        responses: dict[bytes, FaultToleranceResult] = {}
+        pending = set(target_identities)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                events = self.worker_cmd_poller.poll(int(remaining * 1000))
+                if not events:
+                    break
+                identity, _, payload = self.worker_cmd_socket.recv_multipart()
+                result = msgspec.msgpack.decode(payload, type=FaultToleranceResult)
+                # Ignore unrelated responses
+                if result.request_id != ft_request.request_id:
+                    self.logger(
+                        "Discarding outdated response: %s", result, level="warning"
+                    )
+                    continue
+
+                responses[identity] = result
+                pending.discard(identity)
+            except Exception as e:
+                self.logger(
+                    "Error while processing engine response: %s", e, level="error"
+                )
+                break
+
+        return responses
 
     def shutdown(self):
-        close_sockets([self.engine_fault_socket])
+        close_sockets([self.engine_fault_socket, self.worker_cmd_socket])
         super().shutdown()
 
 

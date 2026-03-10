@@ -5,7 +5,9 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from typing import cast
 
+import msgspec
 import torch
+import zmq
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
@@ -16,7 +18,9 @@ from vllm.distributed import (
     get_tp_group,
 )
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 
 
 class WorkerSentinel(BaseSentinel):
@@ -31,13 +35,11 @@ class WorkerSentinel(BaseSentinel):
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         tp_rank = get_tp_group().rank_in_group
         pp_rank = get_pp_group().rank_in_group
-        identity = f"PP{pp_rank}_TP{tp_rank}"
+        identity_str = f"PP{pp_rank}_TP{tp_rank}"
         super().__init__(
-            upstream_cmd_addr=vllm_config.fault_tolerance_config.worker_cmd_addr,
-            downstream_cmd_addr=None,
-            sentinel_identity=identity.encode(),
-            sentinel_tag=f"{dp_rank}_{identity}",
+            sentinel_tag=f"{dp_rank}_{identity_str}",
             vllm_config=vllm_config,
+            identity=identity_str.encode(),
         )
         self.init_distributed_env_callback = init_distributed_env_callback
         self.clear_input_batch_callback = clear_input_batch_callback
@@ -46,6 +48,17 @@ class WorkerSentinel(BaseSentinel):
         self.pause_event = pause_event
         self.communicator_aborted = False
         torch.cuda.set_device(self.device)
+
+        assert vllm_config.fault_tolerance_config.worker_cmd_addr is not None
+        self.engine_core_cmd_socket = make_zmq_socket(
+            self.ctx,
+            vllm_config.fault_tolerance_config.worker_cmd_addr,
+            zmq.DEALER,
+            bind=False,
+            identity=self.identity,
+        )
+        self.engine_core_cmd_socket.setsockopt(zmq.RCVTIMEO, 100)
+
         threading.Thread(
             target=self.run, daemon=True, name="WorkerSentinelMonitorThread"
         ).start()
@@ -54,6 +67,23 @@ class WorkerSentinel(BaseSentinel):
         # Wait for fault tolerance instructions from EngineCoreSentinel
         while not self.sentinel_dead:
             self.poll_and_execute_upstream_cmd()
+
+    def poll_and_execute_upstream_cmd(self):
+        """
+        Receive and execute a command from upstream sentinel and send back
+        the execution result.
+        """
+        try:
+            _, msg = self.engine_core_cmd_socket.recv_multipart()
+            ft_request = msgspec.msgpack.decode(msg, type=FaultToleranceRequest)
+            ft_result = self._execute_cmd(ft_request)
+            msg_bytes = msgspec.msgpack.encode(ft_result)
+            self.engine_core_cmd_socket.send_multipart([b"", msg_bytes])
+        except zmq.Again:
+            pass
+        except zmq.ZMQError:
+            self.logger("Socket closed, terminating.")
+            self.sentinel_dead = True
 
     def pause(self, timeout: int = 1, **kwargs) -> bool:
         soft_pause = kwargs.get("soft_pause", False)
@@ -137,3 +167,7 @@ class WorkerSentinel(BaseSentinel):
         self.clear_input_batch_callback()
         self.pause_event.clear()
         return True
+
+    def shutdown(self):
+        close_sockets([self.engine_core_cmd_socket])
+        super().shutdown()
