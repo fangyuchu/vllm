@@ -247,3 +247,6 @@ class EngineClient(ABC):
     async def update_weights(self, request: WeightTransferUpdateRequest) -> None:
         """Batched weight update for RL training."""
         raise NotImplementedError
+
+    def shutdown(self) -> None:
+        raise NotImplementedError
