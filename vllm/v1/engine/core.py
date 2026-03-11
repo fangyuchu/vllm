@@ -1444,11 +1444,15 @@ class EngineCoreProc(EngineCore):
 
     def handle_fault(self, call_id: int, client_index: int, args: dict):
         """Call engine_core_sentinel to perform fault tolerance."""
-        ft_result = self.engine_core_sentinel.handle_fault(
-            FaultToleranceRequest(**args)
-        )
         uo = UtilityOutput(call_id=call_id)
-        uo.result = UtilityResult(ft_result)
+        try:
+            ft_result = self.engine_core_sentinel.handle_fault(
+                FaultToleranceRequest(**args)
+            )
+            uo.result = UtilityResult(ft_result)
+        except Exception as e:
+            logger.exception("Call to handle_fault method failed")
+            uo.failure_message = f"Call to handle_fault method failed: {e}"
         outputs = EngineCoreOutputs(utility_output=uo)
         self.output_queue.put_nowait((client_index, outputs))
 
