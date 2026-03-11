@@ -6,6 +6,7 @@ import gc
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from functools import partial
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -57,6 +58,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -122,6 +124,8 @@ class Worker(WorkerBase):
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
+
+        self.worker_sentinel: WorkerSentinel | None = None
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -312,6 +316,30 @@ class Worker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            with set_current_vllm_config(self.vllm_config):
+                init_distributed_env_callback = partial(
+                    init_worker_distributed_environment,
+                    self.vllm_config,
+                    self.rank,
+                    self.distributed_init_method,
+                    self.local_rank,
+                )
+
+            def clear_input_batch_callback():
+                input_batch = self.model_runner.input_batch
+                cached_req_ids = input_batch.req_id_to_index.keys()
+                for req_id in list(cached_req_ids):
+                    input_batch.remove_request(req_id)
+
+            self.worker_sentinel = WorkerSentinel(
+                self.vllm_config,
+                self.model_runner.pause_event,
+                init_distributed_env_callback,
+                clear_input_batch_callback,
+                self.device,
+            )
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -1100,6 +1128,8 @@ class Worker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
+        if self.worker_sentinel is not None:
+            self.worker_sentinel.shutdown()
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
@@ -1123,7 +1153,12 @@ def init_worker_distributed_environment(
 
     init_method = distributed_init_method or "env://"
     init_distributed_environment(
-        parallel_config.world_size, rank, init_method, local_rank, backend
+        parallel_config.world_size,
+        rank,
+        init_method,
+        local_rank,
+        backend,
+        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
 
     ensure_model_parallel_initialized(
@@ -1131,6 +1166,7 @@ def init_worker_distributed_environment(
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
+        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
 
     # Init ec connector here before KV caches caches init
