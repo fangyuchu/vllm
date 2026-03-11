@@ -592,7 +592,7 @@ class EngineArgs:
 
     # fault tolerance fields
     enable_fault_tolerance: bool = FaultToleranceConfig.enable_fault_tolerance
-    engine_recovery_timeout: int = FaultToleranceConfig.engine_recovery_timeout
+    engine_recovery_timeout_sec: int = FaultToleranceConfig.engine_recovery_timeout_sec
     internal_fault_report_port: int = FaultToleranceConfig.internal_fault_report_port
     external_fault_notify_port: int = FaultToleranceConfig.external_fault_notify_port
     gloo_comm_timeout: int = FaultToleranceConfig.gloo_comm_timeout
@@ -1259,8 +1259,8 @@ class EngineArgs:
             **fault_tolerance_kwargs["shutdown_on_fault_tolerance_failure"],
         )
         fault_tolerance_group.add_argument(
-            "--engine-recovery-timeout",
-            **fault_tolerance_kwargs["engine_recovery_timeout"],
+            "--engine-recovery-timeout-sec",
+            **fault_tolerance_kwargs["engine_recovery_timeout_sec"],
         )
         fault_tolerance_group.add_argument(
             "--internal-fault-report-port",
@@ -1852,7 +1852,7 @@ class EngineArgs:
         fault_tolerance_config = FaultToleranceConfig(
             enable_fault_tolerance=self.enable_fault_tolerance,
             shutdown_on_fault_tolerance_failure=self.shutdown_on_fault_tolerance_failure,
-            engine_recovery_timeout=self.engine_recovery_timeout,
+            engine_recovery_timeout_sec=self.engine_recovery_timeout_sec,
             internal_fault_report_port=self.internal_fault_report_port,
             external_fault_notify_port=self.external_fault_notify_port,
             gloo_comm_timeout=self.gloo_comm_timeout,

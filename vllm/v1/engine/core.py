@@ -824,7 +824,7 @@ class EngineCoreProc(EngineCore):
                 self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue(
                     maxsize=1
                 )
-                self.engine_recovery_timeout = ft_config.engine_recovery_timeout
+                self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
                 assert addresses.fault_tolerance_addresses is not None
                 ft_addresses = addresses.fault_tolerance_addresses
                 engine_core_sentinel_ids = ft_addresses.engine_core_sentinel_identities
@@ -838,7 +838,6 @@ class EngineCoreProc(EngineCore):
                     busy_loop_active=self.busy_loop_active,
                     engine_input_q=self.input_queue,
                     engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
-                    upstream_cmd_addr=ft_addresses.engine_core_sentinel_cmd_addr,
                     downstream_cmd_addr=worker_cmd_addr,
                     sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     vllm_config=vllm_config,
@@ -1354,6 +1353,12 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                    elif request_type == EngineCoreRequestType.UTILITY:
+                        request = generic_decoder.decode(data_frames)
+                        client_index, call_id, method, args = request
+                        if method == "handle_fault":
+                            self.handle_fault(call_id, client_index, args[0])
+                            continue
                     else:
                         request = generic_decoder.decode(data_frames)
 
@@ -1436,6 +1441,20 @@ class EngineCoreProc(EngineCore):
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
+
+    def handle_fault(self, call_id: int, client_index: int, args: dict):
+        """Call engine_core_sentinel to perform fault tolerance."""
+        uo = UtilityOutput(call_id=call_id)
+        try:
+            ft_result = self.engine_core_sentinel.handle_fault(
+                FaultToleranceRequest(**args)
+            )
+            uo.result = UtilityResult(ft_result)
+        except Exception as e:
+            logger.exception("Call to handle_fault method failed")
+            uo.failure_message = f"Call to handle_fault method failed: {e}"
+        outputs = EngineCoreOutputs(utility_output=uo)
+        self.output_queue.put_nowait((client_index, outputs))
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised
