@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import msgspec
-import regex as re
 import zmq
 
 from vllm import envs
@@ -180,38 +179,49 @@ class CoreEngineProcManager:
         """Shutdown all procs."""
         self._finalizer()
 
-    def notify_engine_down(self, engine_rank, died_proc):
+    def notify_engine_down(self, dead_proc, all_processes):
         """
         Send fault notification to the engine_down_socket
         and log the failure event.
         """
+        engine_rank = all_processes.index(dead_proc)
         fault_info = FaultInfo(
             type="EngineDeadError",
-            message=f"Engine core proc {died_proc.name} died unexpectedly.",
-            engine_id=engine_rank,
+            message=f"Engine core proc {dead_proc.name} died unexpectedly.",
+            engine_id=str(engine_rank),
             additional_info=None,
         )
 
         self.engine_down_socket.send_multipart(
             [b"", msgspec.msgpack.encode(fault_info)]
         )
-        logger.error("Engine core proc %s died unexpectedly", died_proc.name)
 
     def monitor_engine_liveness(self, engine_down_callback):
         """
         Monitor engine core process liveness.
         """
-        sentinels = [proc.sentinel for proc in self.processes]
+        sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
+        sentinels = set(sentinel_to_proc.keys())
+
         while sentinels and not self.shutdown_monitor:
-            died = connection.wait(sentinels)
-            for sentinel in died:
-                sentinel = cast(int, sentinel)
-                died_proc = next(
-                    proc for proc in self.processes if proc.sentinel == sentinel
-                )
-                engine_rank = re.match(r"EngineCore_DP(\d+)", died_proc.name).group(1)
-                engine_down_callback(engine_rank, died_proc)
-                sentinels.remove(sentinel)
+            died_sentinels = connection.wait(sentinels, timeout=1)
+
+            for sentinel in died_sentinels:
+                proc = sentinel_to_proc[cast(int, sentinel)]
+                exitcode = proc.exitcode
+                if exitcode != 0:
+                    logger.error(
+                        "Engine core proc %s died unexpectedly.",
+                        proc.name,
+                    )
+
+                if engine_down_callback is not None:
+                    engine_down_callback(
+                        dead_proc=proc,
+                        all_processes=self.processes,
+                    )
+
+            sentinels -= set(died_sentinels)
 
     def join_first(self):
         """Wait for any process to exit."""
@@ -417,7 +427,6 @@ class CoreEngineActorManager:
                     local_dp_rank=local_index,
                 )
             )
-
             if local_client:
                 self.local_engine_actors.append(actor)
             else:
@@ -841,7 +850,8 @@ class CoreEngineActorManager:
     def get_run_refs(self):
         return self.run_refs
 
-    def notify_engine_down(self, engine_rank, actor_ref):
+    def notify_engine_down(self, dead_proc, all_processes):
+        engine_rank = all_processes.index(dead_proc)
         fault_info = FaultInfo(
             type="EngineDeadError",
             message="Engine_actor died unexpectedly.",
@@ -852,31 +862,31 @@ class CoreEngineActorManager:
         self.engine_down_socket.send_multipart(
             [b"", msgspec.msgpack.encode(fault_info)]
         )
-        logger.error("Engine actor %s died unexpectedly", engine_rank)
 
     def monitor_engine_liveness(self, engine_down_callback):
         import ray
 
-        processed_done_refs = set()
+        all_refs = self.get_run_refs()
+        processed_done_refs: set[ray.ObjectRef] = set()
         while not self.shutdown_monitor:
-            actor_run_refs = self.get_run_refs()
+            actor_run_refs = set(self.get_run_refs())
             if not actor_run_refs:
                 logger.info(
-                    "There are no actors to monitor currently."
-                    " The monitoring function is about to terminate."
+                    "There are no actors to monitor currently. "
+                    "The monitoring function is about to terminate."
                 )
-                return
-            ref_to_index_mapping = {
-                ref: index for index, ref in enumerate(actor_run_refs)
-            }
-            actor_done_refs, _ = ray.wait(actor_run_refs, timeout=5)
-            if not actor_done_refs:
-                continue
+                break
+
+            refs_to_watch = list(actor_run_refs - processed_done_refs)
+            actor_done_refs, _ = ray.wait(refs_to_watch, timeout=5)
             for actor_ref in actor_done_refs:
-                if actor_ref in processed_done_refs:
-                    continue
-                error_engine_id = ref_to_index_mapping[actor_ref]
-                engine_down_callback(error_engine_id, actor_ref)
+                try:
+                    ray.get(actor_ref)
+                except ray.exceptions.RayActorError:
+                    logger.error("Engine core actor died: %s", actor_ref)
+                if engine_down_callback is not None:
+                    engine_down_callback(dead_proc=actor_ref, all_processes=all_refs)
+
                 processed_done_refs.add(actor_ref)
 
     def close(self):
@@ -978,12 +988,7 @@ def launch_core_engines(
 
     if vllm_config.fault_tolerance_config.enable_fault_tolerance is True:
         addresses.fault_tolerance_addresses = FaultToleranceZmqAddresses.build(
-            host,
-            local_engines_only,
-            dp_size,
-            addresses.inputs,
-            addresses.outputs,
-            vllm_config.fault_tolerance_config,
+            host, dp_size, vllm_config.fault_tolerance_config
         )
 
     if parallel_config.data_parallel_backend == "ray":

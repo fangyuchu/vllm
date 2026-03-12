@@ -58,7 +58,6 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
-from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -69,17 +68,13 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     EngineCoreSentinel,
     busy_loop_wrapper,
 )
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.serial_utils import (
-    MsgpackDecoder,
-    MsgpackEncoder,
-)
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.utils import compute_iteration_details, get_engine_client_zmq_addr
+from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -839,30 +834,18 @@ class EngineCoreProc(EngineCore):
             self.enable_fault_tolerance = ft_config.enable_fault_tolerance
             if self.enable_fault_tolerance:
                 # Track whether the busy loop is currently active.
-                self.busy_loop_active = threading.Event()
                 self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
-                self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue(
-                    maxsize=1
-                )
                 self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
                 assert addresses.fault_tolerance_addresses is not None
                 ft_addresses = addresses.fault_tolerance_addresses
                 engine_core_sentinel_ids = ft_addresses.engine_core_sentinel_identities
-
-                # The ZMQ address between engine_core_sentinel and worker_sentinel.
-                worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
                 self.engine_core_sentinel = EngineCoreSentinel(
                     engine_index=self.engine_index,
                     fault_signal_q=self.fault_signal_q,
-                    cmd_q=self.cmd_q,
-                    busy_loop_active=self.busy_loop_active,
-                    engine_input_q=self.input_queue,
                     engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
-                    downstream_cmd_addr=worker_cmd_addr,
                     sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     vllm_config=vllm_config,
                 )
-                vllm_config.fault_tolerance_config.worker_cmd_addr = worker_cmd_addr
                 # Do not shut down the engine immediately upon failure.
                 executor_fail_callback = lambda: self.fault_signal_q.put(
                     RuntimeError(f"Executor on EngineCore {self.engine_index} failed.")
@@ -1165,15 +1148,9 @@ class EngineCoreProc(EngineCore):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
-            self._check_busy_loop_active()
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
-            self._check_busy_loop_active()
             self._process_engine_step()
-
-    def _check_busy_loop_active(self):
-        if self.enable_fault_tolerance and not self.busy_loop_active.is_set():
-            raise EngineLoopPausedError("Engine busy loop is paused.")
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -1241,8 +1218,6 @@ class EngineCoreProc(EngineCore):
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
-        elif request_type == EngineCoreRequestType.PAUSE:
-            self._check_busy_loop_active()
         elif request_type == EngineCoreRequestType.UTILITY:
             client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)
@@ -1384,12 +1359,6 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
-                    elif request_type == EngineCoreRequestType.UTILITY:
-                        request = generic_decoder.decode(data_frames)
-                        client_index, call_id, method, args = request
-                        if method == "handle_fault":
-                            self.handle_fault(call_id, client_index, args[0])
-                            continue
                     else:
                         request = generic_decoder.decode(data_frames)
 
@@ -1472,20 +1441,6 @@ class EngineCoreProc(EngineCore):
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
-
-    def handle_fault(self, call_id: int, client_index: int, args: dict):
-        """Call engine_core_sentinel to perform fault tolerance."""
-        uo = UtilityOutput(call_id=call_id)
-        try:
-            ft_result = self.engine_core_sentinel.handle_fault(
-                FaultToleranceRequest(**args)
-            )
-            uo.result = UtilityResult(ft_result)
-        except Exception as e:
-            logger.exception("Call to handle_fault method failed")
-            uo.failure_message = f"Call to handle_fault method failed: {e}"
-        outputs = EngineCoreOutputs(utility_output=uo)
-        self.output_queue.put_nowait((client_index, outputs))
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised
@@ -1624,9 +1579,7 @@ class DPEngineCoreProc(EngineCoreProc):
         assert 0 <= local_dp_rank <= dp_rank < dp_size
 
         self.dp_rank = dp_rank
-        dp_group, dp_store = parallel_config.stateless_init_dp_group(
-            return_store=True, fault_tolerance_config=vllm_config.fault_tolerance_config
-        )
+        dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
 
     def shutdown(self):
@@ -1693,10 +1646,8 @@ class DPEngineCoreProc(EngineCoreProc):
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
-            self._check_busy_loop_active()
             self._process_input_queue()
 
-            self._check_busy_loop_active()
             if self.eep_scaling_state is not None:
                 _ = self.eep_scaling_state.progress()
                 if self.eep_scaling_state.is_complete():
@@ -1714,11 +1665,9 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                self._check_busy_loop_active()
                 self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            self._check_busy_loop_active()
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )
@@ -1750,14 +1699,6 @@ class DPEngineCoreProc(EngineCoreProc):
             return True
 
         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
-
-    def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port: int):
-        stateless_destroy_torch_distributed_process_group(self.dp_group)
-        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group(
-            fault_tolerance_config=self.vllm_config.fault_tolerance_config,
-            dp_init_port=new_stateless_dp_group_port,
-        )
-        self.step_counter = 0
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
