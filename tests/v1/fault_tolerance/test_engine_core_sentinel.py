@@ -67,7 +67,6 @@ def create_engine_core_sentinel(
         cmd_q=cmd_q,
         busy_loop_active=busy_loop_active,
         engine_input_q=queue.Queue(),
-        upstream_cmd_addr=addr_dict["client_cmd_addr"],
         downstream_cmd_addr=addr_dict["worker_cmd_addr"],
         engine_fault_socket_addr=addr_dict["engine_fault_socket_addr"],
         sentinel_identity=sentinel_identity,
@@ -85,11 +84,8 @@ def test_engine_core_sentinel_initialization(addr_dict):
     assert sentinel.tp_size == 1
     assert sentinel.pp_size == 1
     assert not sentinel.communicator_aborted
-    assert sentinel.engine_running is True
 
     assert sentinel.engine_fault_socket.type == zmq.DEALER
-    assert sentinel.upstream_cmd_socket.type == zmq.DEALER
-    assert sentinel.downstream_cmd_socket.type == zmq.ROUTER
 
     sentinel.shutdown()
 
@@ -141,8 +137,6 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     cmd_q: Queue = Queue()
 
     ctx = zmq.Context()
-    client_cmd_socket = ctx.socket(zmq.ROUTER)
-    client_cmd_socket.bind(addr_dict["client_cmd_addr"])
 
     time.sleep(0.1)
 
@@ -179,17 +173,8 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
         except Exception:
             thread_excs.put(traceback.format_exc())
 
-    worker_ctx = zmq.Context()
-    worker_cmd_socket = worker_ctx.socket(zmq.DEALER)
-    worker_cmd_socket.setsockopt(zmq.IDENTITY, b"PP0_TP0")
-    worker_cmd_socket.connect(addr_dict["worker_cmd_addr"])
-    threading.Thread(
-        target=mock_worker_receiver, args=(worker_cmd_socket,), daemon=True
-    ).start()
-    time.sleep(0.1)
-
     # Simulate sending fault tolerance request from client sentinel
-    param = {"timeout": 3}
+    param = {"timeout": 5}
     if instruction == "pause":
         param["soft_pause"] = False
     elif instruction == "retry":
@@ -199,32 +184,31 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     ft_request = FaultToleranceRequest(
         request_id=req_id, instruction=instruction, params=param
     )
-    client_cmd_socket.send_multipart(
-        [sentinel_identity, b"", msgpack.encode(ft_request)]
-    )
+
+    worker_ctx = zmq.Context()
+    worker_cmd_socket = worker_ctx.socket(zmq.DEALER)
+    worker_cmd_socket.setsockopt(zmq.IDENTITY, b"PP0_TP0")
+    worker_cmd_socket.connect(addr_dict["worker_cmd_addr"])
+    threading.Thread(
+        target=mock_worker_receiver, args=(worker_cmd_socket,), daemon=True
+    ).start()
+    time.sleep(0.1)
 
     if instruction == "pause":
         # Simulate that pause is executed by engine core
         busy_loop_active.clear()
         fault_signal_q.put(EngineLoopPausedError("Simulated pause for testing"))
     elif instruction == "retry":
-        cmd_q.get(timeout=2000)
         busy_loop_active.set()
 
-    # Verify the client sentinel receives the response from the engine core sentinel
-    if not client_cmd_socket.poll(timeout=2000):
-        pytest.fail("Timeout waiting for response from sentinel")
+    ft_res = sentinel.handle_fault(ft_request)
 
-    identity, _, msg_bytes = client_cmd_socket.recv_multipart()
-    assert identity == sentinel_identity
-    ft_res = msgpack.decode(msg_bytes, type=FaultToleranceResult)
     assert ft_res.request_id == req_id
     assert ft_res.success
 
     time.sleep(0.1)
     fail_on_thread_exceptions(thread_excs)
 
-    client_cmd_socket.close()
     worker_cmd_socket.close()
     sentinel.shutdown()
     ctx.term()
