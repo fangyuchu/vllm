@@ -7,7 +7,6 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import timedelta
-from functools import partial
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -316,26 +315,8 @@ class Worker(WorkerBase):
             report_usage_stats(self.vllm_config)
 
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-            with set_current_vllm_config(self.vllm_config):
-                init_distributed_env_callback = partial(
-                    init_worker_distributed_environment,
-                    self.vllm_config,
-                    self.rank,
-                    self.distributed_init_method,
-                    self.local_rank,
-                )
-
-            def clear_input_batch_callback():
-                input_batch = self.model_runner.input_batch
-                cached_req_ids = input_batch.req_id_to_index.keys()
-                for req_id in list(cached_req_ids):
-                    input_batch.remove_request(req_id)
-
             self.worker_sentinel = WorkerSentinel(
                 self.vllm_config,
-                self.model_runner.pause_event,
-                init_distributed_env_callback,
-                clear_input_batch_callback,
                 self.device,
             )
 
@@ -1074,7 +1055,6 @@ def init_worker_distributed_environment(
         local_rank,
         backend,
         timeout,
-        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
 
     ensure_model_parallel_initialized(
@@ -1082,7 +1062,6 @@ def init_worker_distributed_environment(
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
-        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
 
     # Init ec connector here before KV caches init

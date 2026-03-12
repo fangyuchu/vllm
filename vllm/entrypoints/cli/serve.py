@@ -221,13 +221,11 @@ def run_headless(args: argparse.Namespace):
         log_stats=not engine_args.disable_log_stats,
     )
 
+    def callback(*_, **__):
+        engine_manager.shutdown_monitor = True
+
     try:
-        if vllm_config.fault_tolerance_config.enable_fault_tolerance:
-            engine_manager.monitor_engine_liveness(
-                engine_down_callback=engine_manager.notify_engine_down
-            )
-        else:
-            engine_manager.join_first()
+        engine_manager.monitor_engine_liveness(callback)
     finally:
         logger.info("Shutting down.")
         engine_manager.close()
