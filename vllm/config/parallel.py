@@ -11,7 +11,6 @@ from torch.distributed import ProcessGroup, ReduceOp, Store
 from typing_extensions import Self
 
 import vllm.envs as envs
-from vllm.config import FaultToleranceConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
@@ -521,23 +520,14 @@ class ParallelConfig:
 
     @overload
     def stateless_init_dp_group(
-        self,
-        return_store: Literal[False] = ...,
-        dp_init_port: int | None = ...,
-        fault_tolerance_config: FaultToleranceConfig | None = ...,
+        self, return_store: Literal[False] = ...
     ) -> ProcessGroup: ...
     @overload
     def stateless_init_dp_group(
-        self,
-        return_store: Literal[True] = ...,
-        dp_init_port: int | None = ...,
-        fault_tolerance_config: FaultToleranceConfig | None = ...,
+        self, return_store: Literal[True] = ...
     ) -> tuple[ProcessGroup, Store]: ...
     def stateless_init_dp_group(
-        self,
-        return_store: bool = False,
-        dp_init_port: int | None = None,
-        fault_tolerance_config: FaultToleranceConfig | None = None,
+        self, return_store: bool = False
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -554,26 +544,22 @@ class ParallelConfig:
 
         max_retries = 5
         last_exc: Exception | None = None
-        if dp_init_port is None:
-            dp_init_port = self.get_next_dp_init_port()
         for _ in range(max_retries):
             try:
                 # use gloo since the engine process might not have cuda device
                 return stateless_init_torch_distributed_process_group(
                     self.data_parallel_master_ip,
-                    dp_init_port,
+                    self.get_next_dp_init_port(),
                     self.data_parallel_rank,
                     self.data_parallel_size,
                     backend="gloo",
                     return_store=return_store,
-                    fault_tolerance_config=fault_tolerance_config,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.
                 if "EADDRINUSE" in str(e):
                     logger.warning("Address already in use. Retrying with a new port.")
                     last_exc = e
-                    dp_init_port = self.get_next_dp_init_port()
                     continue  # try again with a new port
                 raise e
 
