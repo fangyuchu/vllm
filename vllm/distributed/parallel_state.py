@@ -1755,6 +1755,7 @@ def initialize_model_parallel(
                     eplb_ports,
                     parallel_config.data_parallel_master_ip,
                     backend,
+                    fault_tolerance_config=fault_tolerance_config,
                 )
             else:
                 _EPLB = init_model_parallel_group(
@@ -1762,6 +1763,7 @@ def initialize_model_parallel(
                     get_world_group().local_rank,
                     backend,
                     group_name="eplb",
+                    fault_tolerance_config=fault_tolerance_config,
                 )
     # If no EP group needed, _EP remains None
     # If no EPLB group needed, _EPLB remains None
