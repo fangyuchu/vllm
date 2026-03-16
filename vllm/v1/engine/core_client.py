@@ -932,7 +932,6 @@ class AsyncMPClient(MPClient):
 
         if vllm_config.fault_tolerance_config.enable_fault_tolerance:
             assert client_addresses is not None
-            self.is_faulted = threading.Event()
             ft_addr = FaultToleranceZmqAddresses.from_str(
                 client_addresses["fault_tolerance_addresses"]
             )
@@ -1199,14 +1198,6 @@ class AsyncMPClient(MPClient):
                 with self.engine_status_lock:
                     self.engine_status_dict.clear()
                     self.engine_status_dict.update(status_dict)
-                healthy = all(
-                    v["status"] == EngineStatusType.HEALTHY
-                    for v in status_dict.values()
-                )
-                if healthy:
-                    self.is_faulted.clear()
-                else:
-                    self.is_faulted.set()
             except zmq.ZMQError:
                 break
 

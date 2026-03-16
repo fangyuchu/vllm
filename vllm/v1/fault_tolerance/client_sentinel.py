@@ -58,7 +58,6 @@ class ClientSentinel(BaseSentinel):
         asyncio.create_task(self.run())
 
     async def _pub_engine_status(self):
-        # No lock needed since we're single-threaded in asyncio
         engine_status = self.engine_status_dict.copy()
         topic = self.ft_config.fault_state_pub_topic.encode()
         await self.fault_state_pub_socket.send_multipart(
@@ -66,12 +65,10 @@ class ClientSentinel(BaseSentinel):
         )
 
     async def run(self):
-        """Receive fault info from engine and pause engines if happened."""
+        """Receive fault info from engine."""
         try:
             while not self.sentinel_dead:
-                _, _, message = await self.fault_receiver_socket.recv_multipart(
-                    copy=False
-                )  # type: ignore
+                _, _, message = await self.fault_receiver_socket.recv_multipart()
                 fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
                 if fault_info.type == "EngineLoopPausedError":
                     engine_status = EngineStatusType.PAUSED

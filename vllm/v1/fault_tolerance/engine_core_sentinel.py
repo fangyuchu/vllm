@@ -38,7 +38,7 @@ class EngineCoreSentinel(BaseSentinel):
 
         self.fault_signal_q = fault_signal_q
 
-        # Client <-> EngineCoreSentinel sockets
+        # ClientSentinel <-> EngineCoreSentinel sockets
         self.engine_fault_socket = make_zmq_socket(
             self.ctx,
             engine_fault_socket_addr,

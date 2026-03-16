@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import contextlib
 import os
 import uuid
@@ -125,6 +126,8 @@ class CoreEngineProcManager:
                 bind=False,
                 identity=str(uuid.uuid4()).encode("utf8"),
             )
+            self.start_dp_rank = vllm_config.parallel_config.data_parallel_index
+
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
 
@@ -189,7 +192,7 @@ class CoreEngineProcManager:
         fault_info = FaultInfo(
             type="EngineDeadError",
             message=f"Engine core proc {dead_proc.name} died unexpectedly.",
-            engine_id=str(engine_rank),
+            engine_id=str(engine_rank + self.start_dp_rank),
             additional_info=None,
         )
 
@@ -361,6 +364,7 @@ class CoreEngineActorManager:
                 bind=False,
                 identity=str(uuid.uuid4()).encode("utf8"),
             )
+            self.start_dp_rank = vllm_config.parallel_config.data_parallel_index
 
         if ray.is_initialized():
             logger.info("Ray is already initialized. Skipping Ray initialization.")
@@ -864,7 +868,7 @@ class CoreEngineActorManager:
         fault_info = FaultInfo(
             type="EngineDeadError",
             message="Engine_actor died unexpectedly.",
-            engine_id=str(engine_rank),
+            engine_id=str(engine_rank + self.start_dp_rank),
             additional_info=None,
         )
 
@@ -894,7 +898,7 @@ class CoreEngineActorManager:
                 logger.error("Engine core actor died: %s", actor_ref)
                 if engine_down_callback is not None:
                     engine_down_callback(
-                        dead_proc=actor_ref, all_processes=list(actor_run_refs)
+                        dead_proc=actor_ref, all_processes=self.get_run_refs()
                     )
 
                 processed_done_refs.add(actor_ref)
