@@ -61,6 +61,11 @@ from vllm.v1.engine import (
     UtilityResult,
 )
 from vllm.v1.engine.base_sentinel import BaseSentinel
+from vllm.v1.engine.engine_scaling import (
+_build_vllm_config_update_dict,
+_calculate_exclude_ep_ranks,
+parse_exclude_ep_ranks,
+)
 from vllm.v1.engine.exceptions import EngineLoopPausedError, FaultInfo
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -247,89 +252,72 @@ class EngineCoreSentinel(BaseSentinel):
         return success
 
     def descale(self, timeout: int = 60, **kwargs) -> bool:
-        original_to_new = kwargs["original_to_new"]
+        """Scale down the engine cluster by removing specified DP ranks.
+
+        This method adjusts parallel configuration parameters, broadcasts the descale
+        command to downstream workers, and reinitializes the DP group for fault tolerance.
+
+        Args:
+            timeout: Total timeout (in seconds) for the entire descale operation
+            kwargs: Required keyword arguments:
+                - original_to_new: Mapping from old engine indices to new indices (Dict[str, int])
+                - exclude_dp_ranks: List of DP ranks to exclude/remove (List[int])
+                - new_stateless_dp_group_port: Port for new stateless DP group (int)
+
+        Returns:
+            bool: True if descale operation succeeded, False otherwise
+
+        Raises:
+            KeyError: If required kwargs are missing
+            AssertionError: If dp_size is not greater than 1
+            Exception: For any unexpected errors during execution
+        """
+        # Validate required keyword arguments
+        required_kwargs = [
+            "original_to_new",
+            "exclude_dp_ranks",
+            "new_stateless_dp_group_port",
+        ]
+        for key in required_kwargs:
+            if key not in kwargs:
+                self.logger.error(f"Missing required parameter: {key}")
+                return False
+
+        # Extract and type-cast parameters from kwargs
+        original_to_new: dict[str, int] = kwargs["original_to_new"]
         exclude_dp_ranks: list[int] = kwargs["exclude_dp_ranks"]
-        new_stateless_dp_group_port = kwargs["new_stateless_dp_group_port"]
+        new_stateless_dp_group_port: int = kwargs["new_stateless_dp_group_port"]
+
         start_time = time.monotonic()
+
         self.engine_index = original_to_new[str(self.engine_index)]
-        self.logger = self._make_logger()
-        tensor_model_parallel_size = (
-            self.engine_core.vllm_config.parallel_config.tensor_parallel_size
+        exclude_ep_ranks = _calculate_exclude_ep_ranks(
+            exclude_dp_ranks, self.engine_core.vllm_config
         )
 
-        dp_start_rank = (
-            self.engine_core.vllm_config.parallel_config.data_parallel_start_rank
-        )
-        dp_end_rank = (
-            self.engine_core.vllm_config.parallel_config.data_parallel_start_rank
-            + self.engine_core.vllm_config.parallel_config.data_parallel_size_local
-            - 1
-        )
-        local_exclude_dp_rank = 0
-        for exclude_dp_rank in exclude_dp_ranks:
-            if 0 <= exclude_dp_rank < dp_start_rank:
-                dp_start_rank -= 1
-            elif dp_start_rank <= exclude_dp_rank <= dp_end_rank:
-                local_exclude_dp_rank += 1
-
-        self.engine_core.vllm_config.parallel_config.data_parallel_size_local -= (
-            local_exclude_dp_rank
-        )
-        self.engine_core.vllm_config.parallel_config.data_parallel_start_rank = (
-            dp_start_rank
-        )
-
-        exclude_ep_ranks: list[int] = []
-        for dp_rank in exclude_dp_ranks:
-            start = dp_rank * tensor_model_parallel_size
-            end = (dp_rank + 1) * tensor_model_parallel_size
-            exclude_ep_ranks.extend(range(start, end))
-
-        exclude_ep_ranks = sorted(list(set(exclude_ep_ranks)))
-        new_ep_size, data_parallel_size, rank_mapping = (
-            self.engine_core.parse_exclude_dp_ranks(exclude_dp_ranks)
+        new_ep_size, data_parallel_size, rank_mapping = parse_exclude_ep_ranks(
+            self.engine_core.vllm_config, exclude_ep_ranks
         )
 
         with set_current_vllm_config(self.engine_core.vllm_config):
-            self.engine_core.update_parallel_config(data_parallel_size, rank_mapping)
             parallel_config = self.engine_core.vllm_config.parallel_config
-            vllm_config_update_dict = {
-                "ep_world_size": new_ep_size,
-                "rank_mapping": rank_mapping,
-                "data_parallel_size": data_parallel_size,
-                "data_parallel_rank": parallel_config.data_parallel_rank,
-                "data_parallel_size_local": parallel_config.data_parallel_size_local,
-                "expert_parallel_size": data_parallel_size
-                * parallel_config.pipeline_parallel_size
-                * parallel_config.tensor_parallel_size,
-                "data_parallel_master_port": parallel_config.data_parallel_master_port,
-            }
-            success = self._broadcast_command_to_downstream(
-                "descale",
+            success = self._broadcast_descale_command(
                 timeout=timeout,
-                target_downstream_sentinels=self._get_target_worker_identity(),
                 exclude_ep_ranks=exclude_ep_ranks,
-                vllm_config_update_dict=vllm_config_update_dict,
+                new_ep_size=new_ep_size,
+                data_parallel_size=data_parallel_size,
+                rank_mapping=rank_mapping,
+                parallel_config=parallel_config,
             )
 
             if not success:
                 return success
-
-            assert self.dp_size > 1, "dp_size should be greater than 1 currently"
-            self.engine_core.engine_index = self.engine_index
-
-            command = "reinit_dp_group_on_fault_tolerance"
-            self.cmd_q.put(
-                serialize_method_call(
-                    command,
-                    new_stateless_dp_group_port=new_stateless_dp_group_port,
-                )
-            )
+            # todo use _init_data_parallel instead of reinit_dp_group_on_fault_tolerance?
+            self._send_reinit_dp_group_command(new_stateless_dp_group_port)
 
             elapsed = time.monotonic() - start_time
             remaining_timeout = max(0, timeout - elapsed)
             success = self.busy_loop_active.wait(timeout=remaining_timeout)
-            elapsed = time.monotonic() - start_time
 
             self.engine_running = success
             logger.info(
@@ -393,6 +381,63 @@ class EngineCoreSentinel(BaseSentinel):
             self.engine_fault_socket.close()
         super().shutdown()
 
+    def _send_reinit_dp_group_command(self, new_stateless_dp_group_port: int):
+        """Send command to reinitialize DP group for fault tolerance.
+
+        Args:
+            new_port: Port number for the new stateless DP group
+        """
+        assert self.dp_size > 1, "dp_size should be greater than 1 currently"
+
+        command = "reinit_dp_group_on_fault_tolerance"
+        self.cmd_q.put(
+            serialize_method_call(
+                command,
+                new_stateless_dp_group_port=new_stateless_dp_group_port,
+            )
+        )
+
+    def _broadcast_descale_command(
+        self,
+        timeout: int,
+        exclude_ep_ranks: list[int],
+        new_ep_size: int,
+        data_parallel_size: int,
+        rank_mapping: Any,
+        parallel_config: Any,
+    ) -> bool:
+        """Broadcast descale command to downstream worker sentinels.
+
+        Updates parallel configuration and sends descale command to all target workers.
+
+        Args:
+            timeout: Timeout for broadcast operation
+            exclude_ep_ranks: List of EP ranks to exclude
+            new_ep_size: New expert parallelism size
+            data_parallel_size: New data parallelism size
+            rank_mapping: New rank mapping after exclusion
+            parallel_config: Current parallel configuration object
+
+        Returns:
+            bool: True if broadcast succeeded, False otherwise
+        """
+        with set_current_vllm_config(self.engine_core.vllm_config):
+            self.engine_core.update_parallel_config(data_parallel_size, rank_mapping)
+            logger.info(f'self.vllm_config.parallel_config.data_parallel_rank is {self.engine_core.vllm_config.parallel_config.data_parallel_rank}'
+                        f'rank mapping is {rank_mapping}')
+            # Build config update dictionary for downstream workers
+            vllm_config_update_dict = _build_vllm_config_update_dict(
+                parallel_config, new_ep_size, data_parallel_size, rank_mapping
+            )
+
+            # Broadcast command to downstream workers
+            return self._broadcast_command_to_downstream(
+                "descale",
+                timeout=timeout,
+                target_downstream_sentinels=self._get_target_worker_identity(),
+                exclude_ep_ranks=exclude_ep_ranks,
+                vllm_config_update_dict=vllm_config_update_dict,
+            )
 
 def busy_loop_wrapper(busy_loop_func):
     """
@@ -1450,7 +1495,7 @@ class EngineCoreProc(EngineCore):
             self._check_busy_loop_active()
             self._process_engine_step()
 
-    def parse_exclude_dp_ranks(self, exclude_dp_ranks_list: list[int]):
+    def parse_exclude_ep_ranks(self, exclude_dp_ranks_list: list[int]):
         if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallel is not supported for scaling down."
@@ -1483,6 +1528,7 @@ class EngineCoreProc(EngineCore):
         self.vllm_config.parallel_config.expert_parallel_size = (
             data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
         )
+        # todo: Change the method of updating master_port.
         self.vllm_config.parallel_config.data_parallel_master_port += 1000
 
     def _check_busy_loop_active(self):

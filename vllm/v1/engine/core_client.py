@@ -56,6 +56,7 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
     serialize_method_call,
 )
+from vllm.v1.engine.client_scaling import get_mapping
 from vllm.v1.executor import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -566,60 +567,47 @@ class ClientSentinel(BaseSentinel):
         )
         return success
 
-    @staticmethod
-    def get_mapping(original_list, to_remove) -> tuple[dict, list]:
-        remaining = [num for num in original_list if num not in to_remove]
-        original_to_new_dp_rank = {
-            original_num: new_index for new_index, original_num in enumerate(remaining)
-        }
-        new_list = list(original_to_new_dp_rank.values())
+    def terminate_scaledown_cores(self, exclude_dp_ranks, original_to_new) -> None:
 
-        return original_to_new_dp_rank, new_list
-
-    def shutdown_engine_core(self, exclude_dp_ranks, original_to_new) -> None:
-        logger.info(
-            "original_to_new: %s exclude_dp_ranks: %s",
-            original_to_new,
-            exclude_dp_ranks,
-        )
         dead_engine_identities = [
             self.engine_registry[dead_engine] for dead_engine in exclude_dp_ranks
         ]
-        temp_kwargs = {"exclude_dp_ranks": exclude_dp_ranks}
 
         broadcast_instruction(
             self.downstream_cmd_socket,
             dead_engine_identities,
             "shutdown_engine_core",
             method_uuid=None,
-            **temp_kwargs,
+            exclude_dp_ranks=exclude_dp_ranks,
         )
+
+    def update_config(self, exclude_dp_ranks, original_to_new):
+
         for engine_index in exclude_dp_ranks:
             self.engine_status_dict.pop(engine_index)
             self.engine_registry.pop(engine_index)
-            key_to_del = [
-                identity
-                for identity, engine_id in self.engine_identity_to_index.items()
-                if engine_id == engine_index
-            ]
-            for key in key_to_del:
-                del self.engine_identity_to_index[key]
 
-        for old_engine_index in original_to_new:
-            old_engine_index_int = int(old_engine_index)
-            engine_status = self.engine_status_dict[old_engine_index_int]
-            del self.engine_status_dict[old_engine_index_int]
-            self.engine_status_dict[original_to_new[old_engine_index]] = engine_status
+        exclude_set = set(exclude_dp_ranks)
+        self.engine_identity_to_index = {
+            identity: idx
+            for identity, idx in self.engine_identity_to_index.items()
+            if idx not in exclude_set
+        }
 
-            engine_identity = self.engine_registry[old_engine_index_int]
+        original_to_new_int = {int(old): new for old, new in original_to_new.items()}
+        for old_idx, new_idx in original_to_new_int.items():
+            # Migrate engine status
+            if old_idx in self.engine_status_dict:
+                self.engine_status_dict[new_idx] = self.engine_status_dict.pop(old_idx)
 
-            self.engine_registry[original_to_new[old_engine_index]] = engine_identity
+            # Migrate engine registry
+            if old_idx in self.engine_registry:
+                self.engine_registry[new_idx] = self.engine_registry.pop(old_idx)
 
-            for identity, engine_index in self.engine_identity_to_index.items():
-                if engine_index == old_engine_index_int:
-                    self.engine_identity_to_index[identity] = original_to_new[
-                        old_engine_index
-                    ]
+            # Update the mapping from engine identifier to index
+            for identity, idx in self.engine_identity_to_index.items():
+                if idx == old_idx:
+                    self.engine_identity_to_index[identity] = new_idx
 
         self.descaled_core_engine_dicts = {
             engine_identity: original_to_new[engine_index]
@@ -628,12 +616,14 @@ class ClientSentinel(BaseSentinel):
             )
             if engine_index in original_to_new
         }
+
         self.core_engines = [
             engine_identity
             for engine_identity in self.core_engines
             if engine_identity in self.descaled_core_engine_dicts
         ]
-        _, self.engine_ranks_managed = self.get_mapping(
+
+        _, self.engine_ranks_managed = get_mapping(
             self.engine_ranks_managed, exclude_dp_ranks
         )
         scale_down_marker = msgspec.msgpack.encode(
@@ -645,27 +635,31 @@ class ClientSentinel(BaseSentinel):
             dp_rank = self.core_client.vllm_config.parallel_config.data_parallel_rank
             local_rank = dead_engine - dp_rank
             if hasattr(self.core_client, "lb_engines") and local_rank in range(
-                len(self.core_client.lb_engines)
+                    len(self.core_client.lb_engines)
             ):
                 del self.core_client.lb_engines[local_rank]
 
     def descale(self, timeout: int = 60, **kwargs) -> bool:
         exclude_dp_ranks = kwargs["exclude_dp_ranks"]
-        healthy_ranks_old = []
+
         for faulty_rank in exclude_dp_ranks:
             if self.engine_status_dict[faulty_rank] != "Dead":
                 self.engine_status_dict[faulty_rank] = "Dead"
-        for engine_id, _ in self.engine_status_dict.items():
-            healthy_ranks_old.append(engine_id)
 
-        original_to_new, _ = self.get_mapping(healthy_ranks_old, exclude_dp_ranks)
+        healthy_ranks_old = [engine_id for engine_id, status in self.engine_status_dict.items()]
+
+        original_to_new, _ = get_mapping(healthy_ranks_old, exclude_dp_ranks)
 
         target_engines = {
             identity
             for identity, index in self.engine_identity_to_index.items()
             if index not in exclude_dp_ranks
         }
+
         new_stateless_dp_group_port = get_open_port()
+        new_stateless_dp_cpu_group_port = get_open_port()
+        data_parallel_master_port = get_open_port()
+
         success, _ = self._broadcast_command_to_downstream(
             "descale",
             target_engines,
@@ -673,9 +667,12 @@ class ClientSentinel(BaseSentinel):
             exclude_dp_ranks=exclude_dp_ranks,
             original_to_new=original_to_new,
             new_stateless_dp_group_port=new_stateless_dp_group_port,
+            new_stateless_dp_cpu_group_port=new_stateless_dp_cpu_group_port,
+            data_parallel_master_port=data_parallel_master_port,
         )
         if success:
-            self.shutdown_engine_core(exclude_dp_ranks, original_to_new)
+            self.terminate_scaledown_cores(exclude_dp_ranks, original_to_new)
+            self.update_config(exclude_dp_ranks, original_to_new)
             self.engine_running.set()
             self.is_faulted.clear()
 
