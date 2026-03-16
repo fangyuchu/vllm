@@ -266,6 +266,9 @@ def wait_for_completion_or_failure(
         if engine_manager:
             engine_dead_event = threading.Event()
             dead_msg: str | None = None
+            enable_ft = (
+                engine_manager.vllm_config.fault_tolerance_config.enable_fault_tolerance
+            )
 
             def engine_down_callback(dead_proc, all_processes: list):
                 nonlocal dead_msg
@@ -277,7 +280,11 @@ def wait_for_completion_or_failure(
 
             monitor_thread = threading.Thread(
                 target=engine_manager.monitor_engine_liveness,
-                args=(engine_down_callback,),
+                args=(
+                    engine_manager.notify_engine_down
+                    if enable_ft
+                    else engine_down_callback,
+                ),
                 daemon=True,
             )
             monitor_thread.start()

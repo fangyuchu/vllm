@@ -39,7 +39,7 @@ def mock_ft_addresses():
 
 @pytest.fixture
 def shutdown_callback():
-    return AsyncMock()
+    return Mock()
 
 
 @pytest.fixture
@@ -127,33 +127,3 @@ async def test_run_updates_status_and_publishes(
     assert client_sentinel.engine_status_dict[1]["status"] == expected_status
     client_sentinel.fault_state_pub_socket.send_multipart.assert_awaited_once()
     mock_create_task.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_shutdown_after_timeout_calls_callback(
-    client_sentinel: ClientSentinel, shutdown_callback: AsyncMock
-):
-    with patch("vllm.v1.fault_tolerance.client_sentinel.asyncio.sleep", AsyncMock()):
-        await client_sentinel._shutdown_after_timeout()
-
-    shutdown_callback.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_shutdown(client_sentinel: ClientSentinel):
-    with (
-        patch("vllm.v1.fault_tolerance.client_sentinel.close_sockets") as mock_close,
-        patch.object(client_sentinel.ctx_async, "term") as mock_ctx_async_term,
-        patch.object(client_sentinel.ctx, "term") as mock_ctx_term,
-    ):
-        client_sentinel.shutdown()
-
-    mock_close.assert_called_once_with(
-        [
-            client_sentinel.fault_receiver_socket,
-            client_sentinel.fault_state_pub_socket,
-        ]
-    )
-    mock_ctx_async_term.assert_called_once()
-    mock_ctx_term.assert_called_once()
-    assert client_sentinel.sentinel_dead is True

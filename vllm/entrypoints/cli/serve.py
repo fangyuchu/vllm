@@ -224,8 +224,11 @@ def run_headless(args: argparse.Namespace):
     def callback(*_, **__):
         engine_manager.shutdown_monitor = True
 
+    enable_ft = vllm_config.fault_tolerance_config.enable_fault_tolerance
     try:
-        engine_manager.monitor_engine_liveness(callback)
+        engine_manager.monitor_engine_liveness(
+            engine_manager.notify_engine_down if enable_ft else callback
+        )
     finally:
         logger.info("Shutting down.")
         engine_manager.close()

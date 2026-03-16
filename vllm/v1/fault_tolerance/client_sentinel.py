@@ -86,15 +86,18 @@ class ClientSentinel(BaseSentinel):
                 await self._pub_engine_status()
                 if self._shutdown_task is None:
                     self._shutdown_task = asyncio.create_task(
-                        self._shutdown_after_timeout()
+                        self._shutdown_after_timeout(
+                            self.ft_config.engine_recovery_timeout_sec
+                        )
                     )
 
         except zmq.ZMQError:
             self.logger("Fault receiver socket closed, stopping async monitor.")
 
-    async def _shutdown_after_timeout(self):
-        await asyncio.sleep(self.ft_config.engine_recovery_timeout_sec)
-        await self.instance_shutdown_callback()
+    async def _shutdown_after_timeout(self, timeout):
+        await asyncio.sleep(timeout)
+        self.logger("Shutdown vLLM after timeout of %d seconds.", timeout)
+        self.instance_shutdown_callback()
 
     def shutdown(self):
         close_sockets([self.fault_receiver_socket, self.fault_state_pub_socket])
