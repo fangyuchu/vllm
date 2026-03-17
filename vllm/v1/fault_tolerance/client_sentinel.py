@@ -73,9 +73,7 @@ class ClientSentinel(BaseSentinel):
                     copy=False
                 )  # type: ignore
                 fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
-                if fault_info.type == "EngineLoopPausedError":
-                    engine_status = EngineStatusType.PAUSED
-                elif fault_info.type == "EngineDeadError":
+                if fault_info.type == "EngineDeadError":
                     engine_status = EngineStatusType.DEAD
                 else:
                     engine_status = EngineStatusType.UNHEALTHY
