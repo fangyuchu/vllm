@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 
 import zmq
 
@@ -10,7 +10,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-class BaseSentinel:
+class BaseSentinel(ABC):
     """
     Core functionalities of the sentinel covered:
     - Fault listening
