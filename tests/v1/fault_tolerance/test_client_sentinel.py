@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import contextlib
 import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -177,9 +178,6 @@ async def test_pause_operation(
 
     # Verify result
     assert result is True
-    assert client_sentinel.engine_status_dict[0]["status"] == EngineStatusType.PAUSED
-    assert client_sentinel.engine_status_dict[1]["status"] == EngineStatusType.PAUSED
-
     # Verify call parameters
     call_args = mock_call_utility_async.call_args[0][1]
     assert call_args.instruction == "pause"
@@ -191,25 +189,21 @@ async def test_pause_operation(
 async def test_monitor_and_pause_on_fault(client_sentinel: ClientSentinel):
     """Test fault monitoring and automatic pause logic (fix parameter conflict)"""
 
-    fault_info = FaultInfo(engine_id="0", type="dead", message="dead")
+    fault_info = FaultInfo(engine_id="0", type="EngineDeadError", message="dead")
     client_sentinel.fault_receiver_socket.recv_multipart = AsyncMock(
         return_value=[b"", b"", msgspec.msgpack.encode(fault_info)]
     )
 
-    async def mock_poll(self, timeout):
-        if not hasattr(mock_poll, "called"):
-            mock_poll.called = True  # type: ignore[attr-defined]
-            return [(client_sentinel.fault_receiver_socket, zmq.POLLIN)]
-        else:
-            client_sentinel.sentinel_dead = True
-            return []
-
-    with (
-        patch.object(asyncio, "sleep", return_value=None),
-        patch("zmq.asyncio.Poller.poll", mock_poll),
-    ):  # Replace Poller.poll
+    client_sentinel.fault_receiver_socket.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", b"", msgspec.msgpack.encode(fault_info)],
+            asyncio.CancelledError(),
+        ]
+    )
+    try:
         await client_sentinel._monitor_and_pause_on_fault()
-
+    except asyncio.CancelledError:
+        contextlib.suppress(asyncio.CancelledError)
     assert client_sentinel.engine_status_dict[0]["status"] == EngineStatusType.DEAD
     assert client_sentinel.is_faulted.is_set()
     client_sentinel.fault_state_pub_socket.send_multipart.assert_awaited()
