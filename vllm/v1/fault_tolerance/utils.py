@@ -18,11 +18,6 @@ class FaultInfo(msgspec.Struct):
     timestamp: str | None = None
     additional_info: dict | None = None
 
-    def __post_init__(self):
-        local_time = time.localtime(time.time())
-        if self.timestamp is None:
-            self.timestamp = time.strftime("%H:%M:%S", local_time)
-
     @classmethod
     def from_exception(
         cls,
@@ -31,10 +26,12 @@ class FaultInfo(msgspec.Struct):
         additional_info: dict | None = None,
     ) -> "FaultInfo":
         """Create FaultInfo from an exception."""
+        local_time = time.localtime(time.time())
         return cls(
             type=type(exception).__name__,
             message=str(exception),
             engine_id=str(engine_id),
+            timestamp=time.strftime("%H:%M:%S", local_time),
             additional_info=additional_info or {},
         )
 
@@ -51,7 +48,7 @@ class FaultToleranceZmqAddresses:
     engine_core_sentinel_identities: dict[int, bytes]
 
     @classmethod
-    def build(cls, host, dp_size, ft_config: FaultToleranceConfig):
+    def build(cls, host: str, dp_size: int, ft_config: FaultToleranceConfig):
         engine_fault_socket_addr = get_engine_client_zmq_addr(
             local_only=False,
             host=host,
