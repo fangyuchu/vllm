@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from argparse import Namespace
-
 from fastapi import FastAPI
 
 import vllm.envs as envs
@@ -11,7 +9,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def register_vllm_serve_api_routers(app: FastAPI, args: Namespace | None = None):
+def register_vllm_serve_api_routers(app: FastAPI):
     if envs.VLLM_SERVER_DEV_MODE:
         logger.warning(
             "SECURITY WARNING: Development endpoints are enabled! "
@@ -57,15 +55,3 @@ def register_vllm_serve_api_routers(app: FastAPI, args: Namespace | None = None)
     from .instrumentator import register_instrumentator_api_routers
 
     register_instrumentator_api_routers(app)
-
-    # Attach fault tolerance routes only if enabled by the server args.
-    enable_ft = False
-    if args is not None:
-        enable_ft = bool(getattr(args, "enable_fault_tolerance", False))
-
-    if enable_ft:
-        from vllm.entrypoints.serve.fault_tolerance.api_router import (
-            attach_router as attach_fault_tolerance_router,
-        )
-
-        attach_fault_tolerance_router(app)

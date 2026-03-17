@@ -185,7 +185,7 @@ def build_app(
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
-    register_vllm_serve_api_routers(app, args=args)
+    register_vllm_serve_api_routers(app)
 
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
@@ -249,6 +249,13 @@ def build_app(
         from vllm.entrypoints.pooling import register_pooling_api_routers
 
         register_pooling_api_routers(app, supported_tasks)
+
+    if args.enable_fault_tolerance:
+        from vllm.entrypoints.serve.fault_tolerance.api_router import (
+            register_fault_tolerance_api_router,
+        )
+
+        register_fault_tolerance_api_router(app)
 
     app.root_path = args.root_path
     app.add_middleware(

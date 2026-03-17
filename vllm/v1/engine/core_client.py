@@ -953,7 +953,7 @@ class AsyncMPClient(MPClient):
                 self.client_sentinel = ClientSentinel(
                     vllm_config=vllm_config,
                     fault_tolerance_addresses=ft_addr,
-                    shutdown_callback=self._finalizer,
+                    shutdown_callback=self.shutdown,
                 )
                 self.resources.client_sentinel = self.client_sentinel
             self.engine_status_dict: dict[int, dict[str, EngineStatusType]] = {

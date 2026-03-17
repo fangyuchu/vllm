@@ -24,5 +24,5 @@ async def get_fault_info(
     return JSONResponse(content=engine_status_dict)
 
 
-def attach_router(app: FastAPI):
+def register_fault_tolerance_api_router(app: FastAPI):
     app.include_router(router)
