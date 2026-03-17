@@ -152,6 +152,7 @@ class CoreEngineProcManager:
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.shutdown_monitor = False
         self.vllm_config = vllm_config
+        self.start_index = start_index
 
         try:
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
@@ -186,7 +187,7 @@ class CoreEngineProcManager:
         fault_info = FaultInfo(
             type="EngineDeadError",
             message=f"Engine core proc {dead_proc.name} died unexpectedly.",
-            engine_id=str(engine_rank),
+            engine_id=str(engine_rank + self.start_index),
             additional_info=None,
         )
 
@@ -385,7 +386,7 @@ class CoreEngineActorManager:
                 bind=False,
                 identity=str(uuid.uuid4()).encode("utf8"),
             )
-
+        self.start_rank = vllm_config.parallel_config.data_parallel_rank
         if ray.is_initialized():
             logger.info("Ray is already initialized. Skipping Ray initialization.")
         else:
@@ -888,7 +889,7 @@ class CoreEngineActorManager:
         fault_info = FaultInfo(
             type="EngineDeadError",
             message="Engine_actor died unexpectedly.",
-            engine_id=str(engine_rank),
+            engine_id=str(engine_rank + self.start_rank),
             additional_info=None,
         )
 
@@ -921,7 +922,7 @@ class CoreEngineActorManager:
                     logger.error("Engine core actor died: %s", actor_ref)
                 if engine_down_callback is not None:
                     engine_down_callback(
-                        dead_proc=actor_ref, all_processes=list(actor_run_refs)
+                        dead_proc=actor_ref, all_processes=self.get_run_refs()
                     )
 
                 processed_done_refs.add(actor_ref)

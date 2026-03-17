@@ -69,9 +69,7 @@ class ClientSentinel(BaseSentinel):
         """Receive fault info from engine and pause engines if happened."""
         try:
             while not self.sentinel_dead:
-                _, _, message = await self.fault_receiver_socket.recv_multipart(
-                    copy=False
-                )  # type: ignore
+                _, _, message = await self.fault_receiver_socket.recv_multipart()
                 fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
                 if fault_info.type == "EngineDeadError":
                     engine_status = EngineStatusType.DEAD
@@ -92,7 +90,7 @@ class ClientSentinel(BaseSentinel):
 
     async def _shutdown_after_timeout(self):
         await asyncio.sleep(self.ft_config.engine_recovery_timeout_sec)
-        await self.instance_shutdown_callback()
+        self.instance_shutdown_callback()
 
     def shutdown(self):
         close_sockets([self.fault_receiver_socket, self.fault_state_pub_socket])
