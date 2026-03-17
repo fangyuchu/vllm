@@ -695,30 +695,21 @@ class MPClient(EngineCoreClient):
         return self.engines_running
 
     def start_engine_core_monitor(self):
-        """Start a monitor thread for engine core processes or actors."""
+        """Start a monitor thread for engine core processes."""
         engine_manager = self.resources.engine_manager
         if engine_manager is None:
             return
+
         self_ref = weakref.ref(self)
 
-        def shutdown_callback(engine_rank, target):
+        def shutdown_callback(*_, **__):
             _self = self_ref()
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
-            target_desc = getattr(target, "name", target)
-            logger.error(
-                "Engine core %s died unexpectedly, shutting down client.",
-                target_desc,
-            )
-            engine_manager.shutdown_monitor = True
             _self.resources.engine_dead = True
+            engine_manager.shutdown_monitor = True
             _self.shutdown()
 
-        if isinstance(engine_manager, CoreEngineProcManager) and not getattr(
-            engine_manager, "processes", None
-        ):
-            # No engine processes to monitor
-            return
         engine_down_callback = (
             shutdown_callback
             if not self.vllm_config.fault_tolerance_config.enable_fault_tolerance
@@ -729,7 +720,7 @@ class MPClient(EngineCoreClient):
             target=engine_manager.monitor_engine_liveness,
             args=(engine_down_callback,),
             daemon=True,
-            name="ClientEngineMonitor",
+            name="MPClientEngineMonitor",
         ).start()
 
 
