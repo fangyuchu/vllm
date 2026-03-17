@@ -173,6 +173,7 @@ class CoreEngineProcManager:
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
+        self.shutdown_monitor = True
         if self._finalizer.detach() is not None:
             shutdown(self.processes, timeout=timeout)
 
@@ -193,10 +194,21 @@ class CoreEngineProcManager:
             [b"", msgspec.msgpack.encode(fault_info)]
         )
 
-    def monitor_engine_liveness(self, engine_down_callback):
+    def monitor_engine_liveness(
+        self,
+        engine_down_callback: Callable[..., None] | None = None,
+    ) -> None:
         """
         Monitor engine core process liveness.
+
+        Args:
+            engine_down_callback:
+                Optional callback invoked once for each detected dead process.
+                The callback is called with keyword arguments:
+                    dead_proc: The process that exited.
+                    all_processes: The full list of engine processes.
         """
+
         sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
         sentinels = set(sentinel_to_proc.keys())
 
@@ -219,10 +231,6 @@ class CoreEngineProcManager:
                     )
 
             sentinels -= set(died_sentinels)
-
-    def join_first(self):
-        """Wait for any process to exit."""
-        connection.wait(proc.sentinel for proc in self.processes)
 
     def sentinels(self) -> list:
         return [proc.sentinel for proc in self.processes]
@@ -361,6 +369,7 @@ class CoreEngineActorManager:
         self.log_stats = log_stats
         local_engine_count = vllm_config.parallel_config.data_parallel_size_local
         world_size = vllm_config.parallel_config.world_size
+        self.shutdown_monitor = False
 
         if vllm_config.fault_tolerance_config.enable_fault_tolerance:
             zmq_ctx = zmq.Context()
@@ -887,10 +896,12 @@ class CoreEngineActorManager:
             [b"", msgspec.msgpack.encode(fault_info)]
         )
 
-    def monitor_engine_liveness(self, engine_down_callback):
+    def monitor_engine_liveness(
+        self,
+        engine_down_callback: Callable[..., None] | None = None,
+    ) -> None:
         import ray
 
-        all_refs = self.get_run_refs()
         processed_done_refs: set[ray.ObjectRef] = set()
         while not self.shutdown_monitor:
             actor_run_refs = set(self.get_run_refs())
@@ -909,13 +920,16 @@ class CoreEngineActorManager:
                 except ray.exceptions.RayActorError:
                     logger.error("Engine core actor died: %s", actor_ref)
                 if engine_down_callback is not None:
-                    engine_down_callback(dead_proc=actor_ref, all_processes=all_refs)
+                    engine_down_callback(
+                        dead_proc=actor_ref, all_processes=list(actor_run_refs)
+                    )
 
                 processed_done_refs.add(actor_ref)
 
     def shutdown(self, timeout: float | None = None) -> None:
         import ray
 
+        self.shutdown_monitor = True
         for actor in self.local_engine_actors + self.remote_engine_actors:
             ray.kill(actor)
         for pg in self.created_placement_groups:

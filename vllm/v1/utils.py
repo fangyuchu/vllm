@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import multiprocessing
+import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
@@ -10,7 +11,6 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import connection
 from multiprocessing.process import BaseProcess
-from threading import Thread
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -253,8 +253,6 @@ def wait_for_completion_or_failure(
         coordinator: The coordinator for data parallel.
     """
 
-    from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
-
     try:
         logger.info("Waiting for API servers to complete ...")
         # Create a mapping of sentinels to their corresponding processes
@@ -266,26 +264,30 @@ def wait_for_completion_or_failure(
         if coordinator:
             sentinel_to_proc[coordinator.proc.sentinel] = coordinator.proc
 
-        actor_run_refs = []
-        assert engine_manager is not None
-        if engine_manager.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-            # Start a thread to monitor engine liveness.
-            # Do not exit when engine is down.
-            Thread(
+        # start monitor for engine liveness
+        if engine_manager:
+            engine_dead_event = threading.Event()
+
+            def shutdown_callback(*_, **__):
+                assert engine_manager is not None
+                engine_dead_event.set()
+                engine_manager.shutdown_monitor = True
+
+            if engine_manager.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+                callback = engine_manager.notify_engine_down
+            else:
+                callback = shutdown_callback
+            monitor_thread = threading.Thread(
                 target=engine_manager.monitor_engine_liveness,
-                args=(engine_manager.notify_engine_down,),
+                args=(callback,),
                 daemon=True,
-                name="ClientEngineMonitor",
-            ).start()
-        else:
-            if isinstance(engine_manager, CoreEngineProcManager):
-                for proc in engine_manager.processes:
-                    sentinel_to_proc[proc.sentinel] = proc
-            elif isinstance(engine_manager, CoreEngineActorManager):
-                actor_run_refs = engine_manager.get_run_refs()
+            )
+            monitor_thread.start()
 
         # Check if any process terminates
-        while sentinel_to_proc or actor_run_refs:
+        while sentinel_to_proc:
+            if engine_manager is not None and engine_dead_event.is_set():
+                raise RuntimeError("Engine core process is dead.")
             # Wait for any process to terminate
             ready_sentinels: list[Any] = connection.wait(sentinel_to_proc, timeout=5)
 
@@ -299,11 +301,6 @@ def wait_for_completion_or_failure(
                         f"Process {proc.name} (PID: {proc.pid}) "
                         f"died with exit code {proc.exitcode}"
                     )
-
-            if actor_run_refs:
-                import ray
-
-                _, actor_run_refs = ray.wait(actor_run_refs, timeout=5)
 
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down API servers...")
