@@ -46,6 +46,7 @@ from vllm.v1.engine import (
     UtilityOutput,
 )
 from vllm.v1.engine.base_sentinel import BaseSentinel
+from vllm.v1.engine.client_scaling import get_mapping
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError, FaultInfo
@@ -56,7 +57,6 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
     serialize_method_call,
 )
-from vllm.v1.engine.client_scaling import get_mapping
 from vllm.v1.executor import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -568,7 +568,6 @@ class ClientSentinel(BaseSentinel):
         return success
 
     def terminate_scaledown_cores(self, exclude_dp_ranks, original_to_new) -> None:
-
         dead_engine_identities = [
             self.engine_registry[dead_engine] for dead_engine in exclude_dp_ranks
         ]
@@ -582,7 +581,6 @@ class ClientSentinel(BaseSentinel):
         )
 
     def update_config(self, exclude_dp_ranks, original_to_new):
-
         for engine_index in exclude_dp_ranks:
             self.engine_status_dict.pop(engine_index)
             self.engine_registry.pop(engine_index)
@@ -598,7 +596,9 @@ class ClientSentinel(BaseSentinel):
         for old_idx, new_idx in original_to_new_int.items():
             # Migrate engine status
             if old_idx in self.engine_status_dict:
-                self.engine_status_dict[new_idx] = self.engine_status_dict.pop(old_idx)
+                status_value = self.engine_status_dict[old_idx]
+                del self.engine_status_dict[old_idx]
+                self.engine_status_dict[new_idx] = status_value
 
             # Migrate engine registry
             if old_idx in self.engine_registry:
@@ -635,7 +635,7 @@ class ClientSentinel(BaseSentinel):
             dp_rank = self.core_client.vllm_config.parallel_config.data_parallel_rank
             local_rank = dead_engine - dp_rank
             if hasattr(self.core_client, "lb_engines") and local_rank in range(
-                    len(self.core_client.lb_engines)
+                len(self.core_client.lb_engines)
             ):
                 del self.core_client.lb_engines[local_rank]
 
@@ -646,7 +646,9 @@ class ClientSentinel(BaseSentinel):
             if self.engine_status_dict[faulty_rank] != "Dead":
                 self.engine_status_dict[faulty_rank] = "Dead"
 
-        healthy_ranks_old = [engine_id for engine_id, status in self.engine_status_dict.items()]
+        healthy_ranks_old = [
+            engine_id for engine_id, status in self.engine_status_dict.items()
+        ]
 
         original_to_new, _ = get_mapping(healthy_ranks_old, exclude_dp_ranks)
 

@@ -46,9 +46,12 @@ from torch.distributed import Backend, ProcessGroup
 import vllm.envs as envs
 from vllm.config import FaultToleranceConfig
 from vllm.distributed.device_communicators.base_device_communicator import (
-    DeviceCommunicatorBase
+    DeviceCommunicatorBase,
 )
-from vllm.distributed.utils import StatelessProcessGroup, stateless_destroy_torch_distributed_process_group
+from vllm.distributed.utils import (
+    StatelessProcessGroup,
+    stateless_destroy_torch_distributed_process_group,
+)
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_distributed_init_method

@@ -62,9 +62,9 @@ from vllm.v1.engine import (
 )
 from vllm.v1.engine.base_sentinel import BaseSentinel
 from vllm.v1.engine.engine_scaling import (
-_build_vllm_config_update_dict,
-_calculate_exclude_ep_ranks,
-parse_exclude_ep_ranks,
+    _build_vllm_config_update_dict,
+    _calculate_exclude_ep_ranks,
+    parse_exclude_ep_ranks,
 )
 from vllm.v1.engine.exceptions import EngineLoopPausedError, FaultInfo
 from vllm.v1.engine.utils import (
@@ -254,15 +254,17 @@ class EngineCoreSentinel(BaseSentinel):
     def descale(self, timeout: int = 60, **kwargs) -> bool:
         """Scale down the engine cluster by removing specified DP ranks.
 
-        This method adjusts parallel configuration parameters, broadcasts the descale
-        command to downstream workers, and reinitializes the DP group for fault tolerance.
+        This method adjusts parallel configuration parameters,
+        broadcasts the descalecommand to downstream workers,
+        and reinitializes the DP group for fault tolerance.
 
         Args:
-            timeout: Total timeout (in seconds) for the entire descale operation
-            kwargs: Required keyword arguments:
-                - original_to_new: Mapping from old engine indices to new indices (Dict[str, int])
-                - exclude_dp_ranks: List of DP ranks to exclude/remove (List[int])
-                - new_stateless_dp_group_port: Port for new stateless DP group (int)
+        timeout: Total timeout (in seconds) for the entire descale operation
+        kwargs: Required keyword arguments:
+            - original_to_new: Mapping from old engine indices to new indices
+              (Dict[str, int])
+            - exclude_dp_ranks: List of DP ranks to exclude/remove (List[int])
+            - new_stateless_dp_group_port: Port for new stateless DP group (int)
 
         Returns:
             bool: True if descale operation succeeded, False otherwise
@@ -280,7 +282,7 @@ class EngineCoreSentinel(BaseSentinel):
         ]
         for key in required_kwargs:
             if key not in kwargs:
-                self.logger.error(f"Missing required parameter: {key}")
+                self.logger.error("Missing required parameter: %s", {key})
                 return False
 
         # Extract and type-cast parameters from kwargs
@@ -312,7 +314,7 @@ class EngineCoreSentinel(BaseSentinel):
 
             if not success:
                 return success
-            # todo use _init_data_parallel instead of reinit_dp_group_on_fault_tolerance?
+
             self._send_reinit_dp_group_command(new_stateless_dp_group_port)
 
             elapsed = time.monotonic() - start_time
@@ -423,8 +425,12 @@ class EngineCoreSentinel(BaseSentinel):
         """
         with set_current_vllm_config(self.engine_core.vllm_config):
             self.engine_core.update_parallel_config(data_parallel_size, rank_mapping)
-            logger.info(f'self.vllm_config.parallel_config.data_parallel_rank is {self.engine_core.vllm_config.parallel_config.data_parallel_rank}'
-                        f'rank mapping is {rank_mapping}')
+            logger.info(
+                "self.vllm_config.parallel_config.data_parallel_rank is %s "
+                "rank mapping is %s",
+                self.engine_core.vllm_config.parallel_config.data_parallel_rank,
+                rank_mapping,
+            )
             # Build config update dictionary for downstream workers
             vllm_config_update_dict = _build_vllm_config_update_dict(
                 parallel_config, new_ep_size, data_parallel_size, rank_mapping
@@ -438,6 +444,7 @@ class EngineCoreSentinel(BaseSentinel):
                 exclude_ep_ranks=exclude_ep_ranks,
                 vllm_config_update_dict=vllm_config_update_dict,
             )
+
 
 def busy_loop_wrapper(busy_loop_func):
     """

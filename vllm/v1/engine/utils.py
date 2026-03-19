@@ -192,7 +192,10 @@ class CoreEngineProcManager:
                     else contextlib.nullcontext()
                 ):
                     proc.start()
-            if not local_client:
+            if (
+                not local_client
+                and vllm_config.fault_tolerance_config.enable_fault_tolerance
+            ):
                 self.recv_engine_identity(start_index, local_engine_count)
         finally:
             # Kill other procs if not all are running.
@@ -254,10 +257,12 @@ class CoreEngineProcManager:
             self.engine_identity = engine_identity
         sentinels = [proc.sentinel for proc in self.processes]
         pids = [proc.pid for proc in self.processes]
-        pid_mapping = {
-            proc: byte_data
-            for proc, byte_data in zip(pids, self.engine_identity.values())
-        }
+        pid_mapping = {}
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            pid_mapping = {
+                proc: byte_data
+                for proc, byte_data in zip(pids, self.engine_identity.values())
+            }
         while sentinels and not self.shutdown_monitor:
             died = multiprocessing.connection.wait(sentinels)
             for sentinel in died:
@@ -266,7 +271,12 @@ class CoreEngineProcManager:
                     proc for proc in self.processes if proc.sentinel == sentinel
                 )
                 engine_rank = re.match(r"EngineCore_DP(\d+)", died_proc.name).group(1)
-                engine_down_callback(engine_rank, died_proc, pid_mapping[died_proc.pid])
+                if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+                    engine_down_callback(
+                        engine_rank, died_proc, pid_mapping[died_proc.pid]
+                    )
+                else:
+                    engine_down_callback(engine_rank, died_proc, None)
                 sentinels.remove(sentinel)
 
     def join_first(self):
