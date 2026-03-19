@@ -275,7 +275,7 @@ def wait_for_completion_or_failure(
         # Check if any process terminates
         while sentinel_to_proc:
             if engine_manager is not None and engine_manager.manager_stopped.is_set():
-                raise RuntimeError("Engine core process is dead.")
+                break
             # Wait for any process to terminate
             ready_sentinels: list[Any] = connection.wait(sentinel_to_proc, timeout=5)
 
