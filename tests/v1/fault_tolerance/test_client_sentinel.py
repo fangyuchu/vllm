@@ -76,8 +76,8 @@ def client_sentinel(mock_vllm_config, mock_ft_addresses):
 async def test_client_sentinel_initialization(client_sentinel: ClientSentinel):
     """Test ClientSentinel initialization logic."""
     assert client_sentinel.engine_status_dict == {
-        0: {"status": EngineStatusType.HEALTHY},
-        1: {"status": EngineStatusType.HEALTHY},
+        0: {"status": "healthy"},
+        1: {"status": "healthy"},
     }
     assert client_sentinel.start_rank == 0
     assert client_sentinel.fault_receiver_socket is not None
@@ -88,7 +88,12 @@ async def test_client_sentinel_initialization(client_sentinel: ClientSentinel):
 @pytest.mark.asyncio
 async def test_monitor_and_report_on_fault(client_sentinel: ClientSentinel):
     """Fault should update status and publish fault-state report."""
-    fault_info = FaultInfo(engine_id="0", type="EngineDeadError", message="dead")
+    fault_info = FaultInfo(
+        engine_id="0",
+        type="EngineDeadError",
+        message="dead",
+        engine_status=EngineStatusType.DEAD,
+    )
     client_sentinel.fault_receiver_socket.recv_multipart = AsyncMock(
         side_effect=[
             [b"", b"", msgspec.msgpack.encode(fault_info)],
@@ -98,7 +103,7 @@ async def test_monitor_and_report_on_fault(client_sentinel: ClientSentinel):
 
     await client_sentinel.run()
 
-    assert client_sentinel.engine_status_dict[0]["status"] == EngineStatusType.DEAD
+    assert client_sentinel.engine_status_dict[0]["status"] == "dead"
     client_sentinel.fault_state_pub_socket.send_multipart.assert_awaited_once()
 
     sent_topic, sent_payload = (
@@ -106,8 +111,8 @@ async def test_monitor_and_report_on_fault(client_sentinel: ClientSentinel):
     )
     assert sent_topic == b"vllm_fault"
     assert msgspec.msgpack.decode(sent_payload) == {
-        0: {"status": int(EngineStatusType.DEAD)},
-        1: {"status": int(EngineStatusType.HEALTHY)},
+        "total_engines": 2,
+        "engines": [{"id": 0, "status": "dead"}, {"id": 1, "status": "healthy"}],
     }
 
 

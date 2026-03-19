@@ -37,7 +37,6 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     EngineCoreRequestType,
-    EngineStatusType,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -953,9 +952,12 @@ class AsyncMPClient(MPClient):
                     shutdown_callback=self.shutdown,
                 )
                 self.resources.client_sentinel = self.client_sentinel
-            self.engine_status_dict: dict[int, dict[str, EngineStatusType]] = {
-                engine_index: {"status": EngineStatusType.HEALTHY}
-                for engine_index in self.engine_ranks_managed
+            self.engine_status = {
+                "total_engines": len(self.engine_ranks_managed),
+                "engines": [
+                    {"id": rank, "status": "healthy"}
+                    for rank in self.engine_ranks_managed
+                ],
             }
             self.engine_status_lock = threading.Lock()
             self.fault_state_sub_socket = make_zmq_socket(
@@ -1205,21 +1207,14 @@ class AsyncMPClient(MPClient):
         while True:
             try:
                 frames = self.fault_state_sub_socket.recv_multipart()
-                status_dict = decoder.decode(frames[-1])
                 with self.engine_status_lock:
-                    self.engine_status_dict.clear()
-                    self.engine_status_dict.update(status_dict)
+                    self.engine_status = decoder.decode(frames[-1])
             except zmq.ZMQError:
                 break
 
     async def fault_reporter(self):
         with self.engine_status_lock:
-            raw = self.engine_status_dict.copy()
-        result = {}
-        for engine_id, status_value in raw.items():
-            status_enum = EngineStatusType(status_value["status"])
-            result[engine_id] = {"status": status_enum.name.title()}
-        return result
+            return self.engine_status
 
 
 class DPAsyncMPClient(AsyncMPClient):

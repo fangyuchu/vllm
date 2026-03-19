@@ -50,19 +50,24 @@ class ClientSentinel(BaseSentinel):
         num_dp_managed = (
             dp_local_size if vllm_config.parallel_config.local_engines_only else dp_size
         )
-        self.engine_status_dict: dict[int, dict[str, EngineStatusType]] = {
-            engine_index: {"status": EngineStatusType.HEALTHY}
+        self.engine_status_dict: dict[int, dict[str, str]] = {
+            engine_index: {"status": "healthy"}
             for engine_index in range(self.start_rank, self.start_rank + num_dp_managed)
         }
-
         asyncio.create_task(self.run())
 
     async def _pub_engine_status(self):
-        # No lock needed since we're single-threaded in asyncio
         engine_status = self.engine_status_dict.copy()
+        pub_msg = {
+            "total_engines": len(engine_status),
+            "engines": [
+                {"id": i, "status": status["status"]}
+                for i, status in engine_status.items()
+            ],
+        }
         topic = self.ft_config.fault_state_pub_topic.encode()
         await self.fault_state_pub_socket.send_multipart(
-            (topic, msgspec.msgpack.encode(engine_status))
+            (topic, msgspec.msgpack.encode(pub_msg))
         )
 
     async def run(self):
@@ -71,13 +76,10 @@ class ClientSentinel(BaseSentinel):
             while not self.sentinel_dead:
                 _, _, message = await self.fault_receiver_socket.recv_multipart()
                 fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
-                if fault_info.type == "EngineDeadError":
-                    engine_status = EngineStatusType.DEAD
-                else:
-                    engine_status = EngineStatusType.UNHEALTHY
                 # Update engine status
+                status_enum = EngineStatusType(fault_info.engine_status)
                 self.engine_status_dict[int(fault_info.engine_id)] = {
-                    "status": engine_status
+                    "status": status_enum.name.lower()
                 }
                 await self._pub_engine_status()
                 if self._shutdown_task is None:
