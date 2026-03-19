@@ -167,8 +167,9 @@ class CoreEngineProcManager:
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
-        self.engine_down_socket.close(linger=0)
-        self.ctx.term()
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            self.engine_down_socket.close(linger=0)
+            self.ctx.term()
         if self._finalizer.detach() is not None:
             shutdown(self.processes, timeout=timeout)
 
@@ -193,7 +194,7 @@ class CoreEngineProcManager:
                             self.engine_down_socket,
                             engine_id=str(engine_rank + self.start_index),
                         )
-                        sentinels.remove(sentinel)
+                        sentinels.remove(cast(int, sentinel))
                     except zmq.ZMQError:
                         break
 
@@ -893,8 +894,9 @@ class CoreEngineActorManager:
         import ray
 
         self.manager_stopped.set()
-        self.engine_down_socket.close(linger=0)
-        self.ctx.term()
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            self.engine_down_socket.close(linger=0)
+            self.ctx.term()
         for actor in self.local_engine_actors + self.remote_engine_actors:
             ray.kill(actor)
         for pg in self.created_placement_groups:
