@@ -28,7 +28,6 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import (
-    FaultInfo,
     FaultToleranceZmqAddresses,
     make_engine_down_report_socket,
     notify_engine_down,
@@ -168,25 +167,10 @@ class CoreEngineProcManager:
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
+        self.engine_down_socket.close(linger=0)
+        self.ctx.term()
         if self._finalizer.detach() is not None:
             shutdown(self.processes, timeout=timeout)
-
-    def notify_engine_down(self, dead_proc, all_processes):
-        """
-        Send fault notification to the engine_down_socket
-        and log the failure event.
-        """
-        engine_rank = all_processes.index(dead_proc)
-        fault_info = FaultInfo(
-            type="EngineDeadError",
-            message=f"Engine core proc {dead_proc.name} died unexpectedly.",
-            engine_id=str(engine_rank + self.start_index),
-            additional_info=None,
-        )
-
-        self.engine_down_socket.send_multipart(
-            [b"", msgspec.msgpack.encode(fault_info)]
-        )
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""
@@ -203,11 +187,16 @@ class CoreEngineProcManager:
                 if exitcode != 0:
                     logger.error("Engine core proc %s died unexpectedly.", proc.name)
                 if enable_ft:
-                    engine_rank = self.processes.index(proc)
-                    notify_engine_down(
-                        self.engine_down_socket,
-                        engine_id=str(engine_rank + self.start_index),
-                    )
+                    try:
+                        engine_rank = self.processes.index(proc)
+                        notify_engine_down(
+                            self.engine_down_socket,
+                            engine_id=str(engine_rank + self.start_index),
+                        )
+                        sentinels.remove(sentinel)
+                    except zmq.ZMQError:
+                        break
+
             if died_sentinels and not enable_ft:
                 break
 
@@ -864,8 +853,9 @@ class CoreEngineActorManager:
         import ray
 
         enable_ft = self.vllm_config.fault_tolerance_config.enable_fault_tolerance
+        failed_ref = set()
         while not self.manager_stopped.is_set():
-            actor_run_refs = list(self.get_run_refs())
+            actor_run_refs = [r for r in self.get_run_refs() if r not in failed_ref]
             if not actor_run_refs:
                 logger.info(
                     "There are no actors to monitor currently. "
@@ -884,10 +874,15 @@ class CoreEngineActorManager:
                     logger.error("Engine core actor died: %s", actor_ref)
                     unexpected_failure = True
                     if enable_ft:
-                        engine_rank = self.get_run_refs().index(actor_ref)
-                        notify_engine_down(
-                            self.engine_down_socket, str(engine_rank + self.start_rank)
-                        )
+                        try:
+                            engine_rank = self.get_run_refs().index(actor_ref)
+                            notify_engine_down(
+                                self.engine_down_socket,
+                                str(engine_rank + self.start_rank),
+                            )
+                            failed_ref.add(actor_ref)
+                        except zmq.ZMQError:
+                            break
 
             if unexpected_failure and not enable_ft:
                 break
@@ -898,6 +893,8 @@ class CoreEngineActorManager:
         import ray
 
         self.manager_stopped.set()
+        self.engine_down_socket.close(linger=0)
+        self.ctx.term()
         for actor in self.local_engine_actors + self.remote_engine_actors:
             ray.kill(actor)
         for pg in self.created_placement_groups:
