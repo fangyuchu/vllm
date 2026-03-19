@@ -266,27 +266,15 @@ def wait_for_completion_or_failure(
 
         # start monitor for engine liveness
         if engine_manager:
-            engine_dead_event = threading.Event()
-
-            def shutdown_callback(*_, **__):
-                assert engine_manager is not None
-                engine_dead_event.set()
-                engine_manager.shutdown_monitor = True
-
-            if engine_manager.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-                callback = engine_manager.notify_engine_down
-            else:
-                callback = shutdown_callback
             monitor_thread = threading.Thread(
                 target=engine_manager.monitor_engine_liveness,
-                args=(callback,),
                 daemon=True,
             )
             monitor_thread.start()
 
         # Check if any process terminates
         while sentinel_to_proc:
-            if engine_manager is not None and engine_dead_event.is_set():
+            if engine_manager is not None and engine_manager.manager_stopped.is_set():
                 raise RuntimeError("Engine core process is dead.")
             # Wait for any process to terminate
             ready_sentinels: list[Any] = connection.wait(sentinel_to_proc, timeout=5)
