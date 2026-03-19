@@ -10,6 +10,7 @@ import zmq
 
 from vllm.config import FaultToleranceConfig
 from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.engine import EngineStatusType
 from vllm.v1.utils import get_engine_client_zmq_addr
 
 
@@ -17,6 +18,7 @@ class FaultInfo(msgspec.Struct):
     type: str
     message: str
     engine_id: str
+    engine_status: EngineStatusType
     timestamp: str | None = None
     additional_info: dict | None = None
 
@@ -25,6 +27,7 @@ class FaultInfo(msgspec.Struct):
         cls,
         exception: Exception,
         engine_id: str | int,
+        engine_status: EngineStatusType,
         additional_info: dict | None = None,
     ) -> "FaultInfo":
         """Create FaultInfo from an exception."""
@@ -33,6 +36,7 @@ class FaultInfo(msgspec.Struct):
             type=type(exception).__name__,
             message=str(exception),
             engine_id=str(engine_id),
+            engine_status=engine_status,
             timestamp=time.strftime("%H:%M:%S", local_time),
             additional_info=additional_info or {},
         )
@@ -118,6 +122,7 @@ def notify_engine_down(engine_down_socket, engine_id):
         type="EngineDeadError",
         message="Engine died unexpectedly.",
         engine_id=str(engine_id),
+        engine_status=EngineStatusType.DEAD,
     )
 
     engine_down_socket.send_multipart([b"", msgspec.msgpack.encode(fault_info)])

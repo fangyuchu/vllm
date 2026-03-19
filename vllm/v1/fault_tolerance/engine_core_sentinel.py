@@ -10,6 +10,7 @@ import zmq
 
 from vllm.config import VllmConfig
 from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.engine import EngineStatusType
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
 from vllm.v1.fault_tolerance.utils import FaultInfo
 
@@ -67,7 +68,9 @@ class EngineCoreSentinel(BaseSentinel):
                 "".join(traceback.format_tb(engine_exception.__traceback__)),
                 level="error",
             )
-            msg = FaultInfo.from_exception(engine_exception, self.engine_index)
+            msg = FaultInfo.from_exception(
+                engine_exception, self.engine_index, EngineStatusType.UNHEALTHY
+            )
             msg_bytes = msgspec.msgpack.encode(msg)
             self.engine_fault_socket.send_multipart([b"", msg_bytes])
         except queue.Empty:
