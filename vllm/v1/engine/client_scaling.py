@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
 def get_mapping(original_list, to_remove) -> tuple[dict, list]:
     remaining = [num for num in original_list if num not in to_remove]
     original_to_new_dp_rank = {

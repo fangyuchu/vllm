@@ -4,6 +4,7 @@ from typing import Any
 
 from vllm.config import VllmConfig
 
+
 def _calculate_exclude_ep_ranks(
     exclude_dp_ranks: list[int], vllm_config: VllmConfig
 ) -> list[int]:
@@ -20,7 +21,7 @@ def _calculate_exclude_ep_ranks(
         List[int]: Sorted, deduplicated list of excluded EP ranks.
     """
     tensor_model_parallel_size = vllm_config.parallel_config.tensor_parallel_size
-    exclude_ep_ranks = []
+    exclude_ep_ranks: list[int] = []
     for dp_rank in exclude_dp_ranks:
         start = dp_rank * tensor_model_parallel_size
         end = (dp_rank + 1) * tensor_model_parallel_size
@@ -39,9 +40,10 @@ def parse_exclude_ep_ranks(vllm_config: VllmConfig, exclude_ep_ranks_list: list[
     scaling down the cluster.
 
     Args:
-        vllm_config: Vllm configuration object containing parallelism settings
-            (TP/DP/PP sizes)
-        exclude_ep_ranks_list: List of DP ranks to exclude/remove from the original DP group
+        vllm_config:
+            Vllm configuration object containing parallelism settings
+        exclude_ep_ranks_list:
+            List of DP ranks to exclude/remove from the original DP group
 
     Raises:
         NotImplementedError: Raised when pipeline parallel size > 1, as scaling down
@@ -52,7 +54,8 @@ def parse_exclude_ep_ranks(vllm_config: VllmConfig, exclude_ep_ranks_list: list[
             - new_ep_size: Scaled-down EP parallel size (new_dp_size * tp_size)
             - new_dp_size: Scaled-down DP parallel size (original DP size minus
               number of excluded DP ranks)
-            - dp_rank_mapping: Dictionary mapping old DP ranks (keys) to new DP ranks (values)
+            - dp_rank_mapping:
+                Dictionary mapping old DP ranks (keys) to new DP ranks (values)
     """
     if vllm_config.parallel_config.pipeline_parallel_size > 1:
         raise NotImplementedError(
@@ -77,7 +80,7 @@ def _build_vllm_config_update_dict(
     new_ep_size: int,
     data_parallel_size: int,
     rank_mapping: Any,
-    ) -> dict[str, Any]:
+) -> dict[str, Any]:
     """Build dictionary of VLLM config updates for downstream workers.
 
     Args:
