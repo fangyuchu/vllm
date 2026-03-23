@@ -537,7 +537,7 @@ class EngineCore:
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
-        self.collective_rpc("dp_descale_for_the_first_half_dp")
+        self.collective_rpc("dp_descale_for_the_half_dp")
 
         self.available_gpu_memory_for_kv_cache = -1
 
