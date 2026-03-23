@@ -4,6 +4,7 @@ import enum
 import time
 import weakref
 from datetime import timedelta
+from threading import Timer
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import torch.distributed
@@ -403,7 +404,12 @@ class ElasticEPScalingState:
             self.engine_core._eep_send_engine_core_notification(
                 EEPNotificationType.SHUTDOWN_COMPLETE
             )
-            self.engine_core.shutdown()
+            # Delay shutting down the EngineCore so client-side CoreEngineActorManager
+            # can process the scale-down event first. This avoids liveness monitoring
+            # misreporting a scale-down shutdown as an unexpected engine failure.
+            timer = Timer(5, self.engine_core.shutdown)
+            timer.daemon = True
+            timer.start()
             return True
 
         else:

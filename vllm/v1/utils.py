@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import multiprocessing
+import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
+    from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
 
 logger = init_logger(__name__)
 
@@ -173,6 +175,7 @@ class APIServerProcessManager:
         input_addresses: list[str],
         output_addresses: list[str],
         stats_update_address: str | None = None,
+        fault_tolerance_addresses: "FaultToleranceZmqAddresses|None|str" = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -205,6 +208,12 @@ class APIServerProcessManager:
             }
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
+            if fault_tolerance_addresses is not None:
+                from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
+
+                if isinstance(fault_tolerance_addresses, FaultToleranceZmqAddresses):
+                    fault_tolerance_addresses = fault_tolerance_addresses.to_str()
+                client_config["fault_tolerance_addresses"] = fault_tolerance_addresses
 
             proc = spawn_context.Process(
                 target=target_server_fn,
@@ -244,8 +253,6 @@ def wait_for_completion_or_failure(
         coordinator: The coordinator for data parallel.
     """
 
-    from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
-
     try:
         logger.info("Waiting for API servers to complete ...")
         # Create a mapping of sentinels to their corresponding processes
@@ -257,15 +264,18 @@ def wait_for_completion_or_failure(
         if coordinator:
             sentinel_to_proc[coordinator.proc.sentinel] = coordinator.proc
 
-        actor_run_refs = []
-        if isinstance(engine_manager, CoreEngineProcManager):
-            for proc in engine_manager.processes:
-                sentinel_to_proc[proc.sentinel] = proc
-        elif isinstance(engine_manager, CoreEngineActorManager):
-            actor_run_refs = engine_manager.get_run_refs()
+        # start monitor for engine liveness
+        if engine_manager:
+            monitor_thread = threading.Thread(
+                target=engine_manager.monitor_engine_liveness,
+                daemon=True,
+            )
+            monitor_thread.start()
 
         # Check if any process terminates
-        while sentinel_to_proc or actor_run_refs:
+        while sentinel_to_proc:
+            if engine_manager is not None and engine_manager.manager_stopped.is_set():
+                raise RuntimeError("Engine core process is dead.")
             # Wait for any process to terminate
             ready_sentinels: list[Any] = connection.wait(sentinel_to_proc, timeout=5)
 
@@ -279,11 +289,6 @@ def wait_for_completion_or_failure(
                         f"Process {proc.name} (PID: {proc.pid}) "
                         f"died with exit code {proc.exitcode}"
                     )
-
-            if actor_run_refs:
-                import ray
-
-                _, actor_run_refs = ray.wait(actor_run_refs, timeout=5)
 
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down API servers...")
