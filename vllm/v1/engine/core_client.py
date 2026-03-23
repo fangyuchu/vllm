@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
-import multiprocessing
 import queue
 import sys
+import threading
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -54,6 +54,8 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.fault_tolerance import ClientSentinel
+from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -270,6 +272,9 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    async def fault_reporter(self):
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -382,6 +387,8 @@ class BackgroundResources:
     output_queue_task: asyncio.Task | None = None
     stats_update_task: asyncio.Task | None = None
     shutdown_path: str | None = None
+    client_sentinel: ClientSentinel | None = None
+    fault_state_sub_socket: zmq.Socket | None = None
 
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
@@ -391,6 +398,8 @@ class BackgroundResources:
         """Clean up background resources."""
 
         self.engine_dead = True
+        if self.client_sentinel is not None:
+            self.client_sentinel.shutdown()
         if self.engine_manager is not None:
             self.engine_manager.shutdown()
         if self.coordinator is not None:
@@ -406,6 +415,7 @@ class BackgroundResources:
                 self.first_req_send_socket,
                 self.first_req_rcv_socket,
                 self.stats_update_socket,
+                self.fault_state_sub_socket,
             )
 
             tasks = (self.output_queue_task, self.stats_update_task)
@@ -501,6 +511,7 @@ class MPClient(EngineCoreClient):
 
             self.stats_update_address: str | None = None
             tensor_queue: Queue | None = None
+            self.addresses = None
             if client_addresses:
                 # Engines are managed externally to this client.
                 input_address = client_addresses["input_address"]
@@ -538,7 +549,15 @@ class MPClient(EngineCoreClient):
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
 
+                self.addresses = addresses
                 self.stats_update_address = addresses.frontend_stats_publish_address
+                if vllm_config.fault_tolerance_config.enable_fault_tolerance:
+                    assert client_addresses is not None
+                    assert addresses.fault_tolerance_addresses is not None
+                    client_addresses["fault_tolerance_addresses"] = (
+                        addresses.fault_tolerance_addresses.to_str()
+                    )
+
                 if coordinator is not None:
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
@@ -640,34 +659,20 @@ class MPClient(EngineCoreClient):
     def start_engine_core_monitor(self):
         """Start a monitor thread for engine core processes."""
         engine_manager = self.resources.engine_manager
-        if (
-            engine_manager is None
-            or not hasattr(engine_manager, "processes")
-            or not engine_manager.processes
-        ):
+        if engine_manager is None:
             # No engine processes to monitor
             return
 
-        engine_processes = engine_manager.processes
         self_ref = weakref.ref(self)
 
         # Monitor engine core process liveness. If any die unexpectedly,
-        # logs an error, shuts down the client and invokes the failure
-        # callback to inform the engine.
+        # marks the engine as dead, and shuts down the client.
         def monitor_engine_cores():
-            sentinels = [proc.sentinel for proc in engine_processes]
-            died = multiprocessing.connection.wait(sentinels)
+            engine_manager.monitor_engine_liveness()
             _self = self_ref()
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
-            proc_name = next(
-                proc.name for proc in engine_processes if proc.sentinel == died[0]
-            )
-            logger.error(
-                "Engine core proc %s died unexpectedly, shutting down client.",
-                proc_name,
-            )
             _self.shutdown()
             # Note: For MPClient, we don't have a failure callback mechanism
             # like MultiprocExecutor, but we set engine_dead flag which will
@@ -884,6 +889,8 @@ class AsyncMPClient(MPClient):
         client_count: int = 1,
         client_index: int = 0,
     ):
+        if vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            client_addresses = client_addresses or {}
         super().__init__(
             asyncio_mode=True,
             vllm_config=vllm_config,
@@ -895,6 +902,44 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
+
+        if vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            assert client_addresses is not None
+            ft_addr = FaultToleranceZmqAddresses.from_str(
+                client_addresses["fault_tolerance_addresses"]
+            )
+            if self.client_index == 0:
+                self.client_sentinel = ClientSentinel(
+                    vllm_config=vllm_config,
+                    fault_tolerance_addresses=ft_addr,
+                    shutdown_callback=self.shutdown,
+                )
+                self.resources.client_sentinel = self.client_sentinel
+            self.engine_status = {
+                "total_engines": len(self.engine_ranks_managed),
+                "engines": [
+                    {"id": rank, "status": "healthy"}
+                    for rank in self.engine_ranks_managed
+                ],
+            }
+            self.engine_status_lock = threading.Lock()
+            self.fault_state_sub_socket = make_zmq_socket(
+                self.resources.ctx,
+                ft_addr.fault_state_pub_socket_addr,
+                zmq.SUB,
+                bind=False,
+            )
+            self.fault_state_sub_socket.setsockopt(
+                zmq.SUBSCRIBE,
+                self.vllm_config.fault_tolerance_config.fault_state_pub_topic.encode(),
+            )
+            self.resources.fault_state_sub_socket = self.fault_state_sub_socket
+            threading.Thread(
+                target=self._engine_status_listener,
+                daemon=True,
+                name="EngineStatusListenerThread",
+            ).start()
+
         try:
             # If we are running in an asyncio event loop, start the queue task.
             # Otherwise, it will be started lazily. If it is not started here,
@@ -1119,6 +1164,20 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+
+    def _engine_status_listener(self):
+        decoder = msgspec.msgpack.Decoder()
+        while True:
+            try:
+                frames = self.fault_state_sub_socket.recv_multipart()
+                with self.engine_status_lock:
+                    self.engine_status = decoder.decode(frames[-1])
+            except zmq.ZMQError:
+                break
+
+    async def fault_reporter(self):
+        with self.engine_status_lock:
+            return self.engine_status
 
 
 class DPAsyncMPClient(AsyncMPClient):
@@ -1634,6 +1693,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         parallel_config = self.vllm_config.parallel_config
         ip, coord_store_port = self._setup_elastic_ep_reconfig_bootstrap()
 
+        removed_dp_size = cur_data_parallel_size - new_data_parallel_size
+        assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
+        self.resources.engine_manager.remove_run_refs_for_scale_down(removed_dp_size)
         reconfig_futures = []
         for cur_dp_rank, engine in enumerate(self.core_engines):
             reconfig_request = ReconfigureDistributedRequest(
