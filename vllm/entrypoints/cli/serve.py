@@ -294,6 +294,7 @@ def run_multi_api_server(args: argparse.Namespace):
             stats_update_address=coordinator.get_stats_publish_address()
             if coordinator
             else None,
+            fault_tolerance_addresses=addresses.fault_tolerance_addresses,
         )
 
         # For dp ranks > 0 in external/hybrid DP LB modes, we must delay the
