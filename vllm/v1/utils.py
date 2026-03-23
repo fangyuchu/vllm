@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
+    from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
 
 logger = init_logger(__name__)
 
@@ -173,6 +174,7 @@ class APIServerProcessManager:
         input_addresses: list[str],
         output_addresses: list[str],
         stats_update_address: str | None = None,
+        fault_tolerance_addresses: "FaultToleranceZmqAddresses|None|str" = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -205,6 +207,13 @@ class APIServerProcessManager:
             }
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
+
+            if fault_tolerance_addresses is not None:
+                from vllm.v1.fault_tolerance.utils import FaultToleranceZmqAddresses
+
+                if isinstance(fault_tolerance_addresses, FaultToleranceZmqAddresses):
+                    fault_tolerance_addresses = fault_tolerance_addresses.to_str()
+                client_config["fault_tolerance_addresses"] = fault_tolerance_addresses
 
             proc = spawn_context.Process(
                 target=target_server_fn,
