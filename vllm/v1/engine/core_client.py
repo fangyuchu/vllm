@@ -566,6 +566,28 @@ class ClientSentinel(BaseSentinel):
             soft_pause=soft_pause,
         )
         return success
+    
+    def recover_raw_data(self, timeout = 1, **kwargs) -> bool:
+        self.logger(
+            "Recover raw data operation is best-effort only. Due to the complexity of "
+            "collective communications (e.g., timing dependencies and "
+            "synchronization barriers), recovering may not always succeed. If "
+            "the process remains unresponsive or collective operations "
+            "cannot be interrupted, consider shutting down and restarting "
+            "the instance.",
+            level="warning",
+        )
+        alive_engines = {
+            identity
+            for identity, index in self.engine_identity_to_index.items()
+            if self.engine_status_dict.get(index) != "Dead"
+        }
+        success, _ = self._broadcast_command_to_downstream(
+            "recover_raw_data",
+            alive_engines,
+            timeout=timeout,
+        )
+        return success
 
     def terminate_scaledown_cores(self, exclude_dp_ranks, original_to_new) -> None:
 

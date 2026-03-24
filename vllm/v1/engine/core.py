@@ -250,6 +250,15 @@ class EngineCoreSentinel(BaseSentinel):
                     soft_pause=False,
                 )
         return success
+    
+    def recover_raw_data(self, timeout = 1, **kwargs) -> bool:
+        self.logger("Start recovering raw data for EngineCore", level="info")
+        success, _ = self._broadcast_command_to_downstream(
+                "recover_raw_data",
+                self._get_target_worker_identity(),
+                timeout=timeout,
+            )
+        return success
 
     def descale(self, timeout: int = 60, **kwargs) -> bool:
         """Scale down the engine cluster by removing specified DP ranks.
