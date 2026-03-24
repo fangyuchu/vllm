@@ -9,7 +9,10 @@ import zmq
 from vllm.config import FaultToleranceConfig, VllmConfig
 from vllm.v1.engine import EngineStatusType
 from vllm.v1.fault_tolerance.client_sentinel import ClientSentinel
-from vllm.v1.fault_tolerance.utils import FaultInfo
+from vllm.v1.fault_tolerance.utils import (
+    FaultInfo,
+    FaultToleranceRequest,
+)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -32,26 +35,50 @@ def mock_vllm_config():
 def mock_ft_addresses():
     """Create mock FaultToleranceZmqAddresses object"""
     addresses = Mock()
+    addresses.all_client_input_addresses = ["tcp://127.0.0.1:5555"]
+    addresses.all_client_output_addresses = ["tcp://127.0.0.1:5556"]
     addresses.engine_fault_socket_addr = "tcp://127.0.0.1:5557"
     addresses.fault_state_pub_socket_addr = "tcp://127.0.0.1:5558"
+    addresses.ft_config = Mock(fault_state_pub_topic="vllm_fault")
     return addresses
 
 
 @pytest.fixture
-def client_sentinel(mock_vllm_config, mock_ft_addresses):
-    """Create ClientSentinel fixture with mocked sockets."""
-    fault_receiver_socket = AsyncMock()
-    fault_state_pub_socket = AsyncMock()
+def mock_call_utility_async():
+    """Create mock call_utility_async function"""
+    return AsyncMock(
+        return_value={"request_id": "request_id", "success": True, "reason": None}
+    )
 
+
+@pytest.fixture
+def client_sentinel(mock_vllm_config, mock_ft_addresses, mock_call_utility_async):
+    """Fixed ClientSentinel fixture (mock Poller)"""
+    # 1. Mock Poller class and return mock Poller object
+    mock_poller = Mock()
+    mock_poller.register = Mock()
+    mock_poller.poll = AsyncMock(return_value=[])  # Return empty events by default
+    mock_poller_class = Mock(return_value=mock_poller)
+
+    # 2. Mock make_zmq_socket to return mock Socket
+    mock_socket = AsyncMock()
+    # Add necessary attributes to mock socket (avoid errors in other places)
+    mock_socket.fd = Mock(return_value=1)  # Mock file descriptor
+    mock_socket.getsockopt = Mock(return_value=0)
+
+    # 3. Batch mock related dependencies
     with (
         patch(
             "vllm.v1.fault_tolerance.client_sentinel.make_zmq_socket",
-            side_effect=[fault_receiver_socket, fault_state_pub_socket],
+            return_value=mock_socket,
         ),
+        patch("zmq.asyncio.Poller", mock_poller_class),
         patch(
             "vllm.v1.fault_tolerance.client_sentinel.asyncio.create_task"
         ) as mock_create_task,
     ):
+        # 4. Disable real async tasks (avoid run/_monitor_and_pause_on_fault execution)
+        mock_create_task.return_value = Mock()
 
         def _capture_task(coro):
             # ClientSentinel starts run() in __init__; close it in tests to avoid
@@ -65,6 +92,8 @@ def client_sentinel(mock_vllm_config, mock_ft_addresses):
             vllm_config=mock_vllm_config,
             fault_tolerance_addresses=mock_ft_addresses,
             shutdown_callback=shutdown_callback,
+            call_utility_async=mock_call_utility_async,
+            core_engines=[b"engine_0", b"engine_1"],
         )
 
     sentinel.instance_shutdown_callback = shutdown_callback
@@ -83,6 +112,9 @@ async def test_client_sentinel_initialization(client_sentinel: ClientSentinel):
     assert client_sentinel.fault_receiver_socket is not None
     assert client_sentinel.fault_state_pub_socket is not None
     assert client_sentinel._shutdown_task is None
+    # Verify ZMQ sockets are created
+    assert len(client_sentinel.input_sockets) == 1
+    assert len(client_sentinel.output_sockets) == 1
 
 
 @pytest.mark.asyncio
@@ -114,6 +146,78 @@ async def test_monitor_and_report_on_fault(client_sentinel: ClientSentinel):
         "total_engines": 2,
         "engines": [{"id": 0, "status": "dead"}, {"id": 1, "status": "healthy"}],
     }
+
+
+@pytest.mark.asyncio
+async def test_retry_success(client_sentinel: ClientSentinel, mock_call_utility_async):
+    """Test retry method (success scenario)"""
+    # Mock engine to return successful result
+    mock_call_utility_async.return_value = {
+        "request_id": "request_id",
+        "success": True,
+        "reason": "success",
+    }
+
+    # Execute retry
+    result = await client_sentinel.retry(timeout=5)
+
+    # Verify result
+    assert result is True
+    assert not client_sentinel.is_faulted.is_set()
+
+    # Verify call parameters
+    mock_call_utility_async.assert_awaited()
+    call_args = mock_call_utility_async.call_args[0]
+    assert call_args[0] == "handle_fault"
+    assert isinstance(call_args[1], FaultToleranceRequest)
+    assert call_args[1].instruction == "retry"
+    assert call_args[1].params["timeout"] == 5
+
+
+@pytest.mark.asyncio
+async def test_retry_failure(client_sentinel: ClientSentinel, mock_call_utility_async):
+    """Test retry method (failure scenario)"""
+    # Mock one engine to return failure
+    mock_call_utility_async.side_effect = [
+        {"success": True},
+        {"success": False, "reason": "engine dead"},
+    ]
+
+    # Mark one engine as DEAD first
+    client_sentinel.engine_status_dict[1] = {"status": EngineStatusType.DEAD}
+
+    # Execute retry
+    result = await client_sentinel.retry()
+
+    # Verify result
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pause_operation(
+    client_sentinel: ClientSentinel, mock_call_utility_async
+):
+    """Test pause method"""
+    # Mock all engines to pause successfully
+    mock_call_utility_async.return_value = {
+        "request_id": "request_id",
+        "success": True,
+        "reason": None,
+    }
+
+    # Execute pause
+    result = await client_sentinel.pause(timeout=3, soft_pause=True)
+
+    # Verify result
+    assert result is True
+    assert client_sentinel.engine_status_dict[0]["status"] == EngineStatusType.PAUSED
+    assert client_sentinel.engine_status_dict[1]["status"] == EngineStatusType.PAUSED
+
+    # Verify call parameters
+    call_args = mock_call_utility_async.call_args[0][1]
+    assert call_args.instruction == "pause"
+    assert call_args.params["timeout"] == 3
+    assert call_args.params["soft_pause"] is True
 
 
 @pytest.mark.asyncio
