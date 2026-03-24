@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-import queue
 import socket
+import threading
 import time
+import traceback
+import uuid
+from queue import Queue
 
 import pytest
 import zmq
@@ -15,8 +17,13 @@ from vllm.config import (
     ParallelConfig,
     VllmConfig,
 )
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.fault_tolerance import EngineCoreSentinel
-from vllm.v1.fault_tolerance.utils import FaultInfo
+from vllm.v1.fault_tolerance.utils import (
+    FaultInfo,
+    FaultToleranceRequest,
+    FaultToleranceResult,
+)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -37,10 +44,18 @@ def addr_dict():
     }
 
 
+# Helper to collect exceptions from threads and fail the test if any were raised.
+def fail_on_thread_exceptions(thread_excs: Queue) -> None:
+    if not thread_excs.empty():
+        pytest.fail("Thread raised exception:\n" + "\n".join(thread_excs.queue))
+
+
 def create_engine_core_sentinel(
-    fault_signal_q: queue.Queue,
+    fault_signal_q: Queue,
+    busy_loop_active: threading.Event,
     addr_dict: dict,
     sentinel_identity: bytes = b"engine_sentinel_0",
+    cmd_q: Queue | None = None,
 ):
     vllm_cfg = VllmConfig(
         device_config=DeviceConfig("cpu"),
@@ -49,10 +64,16 @@ def create_engine_core_sentinel(
         ),
         fault_tolerance_config=FaultToleranceConfig(enable_fault_tolerance=True),
     )
+    if cmd_q is None:
+        cmd_q = Queue()
 
     return EngineCoreSentinel(
         engine_index=0,
         fault_signal_q=fault_signal_q,
+        cmd_q=cmd_q,
+        busy_loop_active=busy_loop_active,
+        engine_input_q=Queue(),
+        downstream_cmd_addr=addr_dict["worker_cmd_addr"],
         engine_fault_socket_addr=addr_dict["engine_fault_socket_addr"],
         sentinel_identity=sentinel_identity,
         vllm_config=vllm_cfg,
@@ -60,9 +81,10 @@ def create_engine_core_sentinel(
 
 
 def test_engine_core_sentinel_initialization(addr_dict):
-    fault_signal_q: queue.Queue = queue.Queue()
+    fault_signal_q: Queue = Queue()
+    busy_loop_active = threading.Event()
 
-    sentinel = create_engine_core_sentinel(fault_signal_q, addr_dict)
+    sentinel = create_engine_core_sentinel(fault_signal_q, busy_loop_active, addr_dict)
 
     assert sentinel.engine_index == 0
     assert sentinel.engine_fault_socket.type == zmq.DEALER
@@ -76,7 +98,7 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict):
     EngineCoreSentinel forwards a FaultInfo message to the
     client-facing engine fault socket.
     """
-    fault_signal_q: queue.Queue = queue.Queue()
+    fault_signal_q: Queue = Queue()
     sentinel_identity = b"engine_sentinel_0"
     sentinel = create_engine_core_sentinel(
         fault_signal_q, addr_dict, sentinel_identity=sentinel_identity
@@ -105,3 +127,92 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict):
         engine_fault_receiver.close(linger=0)
         sentinel.shutdown()
         ctx.term()
+
+
+@pytest.mark.parametrize("instruction", ["pause", "retry"])
+def test_engine_core_sentinel_handles_fault_tolerance_instructions(
+    instruction, addr_dict
+):
+    fault_signal_q: Queue = Queue()
+    busy_loop_active = threading.Event()
+    thread_excs: Queue = Queue()
+    cmd_q: Queue = Queue()
+
+    sentinel_identity = b"engine_sentinel_0"
+    sentinel = create_engine_core_sentinel(
+        fault_signal_q,
+        busy_loop_active,
+        addr_dict,
+        sentinel_identity=sentinel_identity,
+        cmd_q=cmd_q,
+    )
+
+    if instruction == "retry":
+        # Simulate that an exception is raised in the busy loop,
+        # so that engine is in pause state.
+        busy_loop_active.clear()
+        fault_signal_q.put(RuntimeError("Pretest exception to trigger pause"))
+        time.sleep(0.1)
+        assert not busy_loop_active.is_set()
+
+    # Simulate the worker waiting the command and replying with a success response.
+    def mock_worker_receiver(cmd_socket):
+        try:
+            if not cmd_socket.poll(timeout=2000):
+                pytest.fail("Timeout waiting for command from engine core sentinel")
+            parts = cmd_socket.recv_multipart()
+            # DEALER gets [empty_frame, msg_bytes]
+            _, msg_bytes = parts
+
+            ft_req = msgpack.decode(msg_bytes, type=FaultToleranceRequest)
+            assert ft_req.instruction == instruction
+            ft_res = FaultToleranceResult(request_id=ft_req.request_id, success=True)
+            cmd_socket.send_multipart([b"", msgpack.encode(ft_res)])
+        except Exception:
+            thread_excs.put(traceback.format_exc())
+
+    # Simulate sending fault tolerance request from client sentinel
+    param = {"timeout": 5}
+    if instruction == "pause":
+        param["soft_pause"] = False
+    elif instruction == "retry":
+        param["new_stateless_dp_group_port"] = 23456
+    # Build a FaultToleranceRequest and send as msgpack
+    req_id = str(uuid.uuid4())
+    ft_request = FaultToleranceRequest(
+        request_id=req_id, instruction=instruction, params=param
+    )
+
+    worker_ctx = zmq.Context()
+    worker_cmd_socket = worker_ctx.socket(zmq.DEALER)
+    worker_cmd_socket.setsockopt(zmq.IDENTITY, b"PP0_TP0")
+    worker_cmd_socket.connect(addr_dict["worker_cmd_addr"])
+    threading.Thread(
+        target=mock_worker_receiver, args=(worker_cmd_socket,), daemon=True
+    ).start()
+    time.sleep(0.1)
+
+    if instruction == "pause":
+        # Simulate that pause is executed by engine core
+        busy_loop_active.clear()
+        fault_signal_q.put(EngineLoopPausedError("Simulated pause for testing"))
+        ft_res = sentinel.handle_fault(ft_request)
+    elif instruction == "retry":
+        from unittest.mock import patch
+
+        # Mock busy_loop_active.wait to avoid blocking, since the busy loop
+        # isn't running in this test to consume the command and set the event.
+        with patch.object(busy_loop_active, "wait", return_value=True) as mock_wait:
+            ft_res = sentinel.handle_fault(ft_request)
+            # Verify that a command was put on the queue for the busy loop.
+            cmd_q.get(timeout=2)
+            mock_wait.assert_called()
+
+    assert ft_res.request_id == req_id
+    assert ft_res.success
+
+    time.sleep(0.1)
+    fail_on_thread_exceptions(thread_excs)
+    worker_cmd_socket.close()
+    sentinel.shutdown()
+    worker_ctx.term()

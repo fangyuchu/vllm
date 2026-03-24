@@ -5,6 +5,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 import msgspec
 import zmq
@@ -43,10 +44,42 @@ class FaultInfo(msgspec.Struct):
         )
 
 
+class FaultToleranceResult(msgspec.Struct):
+    """
+    Result of applying fault tolerance instructions.
+    """
+
+    request_id: str
+    success: bool
+    reason: str | None = None
+
+
+class FaultToleranceRequest(msgspec.Struct):
+    """
+    Request for fault tolerance instructions, used in the fault tolerance protocol.
+    """
+
+    request_id: str
+    instruction: str
+    params: dict[str, Any]
+
+    @classmethod
+    def builder(
+        cls, request_id: str, instruction: str, params: dict[str, Any]
+    ) -> "FaultToleranceRequest":
+        return cls(request_id=request_id, instruction=instruction, params=params)
+
+
 @dataclass
 class FaultToleranceZmqAddresses:
+    all_client_input_addresses: list[str]
+    all_client_output_addresses: list[str]
     # ZMQ fault_state_pub_socket address of client sentinel
     fault_state_pub_socket_addr: str
+    # ZMQ client_sentinel_request socket address of client sentinel
+    client_sentinel_request_addr: str
+    # ZMQ engine_core_sentinel_cmd socket address of engine_core sentinel
+    engine_core_sentinel_cmd_addr: str
     # ZMQ engine_fault socket address of EngineCoreSentinel
     engine_fault_socket_addr: str
     # Identities of engine core DEALER sockets, keyed by engine index.
@@ -55,11 +88,25 @@ class FaultToleranceZmqAddresses:
     engine_core_sentinel_identities: dict[int, bytes]
 
     @classmethod
-    def build(cls, host: str, dp_size: int, ft_config: FaultToleranceConfig):
+    def build(
+        cls,
+        host,
+        local_engines_only,
+        dp_size,
+        inputs,
+        outputs,
+        ft_config: FaultToleranceConfig,
+    ):
         engine_fault_socket_addr = get_engine_client_zmq_addr(
             local_only=False,
             host=host,
             port=ft_config.internal_fault_report_port,
+        )
+        client_sentinel_request_addr = get_engine_client_zmq_addr(
+            local_only=True, host=host
+        )
+        engine_core_sentinel_cmd_addr = get_engine_client_zmq_addr(
+            local_only=local_engines_only, host=host
         )
         identity_group = [str(uuid.uuid4()).encode("utf8") for _ in range(dp_size)]
         engine_core_sentinel_identities = {
@@ -72,14 +119,22 @@ class FaultToleranceZmqAddresses:
         )
         return cls(
             fault_state_pub_socket_addr=fault_state_pub_socket_addr,
+            client_sentinel_request_addr=client_sentinel_request_addr,
+            engine_core_sentinel_cmd_addr=engine_core_sentinel_cmd_addr,
             engine_fault_socket_addr=engine_fault_socket_addr,
             engine_core_sentinel_identities=engine_core_sentinel_identities,
+            all_client_input_addresses=inputs,
+            all_client_output_addresses=outputs,
         )
 
     def to_str(self) -> str:
         payload = {
             "fault_state_pub_socket_addr": self.fault_state_pub_socket_addr,
+            "client_sentinel_request_addr": self.client_sentinel_request_addr,
+            "engine_core_sentinel_cmd_addr": self.engine_core_sentinel_cmd_addr,
             "engine_fault_socket_addr": self.engine_fault_socket_addr,
+            "all_client_input_addresses": self.all_client_input_addresses,
+            "all_client_output_addresses": self.all_client_output_addresses,
             "engine_core_sentinel_identities": {
                 str(rank): identity.hex()
                 for rank, identity in self.engine_core_sentinel_identities.items()
@@ -95,7 +150,11 @@ class FaultToleranceZmqAddresses:
             for rank, identity_hex in payload["engine_core_sentinel_identities"].items()
         }
         return cls(
+            all_client_input_addresses=payload["all_client_input_addresses"],
+            all_client_output_addresses=payload["all_client_output_addresses"],
             fault_state_pub_socket_addr=payload["fault_state_pub_socket_addr"],
+            client_sentinel_request_addr=payload["client_sentinel_request_addr"],
+            engine_core_sentinel_cmd_addr=payload["engine_core_sentinel_cmd_addr"],
             engine_fault_socket_addr=payload["engine_fault_socket_addr"],
             engine_core_sentinel_identities=identities,
         )
