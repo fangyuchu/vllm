@@ -147,6 +147,7 @@ class CoreEngineProcManager:
 
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()
+        self.failed_proc_name: str | None = None
         self.vllm_config = vllm_config
         self.start_index = start_index
 
@@ -191,9 +192,7 @@ class CoreEngineProcManager:
                     proc = sentinel_to_proc.pop(cast(int, sentinel))
                     exitcode = proc.exitcode
                     if exitcode != 0 and not self.manager_stopped.is_set():
-                        logger.error(
-                            "Engine core proc %s died unexpectedly.", proc.name
-                        )
+                        self.failed_proc_name = proc.name
                     if enable_ft:
                         engine_rank = self.processes.index(proc)
                         notify_engine_down(
@@ -347,6 +346,7 @@ class CoreEngineActorManager:
         local_engine_count = vllm_config.parallel_config.data_parallel_size_local
         world_size = vllm_config.parallel_config.world_size
         self.manager_stopped = threading.Event()
+        self.failed_proc_name: str | None = None
 
         if vllm_config.fault_tolerance_config.enable_fault_tolerance:
             self.ctx, self.engine_down_socket = make_engine_down_report_socket(
@@ -908,7 +908,7 @@ class CoreEngineActorManager:
                     try:
                         ray.get(actor_ref)
                     except ray.exceptions.RayActorError:
-                        logger.error("Engine core actor died: %s", actor_ref)
+                        self.failed_proc_name = f"Actor {actor_ref}"
                         unexpected_failure = True
                         if enable_ft:
                             engine_rank = self.get_run_refs().index(actor_ref)
