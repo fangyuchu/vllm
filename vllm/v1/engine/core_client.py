@@ -399,15 +399,12 @@ class ClientSentinel(BaseSentinel):
         }
         self.core_client = core_client
 
-        self.descaled_core_engine_dicts: dict[bytes, Any] = {}
         self.descaled_core_engines_dict = {
             engine_identity: engine_index
             for engine_index, engine_identity in enumerate(
                 self.core_client.core_engines
             )
         }
-        self.core_engines = self.core_client.core_engines
-        self.engine_ranks_managed = self.core_client.engine_ranks_managed
 
         self.fault_receiver_socket = make_zmq_socket(
             ctx=self.ctx,
@@ -609,7 +606,7 @@ class ClientSentinel(BaseSentinel):
                 if idx == old_idx:
                     self.engine_identity_to_index[identity] = new_idx
 
-        self.descaled_core_engine_dicts = {
+        self.descaled_core_engines_dict = {
             engine_identity: original_to_new[engine_index]
             for engine_identity, engine_index in (
                 self.descaled_core_engines_dict.items()
@@ -617,14 +614,14 @@ class ClientSentinel(BaseSentinel):
             if engine_index in original_to_new
         }
 
-        self.core_engines = [
+        self.core_client.core_engines = [
             engine_identity
-            for engine_identity in self.core_engines
-            if engine_identity in self.descaled_core_engine_dicts
+            for engine_identity in self.core_client.core_engines
+            if engine_identity in self.descaled_core_engines_dict
         ]
 
-        _, self.engine_ranks_managed = get_mapping(
-            self.engine_ranks_managed, exclude_dp_ranks
+        _, self.core_client.engine_ranks_managed = get_mapping(
+            self.core_client.engine_ranks_managed, exclude_dp_ranks
         )
         scale_down_marker = msgspec.msgpack.encode(
             ("SCALE_ELASTIC_EP", len(original_to_new))
@@ -836,7 +833,6 @@ class MPClient(EngineCoreClient):
         log_stats: bool,
         client_addresses: dict[str, str] | None = None,
     ):
-        self.descaled_core_engine_dicts: dict[bytes, Any] = {}
         self.vllm_config = vllm_config
         # Serialization setup.
         self.encoder = MsgpackEncoder()
@@ -956,10 +952,7 @@ class MPClient(EngineCoreClient):
                 self.engine_status_dict: ThreadSafeDict[int, str] = ThreadSafeDict()
                 for engine_id in range(vllm_config.parallel_config.data_parallel_size):
                     self.engine_status_dict[engine_id] = "Healthy"
-                self.descaled_core_engines_dict = {
-                    engine_identity: engine_index
-                    for engine_index, engine_identity in enumerate(self.core_engines)
-                }
+
                 self.client_sentinel = ClientSentinel(
                     fault_receiver_addr=addresses.engine_fault_socket_addr,
                     cmd_addr=addresses.client_cmd_addr,
