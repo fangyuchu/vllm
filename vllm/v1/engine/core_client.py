@@ -406,7 +406,7 @@ class ClientSentinel(BaseSentinel):
                 self.core_client.core_engines
             )
         }
-        self.core_engines = self.core_client.core_engines
+
         self.engine_ranks_managed = self.core_client.engine_ranks_managed
 
         self.fault_receiver_socket = make_zmq_socket(
@@ -617,9 +617,9 @@ class ClientSentinel(BaseSentinel):
             if engine_index in original_to_new
         }
 
-        self.core_engines = [
+        self.core_client.core_engines = [
             engine_identity
-            for engine_identity in self.core_engines
+            for engine_identity in self.core_client.core_engines
             if engine_identity in self.descaled_core_engine_dicts
         ]
 
