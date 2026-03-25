@@ -556,9 +556,30 @@ class ClientSentinel(BaseSentinel):
             if self.engine_status_dict.get(index) != "Dead"
             and (exclude_engine_index is None or index not in exclude_engine_index)
         }
+        if "exclude_engine_index" in kwargs:
+            exclude_engine_index = kwargs["exclude_engine_index"]
+            if not isinstance(exclude_engine_index, list):
+                self.logger(
+                    f"[ERROR] Invalid type for 'exclude_engine_index'! "
+                    f"Expected list, "
+                    f"got {type(exclude_engine_index)}, value: {exclude_engine_index}"
+                )
+                return False
+        else:
+            exclude_engine_index = None
+        target_engines = {
+            identity
+            for identity, index in self.engine_identity_to_index.items()
+            if identity in alive_engines
+            and (
+                index not in exclude_engine_index
+                if exclude_engine_index is not None
+                else True
+            )
+        }
         success, _ = self._broadcast_command_to_downstream(
             "pause",
-            alive_engines,
+            target_engines,
             timeout=timeout,
             soft_pause=soft_pause,
         )
