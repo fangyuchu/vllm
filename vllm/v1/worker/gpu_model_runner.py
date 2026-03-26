@@ -858,6 +858,9 @@ class GPUModelRunner(
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
+        self.deep_ep_buffer = None
+        self.dp_mask: torch.Tensor = torch.empty(0, dtype=torch.int)
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         if self.speculative_config:
@@ -3763,6 +3766,10 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        if self.dp_mask.numel() > 0 and torch.any(self.dp_mask == 1):
+            ones_indices = torch.where(self.dp_mask == 1)[0].tolist()
+            raise RuntimeError(f"rank {ones_indices} is unhealthy")
+
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -4817,6 +4824,22 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+
+        if (
+            self.vllm_config.fault_tolerance_config.enable_fault_tolerance
+            and "deepep" in self.parallel_config.all2all_backend
+        ):
+            # TODO find a more elegant way to get deepep_buffer
+            for name, module in self.model.named_modules():
+                if hasattr(module, "experts"):
+                    pf = module.experts.quant_method.moe_kernel.prepare_finalize
+                    self.deep_ep_buffer = getattr(pf, "buffer", None)
+                    if self.deep_ep_buffer:
+                        self.dp_mask = torch.zeros(
+                            size=(self.deep_ep_buffer.group_size,), dtype=torch.int
+                        )
+                        self.deep_ep_buffer.low_latency_query_mask_buffer(self.dp_mask)
+                        break
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())

@@ -412,6 +412,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             num_rdma_bytes=num_rdma_bytes,
             low_latency_mode=True,
             num_qps_per_rank=num_qps_per_rank,
+            enable_shrink=True,
         )
         if not current_platform.is_rocm():
             kwargs.update(
