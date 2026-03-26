@@ -24,6 +24,32 @@ def engine_client(request: Request) -> EngineClient:
 
 router = APIRouter()
 
+SUPPORTED_FAULT_TOLERANCE_INSTRUCTIONS = {"pause", "retry"}
+
+
+def _validate_fault_tolerance_payload(body: dict):
+    instruction = body.get("instruction")
+    params = body.get("params")
+
+    if instruction is None or params is None:
+        raise HTTPException(
+            status_code=400, detail="'instruction' and 'params' is required."
+        )
+
+    if not isinstance(instruction, str):
+        raise HTTPException(status_code=400, detail="'instruction' must be a string.")
+
+    if instruction not in SUPPORTED_FAULT_TOLERANCE_INSTRUCTIONS:
+        raise HTTPException(status_code=400, detail="Invalid 'instruction' value.")
+
+    timeout = params.get("timeout")
+    if not isinstance(timeout, int) or timeout <= 0:
+        raise HTTPException(
+            status_code=400, detail="'timeout' must be a positive integer."
+        )
+
+    return instruction, params
+
 
 # todo: refine this endpoint
 @router.post(
@@ -42,61 +68,26 @@ async def process_fault_tolerance_instruction(raw_request: Request):
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail="Invalid JSON format") from e
 
+    instruction, params = _validate_fault_tolerance_payload(body)
+    ft_request = FaultToleranceRequest(str(uuid.uuid4()), instruction, params)
+
     client = engine_client(raw_request)
-
-    fault_tolerance_instruction = body.get("fault_tolerance_instruction")
-    fault_tolerance_timeout = body.get("fault_tolerance_timeout")
-    fault_tolerance_params = body.get("fault_tolerance_params", {})
-
-    if fault_tolerance_instruction is None or fault_tolerance_timeout is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Both 'fault_tolerance_instruction' and "
-            "'fault_tolerance_timeout' are required.",
-        )
-
-    if not isinstance(fault_tolerance_instruction, str):
-        raise HTTPException(
-            status_code=400, detail="'fault_tolerance_instruction' must be a string."
-        )
-    # Supported instructions: ["pause", "retry"].
-    # More instruction types may be added in future updates.
-    elif fault_tolerance_instruction not in ["pause", "retry"]:
-        raise HTTPException(
-            status_code=400, detail="Invalid 'fault_tolerance_instruction' value."
-        )
-
-    if not isinstance(fault_tolerance_timeout, int) or fault_tolerance_timeout <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="'fault_tolerance_timeout' must be a positive integer.",
-        )
     try:
-        fault_tolerance_params["timeout"] = fault_tolerance_timeout
-        ft_request = FaultToleranceRequest(
-            str(uuid.uuid4()), fault_tolerance_instruction, fault_tolerance_params
-        )
-
         ft_result = await client.handle_fault(ft_request)
-        success, reason = ft_result.success, ft_result.reason
-        if success:
-            return JSONResponse(
-                {
-                    "message": "Instruction executed successfully.",
-                }
-            )
-        else:
-            raise HTTPException(
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-                detail=f"Instruction execution failed. Reason: {reason}",
-            )
-
     except Exception as e:
         logger.error("Failed to handle fault: %s", e)
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
             detail="Failed to handle fault.",
         ) from e
+
+    if ft_result.success:
+        return JSONResponse({"message": "Instruction executed successfully."})
+
+    raise HTTPException(
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        detail=f"Instruction execution failed. Reason: {ft_result.reason}",
+    )
 
 
 @router.get("/fault_tolerance/status")
