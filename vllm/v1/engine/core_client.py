@@ -726,7 +726,6 @@ class ClientSentinel(BaseSentinel):
                 if fault_info.engine_identity == identity:
                     self.engine_status_dict[engine_index] = engine_status
             self.has_faulted = True
-            self.engine_status_dict[int(fault_info.engine_id)] = engine_status
             self.fault_pub_socket.send_string(
                 f"vllm_fault|{json.dumps(self.engine_status_dict.to_dict())}"
             )
