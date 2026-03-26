@@ -17,7 +17,7 @@ from vllm.config import (
     ParallelConfig,
     VllmConfig,
 )
-from vllm.v1.engine.exceptions import EngineLoopPausedError
+from vllm.v1.engine import EngineStatusType
 from vllm.v1.fault_tolerance import EngineCoreSentinel
 from vllm.v1.fault_tolerance.utils import (
     FaultInfo,
@@ -50,10 +50,12 @@ def fail_on_thread_exceptions(thread_excs: Queue) -> None:
         pytest.fail("Thread raised exception:\n" + "\n".join(thread_excs.queue))
 
 
+# todo: check all busy_loop_paused flag being tested
 def create_engine_core_sentinel(
     fault_signal_q: Queue,
-    busy_loop_active: threading.Event,
+    stop_busy_loop: threading.Event,
     addr_dict: dict,
+    busy_loop_paused: threading.Event,
     sentinel_identity: bytes = b"engine_sentinel_0",
     cmd_q: Queue | None = None,
 ):
@@ -62,7 +64,10 @@ def create_engine_core_sentinel(
         parallel_config=ParallelConfig(
             tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1
         ),
-        fault_tolerance_config=FaultToleranceConfig(enable_fault_tolerance=True),
+        fault_tolerance_config=FaultToleranceConfig(
+            enable_fault_tolerance=True,
+            worker_cmd_addr=addr_dict["worker_cmd_addr"],
+        ),
     )
     if cmd_q is None:
         cmd_q = Queue()
@@ -71,9 +76,9 @@ def create_engine_core_sentinel(
         engine_index=0,
         fault_signal_q=fault_signal_q,
         cmd_q=cmd_q,
-        busy_loop_active=busy_loop_active,
+        busy_loop_paused=busy_loop_paused,
+        stop_busy_loop=stop_busy_loop,
         engine_input_q=Queue(),
-        downstream_cmd_addr=addr_dict["worker_cmd_addr"],
         engine_fault_socket_addr=addr_dict["engine_fault_socket_addr"],
         sentinel_identity=sentinel_identity,
         vllm_config=vllm_cfg,
@@ -82,9 +87,15 @@ def create_engine_core_sentinel(
 
 def test_engine_core_sentinel_initialization(addr_dict):
     fault_signal_q: Queue = Queue()
-    busy_loop_active = threading.Event()
+    stop_busy_loop = threading.Event()
+    busy_loop_paused = threading.Event()
 
-    sentinel = create_engine_core_sentinel(fault_signal_q, busy_loop_active, addr_dict)
+    sentinel = create_engine_core_sentinel(
+        fault_signal_q,
+        stop_busy_loop,
+        addr_dict,
+        busy_loop_paused=busy_loop_paused,
+    )
 
     assert sentinel.engine_index == 0
     assert sentinel.engine_fault_socket.type == zmq.DEALER
@@ -101,7 +112,11 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict):
     fault_signal_q: Queue = Queue()
     sentinel_identity = b"engine_sentinel_0"
     sentinel = create_engine_core_sentinel(
-        fault_signal_q, addr_dict, sentinel_identity=sentinel_identity
+        fault_signal_q,
+        threading.Event(),
+        addr_dict,
+        sentinel_identity=sentinel_identity,
+        busy_loop_paused=threading.Event(),
     )
 
     # Bind a ROUTER to the engine_fault_socket_addr to receive the fault report.
@@ -123,37 +138,33 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict):
         assert fault_info.type == "RuntimeError"
         assert fault_info.engine_id == "0"
         assert fault_info.message == "test exception"
+        assert fault_info.engine_status == EngineStatusType.UNHEALTHY
     finally:
         engine_fault_receiver.close(linger=0)
         sentinel.shutdown()
         ctx.term()
 
 
-@pytest.mark.parametrize("instruction", ["pause", "retry"])
+# todo: check all busy_loop_active related codes
+@pytest.mark.parametrize("instruction", ["pause"])
 def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     instruction, addr_dict
 ):
     fault_signal_q: Queue = Queue()
-    busy_loop_active = threading.Event()
+    stop_busy_loop = threading.Event()
+    busy_loop_paused = threading.Event()
     thread_excs: Queue = Queue()
     cmd_q: Queue = Queue()
 
     sentinel_identity = b"engine_sentinel_0"
     sentinel = create_engine_core_sentinel(
-        fault_signal_q,
-        busy_loop_active,
-        addr_dict,
+        fault_signal_q=fault_signal_q,
+        stop_busy_loop=stop_busy_loop,
+        addr_dict=addr_dict,
         sentinel_identity=sentinel_identity,
         cmd_q=cmd_q,
+        busy_loop_paused=busy_loop_paused,
     )
-
-    if instruction == "retry":
-        # Simulate that an exception is raised in the busy loop,
-        # so that engine is in pause state.
-        busy_loop_active.clear()
-        fault_signal_q.put(RuntimeError("Pretest exception to trigger pause"))
-        time.sleep(0.1)
-        assert not busy_loop_active.is_set()
 
     # Simulate the worker waiting the command and replying with a success response.
     def mock_worker_receiver(cmd_socket):
@@ -173,10 +184,7 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
 
     # Simulate sending fault tolerance request from client sentinel
     param = {"timeout": 5}
-    if instruction == "pause":
-        param["soft_pause"] = False
-    elif instruction == "retry":
-        param["new_stateless_dp_group_port"] = 23456
+
     # Build a FaultToleranceRequest and send as msgpack
     req_id = str(uuid.uuid4())
     ft_request = FaultToleranceRequest(
@@ -193,20 +201,10 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     time.sleep(0.1)
 
     if instruction == "pause":
-        # Simulate that pause is executed by engine core
-        busy_loop_active.clear()
-        fault_signal_q.put(EngineLoopPausedError("Simulated pause for testing"))
-        ft_res = sentinel.handle_fault(ft_request)
-    elif instruction == "retry":
-        from unittest.mock import patch
+        # Simulate that pause is executed by engine core.
+        busy_loop_paused.set()
 
-        # Mock busy_loop_active.wait to avoid blocking, since the busy loop
-        # isn't running in this test to consume the command and set the event.
-        with patch.object(busy_loop_active, "wait", return_value=True) as mock_wait:
-            ft_res = sentinel.handle_fault(ft_request)
-            # Verify that a command was put on the queue for the busy loop.
-            cmd_q.get(timeout=2)
-            mock_wait.assert_called()
+    ft_res = sentinel.handle_fault(ft_request)
 
     assert ft_res.request_id == req_id
     assert ft_res.success

@@ -131,6 +131,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     world_size=self.world_size,
                     backend="gloo",
                     group_name=f"{self.unique_name}_cpu",
+                    listen_socket=socks[1] if socks else None,
                     fault_tolerance_config=fault_tolerance_config,
                 )
                 tcp_store_group = StatelessProcessGroup.create(

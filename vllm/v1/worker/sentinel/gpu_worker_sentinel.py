@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
-from collections.abc import Callable
 
 import msgspec
 import torch
@@ -11,7 +10,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 
 
 class WorkerSentinel(BaseSentinel):
@@ -19,7 +18,6 @@ class WorkerSentinel(BaseSentinel):
         self,
         vllm_config: VllmConfig,
         pause_event: threading.Event,
-        clear_input_batch_callback: Callable,
         device: torch.device,
     ):
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -31,12 +29,10 @@ class WorkerSentinel(BaseSentinel):
             vllm_config=vllm_config,
             identity=identity_str.encode(),
         )
-        self.clear_input_batch_callback = clear_input_batch_callback
         self.device = device
         self.pause_event = pause_event
         torch.accelerator.set_device_index(self.device)
 
-        # todo: check the relation of this addr with that in the FaultToleranceZmqAddr
         assert vllm_config.fault_tolerance_config.worker_cmd_addr is not None
         self.engine_core_cmd_socket = make_zmq_socket(
             self.ctx,
@@ -45,7 +41,6 @@ class WorkerSentinel(BaseSentinel):
             bind=False,
             identity=self.identity,
         )
-        # todo: check what is the need of this
         self.engine_core_cmd_socket.setsockopt(zmq.RCVTIMEO, 100)
 
         threading.Thread(
@@ -74,7 +69,9 @@ class WorkerSentinel(BaseSentinel):
             self.logger("Socket closed, terminating.")
             self.sentinel_dead = True
 
-    # todo: implement pause and retry
+    def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        self.pause_event.set()
+        return FaultToleranceResult(ft_request.request_id, True)
 
     def shutdown(self):
         close_sockets([self.engine_core_cmd_socket])

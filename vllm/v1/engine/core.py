@@ -851,8 +851,10 @@ class EngineCoreProc(EngineCore):
             ft_config = vllm_config.fault_tolerance_config
             self.enable_fault_tolerance = ft_config.enable_fault_tolerance
             if self.enable_fault_tolerance:
-                # Track whether the busy loop is currently active.
-                self.busy_loop_active = threading.Event()
+                # Track whether the busy loop should be stopped.
+                self.stop_busy_loop = threading.Event()
+                # Track whether the busy loop is paused.
+                self.busy_loop_paused = threading.Event()
                 # Queue for reporting EngineCore exceptions to EngineCoreSentinel.
                 self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
                 self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue()
@@ -863,19 +865,18 @@ class EngineCoreProc(EngineCore):
 
                 # The ZMQ address between engine_core_sentinel and worker_sentinel.
                 worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
-                # todo: at least put addr in vllm config and skip passing it explicitly
+                vllm_config.fault_tolerance_config.worker_cmd_addr = worker_cmd_addr
                 self.engine_core_sentinel = EngineCoreSentinel(
                     engine_index=self.engine_index,
                     fault_signal_q=self.fault_signal_q,
                     cmd_q=self.cmd_q,
-                    busy_loop_active=self.busy_loop_active,
+                    busy_loop_paused=self.busy_loop_paused,
+                    stop_busy_loop=self.stop_busy_loop,
                     engine_input_q=self.input_queue,
                     engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
-                    downstream_cmd_addr=worker_cmd_addr,
                     sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     vllm_config=vllm_config,
                 )
-                vllm_config.fault_tolerance_config.worker_cmd_addr = worker_cmd_addr
                 # Do not shut down the engine immediately upon failure.
                 executor_fail_callback = lambda: self.fault_signal_q.put(
                     RuntimeError(f"Executor on EngineCore {self.engine_index} failed.")
@@ -1173,12 +1174,10 @@ class EngineCoreProc(EngineCore):
         """Returns true if shutdown has not been requested."""
         return self.shutdown_state == EngineShutdownState.RUNNING
 
-    # todo:check how frequent should we check busy loop active or could we move it in
-    # handle shutdown
     @busy_loop_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
-        while self._handle_shutdown() and self._check_busy_loop_active():
+        while self._handle_shutdown() and self._ensure_busy_loop_running():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
@@ -1186,8 +1185,8 @@ class EngineCoreProc(EngineCore):
 
         raise SystemExit
 
-    def _check_busy_loop_active(self):
-        if self.enable_fault_tolerance and not self.busy_loop_active.is_set():
+    def _ensure_busy_loop_running(self):
+        if self.enable_fault_tolerance and self.stop_busy_loop.is_set():
             raise EngineLoopPausedError("Engine busy loop is paused.")
         return True
 
@@ -1771,7 +1770,7 @@ class DPEngineCoreProc(EngineCoreProc):
         """Core busy loop of the EngineCore for data parallel case."""
 
         # Loop until process is sent a SIGINT or SIGTERM
-        while self._handle_shutdown() and self._check_busy_loop_active():
+        while self._handle_shutdown() and self._ensure_busy_loop_running():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 

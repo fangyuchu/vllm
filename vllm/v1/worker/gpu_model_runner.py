@@ -3504,7 +3504,6 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        self._check_pause_event()
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -3556,6 +3555,7 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        self._check_pause_event()
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -3862,7 +3862,6 @@ class GPUModelRunner(
                     self.input_batch.num_computed_tokens_cpu[:num_reqs],
                     scheduler_output.num_common_prefix_blocks,
                 )
-
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4024,6 +4023,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            self._check_pause_event()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

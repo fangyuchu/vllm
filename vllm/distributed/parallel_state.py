@@ -336,13 +336,13 @@ class GroupCoordinator:
 
         self_device_group = None
         self_cpu_group = None
-        gloo_comm_timeout = None
+        gloo_comm_timeout_sec = None
         if (
             fault_tolerance_config is not None
             and fault_tolerance_config.enable_fault_tolerance
         ):
-            gloo_comm_timeout = timedelta(
-                seconds=fault_tolerance_config.gloo_comm_timeout
+            gloo_comm_timeout_sec = timedelta(
+                seconds=fault_tolerance_config.gloo_comm_timeout_sec
             )
 
         for ranks in group_ranks:
@@ -353,7 +353,7 @@ class GroupCoordinator:
             # processes through the CPU.
             with suppress_stdout():
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_comm_timeout
+                    ranks, backend="gloo", timeout=gloo_comm_timeout_sec
                 )
             if self.rank in ranks:
                 self.ranks = ranks
