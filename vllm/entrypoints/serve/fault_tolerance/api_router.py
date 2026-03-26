@@ -24,7 +24,7 @@ def engine_client(request: Request) -> EngineClient:
 
 router = APIRouter()
 
-SUPPORTED_FAULT_TOLERANCE_INSTRUCTIONS = {"pause", "retry"}
+SUPPORTED_FAULT_TOLERANCE_INSTRUCTIONS = {"pause"}
 
 
 def _validate_fault_tolerance_payload(body: dict):
@@ -33,7 +33,7 @@ def _validate_fault_tolerance_payload(body: dict):
 
     if instruction is None or params is None:
         raise HTTPException(
-            status_code=400, detail="'instruction' and 'params' is required."
+            status_code=400, detail="'instruction' and 'params' are required."
         )
 
     if not isinstance(instruction, str):
@@ -51,7 +51,6 @@ def _validate_fault_tolerance_payload(body: dict):
     return instruction, params
 
 
-# todo: refine this endpoint
 @router.post(
     "/fault_tolerance/apply",
     dependencies=[Depends(validate_json_request)],

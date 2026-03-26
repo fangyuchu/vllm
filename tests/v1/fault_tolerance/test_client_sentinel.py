@@ -9,10 +9,7 @@ import zmq
 from vllm.config import FaultToleranceConfig, VllmConfig
 from vllm.v1.engine import EngineStatusType
 from vllm.v1.fault_tolerance.client_sentinel import ClientSentinel
-from vllm.v1.fault_tolerance.utils import (
-    FaultInfo,
-    FaultToleranceRequest,
-)
+from vllm.v1.fault_tolerance.utils import FaultInfo, FaultToleranceRequest
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -35,11 +32,10 @@ def mock_vllm_config():
 def mock_ft_addresses():
     """Create mock FaultToleranceZmqAddresses object"""
     addresses = Mock()
-    addresses.all_client_input_addresses = ["tcp://127.0.0.1:5555"]
-    addresses.all_client_output_addresses = ["tcp://127.0.0.1:5556"]
+    addresses.ft_request_addresses = ["tcp://127.0.0.1:5555"]
+    addresses.ft_result_addresses = ["tcp://127.0.0.1:5556"]
     addresses.engine_fault_socket_addr = "tcp://127.0.0.1:5557"
     addresses.fault_state_pub_socket_addr = "tcp://127.0.0.1:5558"
-    addresses.ft_config = Mock(fault_state_pub_topic="vllm_fault")
     return addresses
 
 
@@ -91,7 +87,6 @@ def client_sentinel(mock_vllm_config, mock_ft_addresses, mock_call_utility_async
         sentinel = ClientSentinel(
             vllm_config=mock_vllm_config,
             fault_tolerance_addresses=mock_ft_addresses,
-            shutdown_callback=shutdown_callback,
             call_utility_async=mock_call_utility_async,
             core_engines=[b"engine_0", b"engine_1"],
         )
@@ -111,10 +106,9 @@ async def test_client_sentinel_initialization(client_sentinel: ClientSentinel):
     assert client_sentinel.start_rank == 0
     assert client_sentinel.fault_receiver_socket is not None
     assert client_sentinel.fault_state_pub_socket is not None
-    assert client_sentinel._shutdown_task is None
     # Verify ZMQ sockets are created
-    assert len(client_sentinel.input_sockets) == 1
-    assert len(client_sentinel.output_sockets) == 1
+    assert len(client_sentinel.ft_request_sockets) == 1
+    assert len(client_sentinel.ft_result_sockets) == 1
 
 
 @pytest.mark.asyncio
@@ -149,51 +143,6 @@ async def test_monitor_and_report_on_fault(client_sentinel: ClientSentinel):
 
 
 @pytest.mark.asyncio
-async def test_retry_success(client_sentinel: ClientSentinel, mock_call_utility_async):
-    """Test retry method (success scenario)"""
-    # Mock engine to return successful result
-    mock_call_utility_async.return_value = {
-        "request_id": "request_id",
-        "success": True,
-        "reason": "success",
-    }
-
-    # Execute retry
-    result = await client_sentinel.retry(timeout=5)
-
-    # Verify result
-    assert result is True
-    assert not client_sentinel.is_faulted.is_set()
-
-    # Verify call parameters
-    mock_call_utility_async.assert_awaited()
-    call_args = mock_call_utility_async.call_args[0]
-    assert call_args[0] == "handle_fault"
-    assert isinstance(call_args[1], FaultToleranceRequest)
-    assert call_args[1].instruction == "retry"
-    assert call_args[1].params["timeout"] == 5
-
-
-@pytest.mark.asyncio
-async def test_retry_failure(client_sentinel: ClientSentinel, mock_call_utility_async):
-    """Test retry method (failure scenario)"""
-    # Mock one engine to return failure
-    mock_call_utility_async.side_effect = [
-        {"success": True},
-        {"success": False, "reason": "engine dead"},
-    ]
-
-    # Mark one engine as DEAD first
-    client_sentinel.engine_status_dict[1] = {"status": EngineStatusType.DEAD}
-
-    # Execute retry
-    result = await client_sentinel.retry()
-
-    # Verify result
-    assert result is False
-
-
-@pytest.mark.asyncio
 async def test_pause_operation(
     client_sentinel: ClientSentinel, mock_call_utility_async
 ):
@@ -205,19 +154,26 @@ async def test_pause_operation(
         "reason": None,
     }
 
+    request = FaultToleranceRequest.builder(
+        request_id="request_id",
+        instruction="pause",
+        params={"timeout": 3},
+    )
+
     # Execute pause
-    result = await client_sentinel.pause(timeout=3, soft_pause=True)
+    result = await client_sentinel.pause(request)
 
     # Verify result
-    assert result is True
-    assert client_sentinel.engine_status_dict[0]["status"] == EngineStatusType.PAUSED
-    assert client_sentinel.engine_status_dict[1]["status"] == EngineStatusType.PAUSED
+    assert result.request_id == "request_id"
+    assert result.success is True
+    assert result.reason is None
 
     # Verify call parameters
-    call_args = mock_call_utility_async.call_args[0][1]
-    assert call_args.instruction == "pause"
-    assert call_args.params["timeout"] == 3
-    assert call_args.params["soft_pause"] is True
+    assert mock_call_utility_async.call_count == 2
+    for call in mock_call_utility_async.call_args_list:
+        assert call.args[0] == "handle_fault"
+        assert call.args[1] == request
+        assert call.kwargs["engine"] in {b"engine_0", b"engine_1"}
 
 
 @pytest.mark.asyncio
@@ -226,10 +182,14 @@ async def test_shutdown(client_sentinel: ClientSentinel):
     with patch("vllm.v1.fault_tolerance.client_sentinel.close_sockets") as mock_close:
         client_sentinel.shutdown()
 
-    mock_close.assert_called_once_with(
-        [
-            client_sentinel.fault_receiver_socket,
-            client_sentinel.fault_state_pub_socket,
-        ]
+    assert mock_close.call_count == 2
+    first_call_args = mock_close.call_args_list[0].args[0]
+    second_call_args = mock_close.call_args_list[1].args[0]
+    assert first_call_args == [
+        client_sentinel.fault_receiver_socket,
+        client_sentinel.fault_state_pub_socket,
+    ]
+    assert second_call_args == (
+        client_sentinel.ft_request_sockets + client_sentinel.ft_result_sockets
     )
     assert client_sentinel.sentinel_dead is True

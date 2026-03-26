@@ -42,7 +42,7 @@ class FaultToleranceConfig:
     """
     The timeout (in seconds) for gloo communication.
     """
-    # todo: check the need of this
+
     worker_cmd_addr: str | None = None
     """
     ZMQ address used by EngineCoreSentinel to dispatch instructions to 
