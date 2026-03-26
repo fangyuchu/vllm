@@ -576,7 +576,7 @@ def stateless_init_torch_distributed_process_group(
         fault_tolerance_config is not None
         and fault_tolerance_config.enable_fault_tolerance
     ):
-        timeout = timedelta(seconds=fault_tolerance_config.gloo_comm_timeout)
+        timeout = timedelta(seconds=fault_tolerance_config.gloo_comm_timeout_sec)
     if listen_socket is not None:
         store = create_tcp_store(
             host,

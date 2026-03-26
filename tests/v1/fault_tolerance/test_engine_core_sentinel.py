@@ -50,9 +50,10 @@ def fail_on_thread_exceptions(thread_excs: Queue) -> None:
         pytest.fail("Thread raised exception:\n" + "\n".join(thread_excs.queue))
 
 
+# todo: check all busy_loop_paused flag being tested
 def create_engine_core_sentinel(
     fault_signal_q: Queue,
-    busy_loop_active: threading.Event,
+    stop_busy_loop: threading.Event,
     addr_dict: dict,
     sentinel_identity: bytes = b"engine_sentinel_0",
     cmd_q: Queue | None = None,
@@ -71,7 +72,7 @@ def create_engine_core_sentinel(
         engine_index=0,
         fault_signal_q=fault_signal_q,
         cmd_q=cmd_q,
-        busy_loop_active=busy_loop_active,
+        stop_busy_loop=stop_busy_loop,
         engine_input_q=Queue(),
         downstream_cmd_addr=addr_dict["worker_cmd_addr"],
         engine_fault_socket_addr=addr_dict["engine_fault_socket_addr"],
@@ -82,9 +83,9 @@ def create_engine_core_sentinel(
 
 def test_engine_core_sentinel_initialization(addr_dict):
     fault_signal_q: Queue = Queue()
-    busy_loop_active = threading.Event()
+    stop_busy_loop = threading.Event()
 
-    sentinel = create_engine_core_sentinel(fault_signal_q, busy_loop_active, addr_dict)
+    sentinel = create_engine_core_sentinel(fault_signal_q, stop_busy_loop, addr_dict)
 
     assert sentinel.engine_index == 0
     assert sentinel.engine_fault_socket.type == zmq.DEALER
@@ -101,7 +102,10 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict):
     fault_signal_q: Queue = Queue()
     sentinel_identity = b"engine_sentinel_0"
     sentinel = create_engine_core_sentinel(
-        fault_signal_q, addr_dict, sentinel_identity=sentinel_identity
+        fault_signal_q,
+        threading.Event(),
+        addr_dict,
+        sentinel_identity=sentinel_identity,
     )
 
     # Bind a ROUTER to the engine_fault_socket_addr to receive the fault report.
@@ -129,19 +133,20 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict):
         ctx.term()
 
 
+# todo: check all busy_loop_active related codes
 @pytest.mark.parametrize("instruction", ["pause", "retry"])
 def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     instruction, addr_dict
 ):
     fault_signal_q: Queue = Queue()
-    busy_loop_active = threading.Event()
+    stop_busy_loop = threading.Event()
     thread_excs: Queue = Queue()
     cmd_q: Queue = Queue()
 
     sentinel_identity = b"engine_sentinel_0"
     sentinel = create_engine_core_sentinel(
         fault_signal_q,
-        busy_loop_active,
+        stop_busy_loop,
         addr_dict,
         sentinel_identity=sentinel_identity,
         cmd_q=cmd_q,
@@ -150,7 +155,8 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     if instruction == "retry":
         # Simulate that an exception is raised in the busy loop,
         # so that engine is in pause state.
-        busy_loop_active.clear()
+        # todo: change the flag
+        # busy_loop_active.clear()
         fault_signal_q.put(RuntimeError("Pretest exception to trigger pause"))
         time.sleep(0.1)
         assert not busy_loop_active.is_set()
@@ -194,7 +200,7 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
 
     if instruction == "pause":
         # Simulate that pause is executed by engine core
-        busy_loop_active.clear()
+        busy_loop_active.set()
         fault_signal_q.put(EngineLoopPausedError("Simulated pause for testing"))
         ft_res = sentinel.handle_fault(ft_request)
     elif instruction == "retry":

@@ -1056,7 +1056,6 @@ def init_worker_distributed_environment(
         local_rank,
         backend,
         timeout,
-        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
 
     ensure_model_parallel_initialized(

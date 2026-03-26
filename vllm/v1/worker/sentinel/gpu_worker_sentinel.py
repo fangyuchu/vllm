@@ -11,7 +11,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 
 
 class WorkerSentinel(BaseSentinel):
@@ -75,6 +75,13 @@ class WorkerSentinel(BaseSentinel):
             self.sentinel_dead = True
 
     # todo: implement pause and retry
+
+    def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        self.pause_event.set()
+        return FaultToleranceResult(ft_request.request_id, True)
+
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        pass
 
     def shutdown(self):
         close_sockets([self.engine_core_cmd_socket])

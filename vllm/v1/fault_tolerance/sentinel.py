@@ -63,21 +63,19 @@ class BaseSentinel(ABC):
 
     def _execute_cmd(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         method = ft_request.instruction
-        self.logger("Executing command: %s", ft_request, level="info")
         try:
-            success: bool = run_method(self, method, args=(), kwargs=ft_request.params)
-            self.logger("Command (%s) succeeded: %s", method, success, level="info")
-            reason = None
+            res = run_method(self, method, args=(ft_request,), kwargs={})
+            self.logger("Command (%s) succeeded: %s", method, res.success, level="info")
         except Exception as e:
-            self.logger("Error executing ft request: %s", ft_request, level="error")
-            success = False
-            reason = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-        return FaultToleranceResult(
-            success=success, request_id=ft_request.request_id, reason=reason
-        )
+            res = FaultToleranceResult(
+                ft_request.request_id,
+                False,
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+            )
+        return res
 
     @abstractmethod
-    def pause(self, timeout: int = 1, **kwargs) -> bool:
+    def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         """
         Pause the vLLM instance to enter fault-tolerance mode.
         This method should be called when a fault is detected. It pauses the
@@ -87,7 +85,7 @@ class BaseSentinel(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def retry(self, timeout: int = 1, **kwargs) -> bool:
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         """
         Retry execution after a transient recoverable fault.
         """

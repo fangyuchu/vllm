@@ -921,7 +921,6 @@ class AsyncMPClient(MPClient):
                 self.client_sentinel = ClientSentinel(
                     vllm_config=vllm_config,
                     fault_tolerance_addresses=ft_addr,
-                    shutdown_callback=self.shutdown,
                     call_utility_async=self._call_utility_async,
                     core_engines=self.core_engines,
                 )

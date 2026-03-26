@@ -35,8 +35,8 @@ def mock_vllm_config():
 def mock_ft_addresses():
     """Create mock FaultToleranceZmqAddresses object"""
     addresses = Mock()
-    addresses.all_client_input_addresses = ["tcp://127.0.0.1:5555"]
-    addresses.all_client_output_addresses = ["tcp://127.0.0.1:5556"]
+    addresses.ft_request_addresses = ["tcp://127.0.0.1:5555"]
+    addresses.ft_result_addresses = ["tcp://127.0.0.1:5556"]
     addresses.engine_fault_socket_addr = "tcp://127.0.0.1:5557"
     addresses.fault_state_pub_socket_addr = "tcp://127.0.0.1:5558"
     addresses.ft_config = Mock(fault_state_pub_topic="vllm_fault")
@@ -91,7 +91,6 @@ def client_sentinel(mock_vllm_config, mock_ft_addresses, mock_call_utility_async
         sentinel = ClientSentinel(
             vllm_config=mock_vllm_config,
             fault_tolerance_addresses=mock_ft_addresses,
-            shutdown_callback=shutdown_callback,
             call_utility_async=mock_call_utility_async,
             core_engines=[b"engine_0", b"engine_1"],
         )
@@ -111,10 +110,9 @@ async def test_client_sentinel_initialization(client_sentinel: ClientSentinel):
     assert client_sentinel.start_rank == 0
     assert client_sentinel.fault_receiver_socket is not None
     assert client_sentinel.fault_state_pub_socket is not None
-    assert client_sentinel._shutdown_task is None
     # Verify ZMQ sockets are created
-    assert len(client_sentinel.input_sockets) == 1
-    assert len(client_sentinel.output_sockets) == 1
+    assert len(client_sentinel.ft_request_sockets) == 1
+    assert len(client_sentinel.ft_result_sockets) == 1
 
 
 @pytest.mark.asyncio
