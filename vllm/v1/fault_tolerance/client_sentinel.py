@@ -155,7 +155,20 @@ class ClientSentinel(BaseSentinel):
                 "handle_fault", ft_request, engine=core_engine
             )
             coroutines.append(coro)
-        results = await asyncio.gather(*coroutines)
+
+        timeout = ft_request.params["timeout"]
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*coroutines),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            return FaultToleranceResult(
+                request_id=ft_request.request_id,
+                success=False,
+                reason=f"Timed out after {timeout}s waiting for engine responses.",
+            )
+
         results = [FaultToleranceResult(**res) for res in results]
         return FaultToleranceResult(
             request_id=ft_request.request_id,
@@ -193,7 +206,7 @@ class ClientSentinel(BaseSentinel):
                             "timeout": self.ft_config.gloo_comm_timeout_sec + 5,
                         },
                     )
-                    await self.pause(pause_request)
+                    asyncio.create_task(self.pause(pause_request))
 
         except zmq.ZMQError:
             self.logger("Fault receiver socket closed, stopping async monitor.")
