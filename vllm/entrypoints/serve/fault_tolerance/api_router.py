@@ -27,6 +27,7 @@ router = APIRouter()
 SUPPORTED_FAULT_TOLERANCE_INSTRUCTIONS = {"pause"}
 
 
+# todo: check how other api entrypoints validate the payload
 def _validate_fault_tolerance_payload(body: dict):
     instruction = body.get("instruction")
     params = body.get("params")
@@ -43,7 +44,7 @@ def _validate_fault_tolerance_payload(body: dict):
         raise HTTPException(status_code=400, detail="Invalid 'instruction' value.")
 
     timeout = params.get("timeout")
-    if not isinstance(timeout, int) or timeout <= 0:
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
         raise HTTPException(
             status_code=400, detail="'timeout' must be a positive integer."
         )

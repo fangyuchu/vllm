@@ -626,9 +626,6 @@ class EngineArgs:
     internal_fault_report_port: int = FaultToleranceConfig.internal_fault_report_port
     external_fault_notify_port: int = FaultToleranceConfig.external_fault_notify_port
     gloo_comm_timeout_sec: int = FaultToleranceConfig.gloo_comm_timeout_sec
-    shutdown_on_fault_tolerance_failure: bool = (
-        FaultToleranceConfig.shutdown_on_fault_tolerance_failure
-    )
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
@@ -1344,10 +1341,6 @@ class EngineArgs:
             **fault_tolerance_kwargs["enable_fault_tolerance"],
         )
         fault_tolerance_group.add_argument(
-            "--shutdown-on-fault-tolerance-failure",
-            **fault_tolerance_kwargs["shutdown_on_fault_tolerance_failure"],
-        )
-        fault_tolerance_group.add_argument(
             "--engine-recovery-timeout-sec",
             **fault_tolerance_kwargs["engine_recovery_timeout_sec"],
         )
@@ -1959,7 +1952,6 @@ class EngineArgs:
 
         fault_tolerance_config = FaultToleranceConfig(
             enable_fault_tolerance=self.enable_fault_tolerance,
-            shutdown_on_fault_tolerance_failure=self.shutdown_on_fault_tolerance_failure,
             engine_recovery_timeout_sec=self.engine_recovery_timeout_sec,
             internal_fault_report_port=self.internal_fault_report_port,
             external_fault_notify_port=self.external_fault_notify_port,

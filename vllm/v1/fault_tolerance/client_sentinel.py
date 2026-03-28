@@ -46,17 +46,13 @@ class ClientSentinel(BaseSentinel):
         self.sentinel_dead = False
         self.logger = self._make_logger()
 
+        # sockets to receive fault tolerance request from clients
         self.ft_request_sockets = [
-            make_zmq_socket(
-                self.ctx_async,
-                addr,
-                zmq.DEALER,
-                identity=self.identity,
-                bind=False,
-            )
+            make_zmq_socket(self.ctx_async, addr, zmq.DEALER, False, self.identity)
             for addr in fault_tolerance_addresses.ft_request_addresses
         ]
-
+        # todo reformat this
+        # sockets to send fault tolerance execution results back to clients
         self.ft_result_sockets = [
             make_zmq_socket(
                 self.ctx_async,
@@ -110,6 +106,7 @@ class ClientSentinel(BaseSentinel):
         call_id: int,
         result: FaultToleranceResult,
     ) -> None:
+        # todo:加个注释send execution result back to the client
         uo = UtilityOutput(call_id=call_id)
         uo.result = UtilityResult(result)
         outputs = FTUtilityOutputs(utility_output=uo)
@@ -118,6 +115,7 @@ class ClientSentinel(BaseSentinel):
 
     async def pause(self, ft_request: FaultToleranceRequest):  # type: ignore[override]
         """Expected params: timeout, exclude_engine_index (optional)."""
+        # todo: check what will happen if cast failed
         params = cast(PauseParams, ft_request.params)
         exclude_engine_index = params.get("exclude_engine_index")
 
@@ -203,9 +201,7 @@ class ClientSentinel(BaseSentinel):
                     pause_request = FaultToleranceRequest.builder(
                         request_id=str(uuid.uuid4()),
                         instruction="pause",
-                        params={
-                            "timeout": timeout,
-                        },
+                        params={"timeout": timeout},
                     )
                     asyncio.create_task(self.pause(pause_request))
 

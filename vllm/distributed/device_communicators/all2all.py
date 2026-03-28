@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -17,7 +18,6 @@ from vllm.utils.flashinfer import (
 )
 from vllm.utils.import_utils import has_deep_ep, has_mori
 
-from ...config import get_current_vllm_config
 from .base_device_communicator import All2AllManagerBase, Cache
 
 if has_flashinfer_nvlink_two_sided():
