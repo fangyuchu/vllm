@@ -33,7 +33,6 @@ class EngineCoreSentinel(BaseSentinel):
         self,
         engine_index: int,
         fault_signal_q: queue.Queue,
-        cmd_q: queue.Queue,
         busy_loop_paused: threading.Event,
         stop_busy_loop: threading.Event,
         engine_input_q: queue.Queue,
@@ -49,13 +48,9 @@ class EngineCoreSentinel(BaseSentinel):
         )
 
         self.fault_signal_q = fault_signal_q
-        self.cmd_q = cmd_q
         self.stop_busy_loop = stop_busy_loop
         self.busy_loop_paused = busy_loop_paused
         self.engine_input_q = engine_input_q
-        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
-        self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        self.dp_size = vllm_config.parallel_config.data_parallel_size
         assert vllm_config.fault_tolerance_config.worker_cmd_addr is not None
         self.worker_cmd_socket = make_zmq_socket(
             ctx=self.ctx,
@@ -67,8 +62,8 @@ class EngineCoreSentinel(BaseSentinel):
         self.worker_cmd_poller.register(self.worker_cmd_socket, zmq.POLLIN)
         self.worker_identities = [
             f"PP{pp_rank}_TP{tp_rank}".encode()
-            for tp_rank in range(self.tp_size)
-            for pp_rank in range(self.pp_size)
+            for tp_rank in range(vllm_config.parallel_config.tensor_parallel_size)
+            for pp_rank in range(vllm_config.parallel_config.pipeline_parallel_size)
         ]
 
         # Client <-> EngineCoreSentinel sockets

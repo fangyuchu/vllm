@@ -862,7 +862,10 @@ class GPUModelRunner(
         self.pause_event = threading.Event()
 
     def _check_pause_event(self):
-        if self.pause_event.is_set():
+        if (
+            self.vllm_config.fault_tolerance_config.enable_fault_tolerance
+            and self.pause_event.is_set()
+        ):
             raise EngineLoopPausedError("Worker is paused.")
 
     def update_max_model_len(self, max_model_len: int) -> None:

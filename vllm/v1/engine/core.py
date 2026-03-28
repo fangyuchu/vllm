@@ -861,7 +861,6 @@ class EngineCoreProc(EngineCore):
                 self.busy_loop_paused = threading.Event()
                 # Queue for reporting EngineCore exceptions to EngineCoreSentinel.
                 self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
-                self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue()
                 self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
                 assert addresses.fault_tolerance_addresses is not None
                 ft_addresses = addresses.fault_tolerance_addresses
@@ -873,7 +872,6 @@ class EngineCoreProc(EngineCore):
                 self.engine_core_sentinel = EngineCoreSentinel(
                     engine_index=self.engine_index,
                     fault_signal_q=self.fault_signal_q,
-                    cmd_q=self.cmd_q,
                     busy_loop_paused=self.busy_loop_paused,
                     stop_busy_loop=self.stop_busy_loop,
                     engine_input_q=self.input_queue,
