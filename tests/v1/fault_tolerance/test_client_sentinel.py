@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import msgspec.msgpack
@@ -174,6 +175,31 @@ async def test_pause_operation(
         assert call.args[0] == "handle_fault"
         assert call.args[1] == request
         assert call.kwargs["engine"] in {b"engine_0", b"engine_1"}
+
+
+@pytest.mark.asyncio
+async def test_pause_operation_timeout(
+    client_sentinel: ClientSentinel, mock_call_utility_async
+):
+    """Pause should fail if engine responses exceed request timeout."""
+
+    async def slow_response(*args, **kwargs):
+        await asyncio.sleep(0.1)
+        return {"request_id": "request_id", "success": True, "reason": None}
+
+    mock_call_utility_async.side_effect = slow_response
+
+    request = FaultToleranceRequest.builder(
+        request_id="request_id",
+        instruction="pause",
+        params={"timeout": 0.01},
+    )
+
+    result = await client_sentinel.pause(request)
+
+    assert result.request_id == "request_id"
+    assert result.success is False
+    assert result.reason == "Timed out after 0.01s waiting for engine responses."
 
 
 @pytest.mark.asyncio

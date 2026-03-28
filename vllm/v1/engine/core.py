@@ -802,6 +802,10 @@ class EngineCoreProc(EngineCore):
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        executor_fail_callback = lambda: self.input_queue.put_nowait(
+            (EngineCoreRequestType.EXECUTOR_FAILED, b"")
+        )
+
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
@@ -876,14 +880,6 @@ class EngineCoreProc(EngineCore):
                     engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
                     sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     vllm_config=vllm_config,
-                )
-                # Do not shut down the engine immediately upon failure.
-                executor_fail_callback = lambda: self.fault_signal_q.put(
-                    RuntimeError(f"Executor on EngineCore {self.engine_index} failed.")
-                )
-            else:
-                executor_fail_callback = lambda: self.input_queue.put_nowait(
-                    (EngineCoreRequestType.EXECUTOR_FAILED, b"")
                 )
 
             super().__init__(
@@ -1177,7 +1173,7 @@ class EngineCoreProc(EngineCore):
     @busy_loop_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
-        while self._handle_shutdown() and self._ensure_busy_loop_running():
+        while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
@@ -1223,9 +1219,10 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
-
+        self._ensure_busy_loop_running()
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        self._ensure_busy_loop_running()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -1770,7 +1767,7 @@ class DPEngineCoreProc(EngineCoreProc):
         """Core busy loop of the EngineCore for data parallel case."""
 
         # Loop until process is sent a SIGINT or SIGTERM
-        while self._handle_shutdown() and self._ensure_busy_loop_running():
+        while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
@@ -1793,7 +1790,9 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
+                self._ensure_busy_loop_running()
                 self.execute_dummy_batch()
+                self._ensure_busy_loop_running()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
