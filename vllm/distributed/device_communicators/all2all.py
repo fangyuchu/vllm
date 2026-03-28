@@ -17,6 +17,7 @@ from vllm.utils.flashinfer import (
 )
 from vllm.utils.import_utils import has_deep_ep, has_mori
 
+from ...config import get_current_vllm_config
 from .base_device_communicator import All2AllManagerBase, Cache
 
 if has_flashinfer_nvlink_two_sided():
@@ -406,12 +407,16 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         assert num_rdma_bytes is not None
         # TODO: remove platform-specific logic
         # once ROCm DeepEP is updated with the latest APIs.
+        enable_ft = (
+            get_current_vllm_config().fault_tolerance_config.enable_fault_tolerance
+        )
         kwargs = dict(
             group=self.cpu_group,
             num_nvl_bytes=num_nvl_bytes,
             num_rdma_bytes=num_rdma_bytes,
             low_latency_mode=True,
             num_qps_per_rank=num_qps_per_rank,
+            enable_shrink=enable_ft,
         )
         if not current_platform.is_rocm():
             kwargs.update(

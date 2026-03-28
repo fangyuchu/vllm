@@ -198,12 +198,13 @@ class ClientSentinel(BaseSentinel):
                     and status_enum != EngineStatusType.HEALTHY
                 ):
                     self.is_faulted.set()
-                    # todo: we may need to set this timeout value according to DeepEP
+                    # todo: Timeout for DeepEP kernel is fixed to 100 seconds
+                    timeout = max(100, self.ft_config.gloo_comm_timeout_sec) + 5
                     pause_request = FaultToleranceRequest.builder(
                         request_id=str(uuid.uuid4()),
                         instruction="pause",
                         params={
-                            "timeout": self.ft_config.gloo_comm_timeout_sec + 5,
+                            "timeout": timeout,
                         },
                     )
                     asyncio.create_task(self.pause(pause_request))
