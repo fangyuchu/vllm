@@ -24,31 +24,48 @@ def engine_client(request: Request) -> EngineClient:
 
 router = APIRouter()
 
-SUPPORTED_FAULT_TOLERANCE_INSTRUCTIONS = {"pause"}
+INSTRUCTION_PARAMS = {
+    "pause": {
+        "required": {"timeout": (int, float)},
+        "optional": {"exclude_engine_index": list},
+    }
+}
 
 
-# todo: check how other api entrypoints validate the payload
+def _validate_instruction_params(instruction: str, params: dict) -> None:
+    def _format_expected_type(expected_type: type | tuple[type, ...]) -> str:
+        if isinstance(expected_type, tuple):
+            return " | ".join(t.__name__ for t in expected_type)
+        return expected_type.__name__
+
+    rule = INSTRUCTION_PARAMS[instruction]
+    for key, expected_type in rule["required"].items():
+        expected_name = _format_expected_type(expected_type)
+        if key not in params or not isinstance(params[key], expected_type):
+            raise HTTPException(
+                400,
+                detail=f"Missing or invalid {key} value. Expected: {expected_name}.",
+            )
+    for key, expected_type in rule["optional"].items():
+        expected_name = _format_expected_type(expected_type)
+        if key in params and not isinstance(params[key], expected_type):
+            raise HTTPException(
+                400,
+                detail=f"Invalid {key} value. Expected: {expected_name}.",
+            )
+
+
 def _validate_fault_tolerance_payload(body: dict):
     instruction = body.get("instruction")
     params = body.get("params")
 
     if instruction is None or params is None:
-        raise HTTPException(
-            status_code=400, detail="'instruction' and 'params' are required."
-        )
+        raise HTTPException(400, detail="'instruction' and 'params' are required.")
 
-    if not isinstance(instruction, str):
-        raise HTTPException(status_code=400, detail="'instruction' must be a string.")
+    if instruction not in INSTRUCTION_PARAMS:
+        raise HTTPException(400, detail="Invalid 'instruction'.")
 
-    if instruction not in SUPPORTED_FAULT_TOLERANCE_INSTRUCTIONS:
-        raise HTTPException(status_code=400, detail="Invalid 'instruction' value.")
-
-    timeout = params.get("timeout")
-    if not isinstance(timeout, (int, float)) or timeout <= 0:
-        raise HTTPException(
-            status_code=400, detail="'timeout' must be a positive integer."
-        )
-
+    _validate_instruction_params(instruction, params)
     return instruction, params
 
 

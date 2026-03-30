@@ -57,7 +57,6 @@ def create_engine_core_sentinel(
     addr_dict: dict,
     busy_loop_paused: threading.Event,
     sentinel_identity: bytes = b"engine_sentinel_0",
-    cmd_q: Queue | None = None,
 ):
     vllm_cfg = VllmConfig(
         device_config=DeviceConfig("cpu"),
@@ -69,13 +68,10 @@ def create_engine_core_sentinel(
             worker_cmd_addr=addr_dict["worker_cmd_addr"],
         ),
     )
-    if cmd_q is None:
-        cmd_q = Queue()
 
     return EngineCoreSentinel(
         engine_index=0,
         fault_signal_q=fault_signal_q,
-        cmd_q=cmd_q,
         busy_loop_paused=busy_loop_paused,
         stop_busy_loop=stop_busy_loop,
         engine_input_q=Queue(),
@@ -154,7 +150,6 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
     stop_busy_loop = threading.Event()
     busy_loop_paused = threading.Event()
     thread_excs: Queue = Queue()
-    cmd_q: Queue = Queue()
 
     sentinel_identity = b"engine_sentinel_0"
     sentinel = create_engine_core_sentinel(
@@ -162,7 +157,6 @@ def test_engine_core_sentinel_handles_fault_tolerance_instructions(
         stop_busy_loop=stop_busy_loop,
         addr_dict=addr_dict,
         sentinel_identity=sentinel_identity,
-        cmd_q=cmd_q,
         busy_loop_paused=busy_loop_paused,
     )
 

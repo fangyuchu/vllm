@@ -1283,6 +1283,7 @@ class EngineCoreProc(EngineCore):
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.WAKEUP:
+            self._ensure_busy_loop_running()
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request

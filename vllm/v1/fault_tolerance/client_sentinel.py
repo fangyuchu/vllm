@@ -3,11 +3,9 @@
 import asyncio
 import uuid
 from collections.abc import Callable
-from typing import TypedDict, cast
 
 import msgspec.msgpack
 import zmq.asyncio
-from typing_extensions import NotRequired
 
 from vllm.config import VllmConfig
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
@@ -21,11 +19,6 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceZmqAddresses,
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
-
-
-class PauseParams(TypedDict, total=False):
-    exclude_engine_index: NotRequired[list[int]]
-    timeout: float | int
 
 
 class ClientSentinel(BaseSentinel):
@@ -51,7 +44,6 @@ class ClientSentinel(BaseSentinel):
             make_zmq_socket(self.ctx_async, addr, zmq.DEALER, False, self.identity)
             for addr in fault_tolerance_addresses.ft_request_addresses
         ]
-        # todo reformat this
         # sockets to send fault tolerance execution results back to clients
         self.ft_result_sockets = [
             make_zmq_socket(
@@ -106,7 +98,7 @@ class ClientSentinel(BaseSentinel):
         call_id: int,
         result: FaultToleranceResult,
     ) -> None:
-        # todo:加个注释send execution result back to the client
+        # Return the fault-tolerance execution result to the originating client.
         uo = UtilityOutput(call_id=call_id)
         uo.result = UtilityResult(result)
         outputs = FTUtilityOutputs(utility_output=uo)
@@ -115,9 +107,7 @@ class ClientSentinel(BaseSentinel):
 
     async def pause(self, ft_request: FaultToleranceRequest):  # type: ignore[override]
         """Expected params: timeout, exclude_engine_index (optional)."""
-        # todo: check what will happen if cast failed
-        params = cast(PauseParams, ft_request.params)
-        exclude_engine_index = params.get("exclude_engine_index")
+        exclude_engine_index = ft_request.params.get("exclude_engine_index")
 
         # Pause all engines except ones already marked dead or being excluded.
         target_engines = [
@@ -241,6 +231,7 @@ class ClientSentinel(BaseSentinel):
                 if not events:
                     continue
                 for sock, event in events:
+                    # Receive a client FT request, execute it, and route the result back
                     _, *msg = await sock.recv_multipart(copy=False)
                     client_index, call_id, _, ft_args = generic_decoder.decode(msg)
                     ft_request = FaultToleranceRequest(**ft_args[0])
