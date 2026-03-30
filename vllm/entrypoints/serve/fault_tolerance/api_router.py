@@ -5,6 +5,7 @@
 import json
 import uuid
 from http import HTTPStatus
+from typing import TypeAlias
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -24,7 +25,8 @@ def engine_client(request: Request) -> EngineClient:
 
 router = APIRouter()
 
-INSTRUCTION_PARAMS = {
+ParamType: TypeAlias = type | tuple[type, ...]
+INSTRUCTION_PARAMS: dict[str, dict[str, dict[str, ParamType]]] = {
     "pause": {
         "required": {"timeout": (int, float)},
         "optional": {"exclude_engine_index": list},

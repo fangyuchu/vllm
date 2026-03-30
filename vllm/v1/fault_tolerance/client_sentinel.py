@@ -116,8 +116,10 @@ class ClientSentinel(BaseSentinel):
             if status["status"] != "dead"
             and (exclude_engine_index is None or i not in exclude_engine_index)
         ]
-
-        return await self._execute_cmd_on_engines(ft_request, target_engines)
+        res = await self._execute_cmd_on_engines(ft_request, target_engines)
+        if res.success:
+            self.logger("vLLM instance is paused and waiting for recovery commands.")
+        return res
 
     async def _pub_engine_status(self):
         engine_status = self.engine_status_dict.copy()

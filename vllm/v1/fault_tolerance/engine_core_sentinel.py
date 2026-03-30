@@ -209,8 +209,9 @@ def busy_loop_wrapper(busy_loop_func):
                     self.busy_loop_paused.set()
                     self.fault_signal_q.put(original_exc)
                     logger.warning(
-                        "[BusyLoopWrapper] EngineCore busy loop raised an exception. "
-                        "Suspended and waiting for fault tolerance instructions."
+                        "[BusyLoopWrapper] EngineCore busy loop raised a %s exception. "
+                        "Suspended and waiting for fault tolerance instructions.",
+                        type(original_exc).__name__,
                     )
                     # todo: Currently only wait a certain time before shutting
                     #  down the engine. Will implement fault tolerance methods
