@@ -12,17 +12,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch.distributed import (
-    P2POp,
     ProcessGroup,
     all_gather,
-    batch_isend_irecv,
-    get_global_rank,
 )
 
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
+from vllm.distributed.parallel_state import get_ep_group
 
 @dataclass
 class RecvMetadata:
@@ -157,6 +151,7 @@ def move_to_buffer(
     expert_weights_buffers: Sequence[torch.Tensor],
     cuda_stream: torch.cuda.Stream | None,
     ep_group: ProcessGroup,
+    layer_idx: int | None = None,
 ) -> MoveToBufferResult:
     """
     Rearranges expert weights during EPLB rebalancing.
@@ -171,6 +166,7 @@ def move_to_buffer(
         expert_weights_buffers: Intermediate buffers (one per tensor).
         cuda_stream: CUDA stream for async copies (can be None for sync mode).
         ep_group: Distributed process group for expert parallel comms.
+        layer_idx: MoE layer index for debug logs (optional).
 
     Returns:
         is_unchanged (np.ndarray): (num_local_experts,), True where an expert row
@@ -248,11 +244,15 @@ def move_to_buffer(
                 for w, b in zip(expert_weights, expert_weights_buffers):
                     b[dst].copy_(w[src_local], non_blocking=True)
 
-    p2p_ops: list[P2POp] = []
+    p2p_ops: list[tuple[str, torch.Tensor, int]] = []
 
-    # Pre-compute global ranks mapping
+    ep_coord = get_ep_group()
     ep_size = ep_group.size()
-    rank_to_global = {rank: get_global_rank(ep_group, rank) for rank in range(ep_size)}
+    if len(ep_coord.ranks) != ep_size:
+        raise RuntimeError(
+            f"EP group size mismatch: ep_group.size()={ep_size}, "
+            f"len(get_ep_group().ranks)={len(ep_coord.ranks)}"
+        )
 
     # 2. Post sends
     if send_count > 0:
@@ -284,13 +284,8 @@ def move_to_buffer(
             if recver_pos < len(ranks_to_recv):
                 recv_ranks.append(ranks_to_recv[recver_pos])
             for dst in recv_ranks:
-                dst_global = rank_to_global[dst]
                 p2p_ops += [
-                    P2POp(
-                        torch.distributed.isend,
-                        w[src],
-                        dst_global,
-                    )
+                    ("send", w[src], int(dst))
                     for w in expert_weights
                 ]
 
@@ -321,26 +316,37 @@ def move_to_buffer(
                 src = ranks_to_send[recver_pos // num_dst_per_sender]
             else:
                 src = ranks_to_send[recver_pos - remainder_start]
-            src_global = rank_to_global[src]
             p2p_ops += [
-                P2POp(
-                    torch.distributed.irecv,
-                    b[dst],
-                    src_global,
-                )
+                ("recv", b[dst], int(src))
                 for b in expert_weights_buffers
             ]
 
     # 4. Execute the P2P operations. The real communication happens here.
-    if p2p_ops and cuda_stream is not None:
-        with torch.cuda.stream(cuda_stream):
-            reqs = batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
-    elif p2p_ops:
-        reqs = batch_isend_irecv(p2p_ops)
+    def _execute_p2p_ops() -> None:
+        reqs = []
+        for op_kind, tensor, peer in p2p_ops:
+            if op_kind == "send":
+                req = torch.distributed.isend(
+                    tensor,
+                    group=ep_group,
+                    group_dst=peer,
+                )
+            else:
+                req = torch.distributed.irecv(
+                    tensor,
+                    group=ep_group,
+                    group_src=peer,
+                )
+            if req is not None:
+                reqs.append(req)
         for req in reqs:
             req.wait()
+
+    if p2p_ops and cuda_stream is not None:
+        with torch.cuda.stream(cuda_stream):
+            _execute_p2p_ops()
+    elif p2p_ops:
+        _execute_p2p_ops()
     # wait for the communication to finish
     return (
         is_unchanged,
@@ -428,9 +434,29 @@ def move_from_buffer(
     matched_dst_rows = dup_dst_rows[valid]
     matched_src_rows = prim_dsts_sorted[pos[valid]]
 
+    if matched_dst_rows.size > 0:
+        dst_min = int(matched_dst_rows.min())
+        dst_max = int(matched_dst_rows.max())
+        src_min = int(matched_src_rows.min())
+        src_max = int(matched_src_rows.max())
+        if (
+            dst_min < 0
+            or dst_max >= num_local_experts
+            or src_min < 0
+            or src_max >= num_local_experts
+        ):
+            raise RuntimeError(
+                "Invalid duplicate row mapping in move_from_buffer: "
+                f"dst_rows={matched_dst_rows[:16].tolist()}, "
+                f"src_rows={matched_src_rows[:16].tolist()}, "
+                f"num_local_experts={num_local_experts}, "
+                f"ep_rank={ep_rank}, "
+                f"recv_count={recv_count}"
+            )
+
     for dst, src in zip(matched_dst_rows.tolist(), matched_src_rows.tolist()):
-        for w in expert_weights:
-            w[dst].copy_(w[src], non_blocking=True)
+        for w, b in zip(expert_weights, expert_weights_buffers):
+            w[dst].copy_(b[src], non_blocking=True)
 
 
 async def transfer_layer(
@@ -503,6 +529,7 @@ async def transfer_layer(
         expert_weights_buffers=expert_weights_buffer,
         cuda_stream=cuda_stream,
         ep_group=ep_group,
+        layer_idx=layer,
     )
     return is_unchanged, is_received_locally, recv_metadata
 
@@ -595,6 +622,7 @@ def rearrange_expert_weights_inplace(
             expert_weights_buffers=weights_buffer,
             cuda_stream=None,
             ep_group=ep_group,
+            layer_idx=layer_idx,
         )
 
         move_from_buffer(

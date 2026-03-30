@@ -224,6 +224,16 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
         slots_per_gpu = num_phy_experts // num_ranks
         num_layers = phy2log.shape[0]
 
+        # Skip slot preservation when EP world size or physical layout changed
+        # (e.g. elastic scale-up): old_phy2log may be too narrow to slice by the
+        # new per-rank partition, which would yield empty old_local and crash.
+        if old_phy2log.shape[1] != phy2log.shape[1]:
+            return phy2log, phy_replicas_idx
+        for gpu_idx in range(num_ranks):
+            end = (gpu_idx + 1) * slots_per_gpu
+            if end > old_phy2log.shape[1]:
+                return phy2log, phy_replicas_idx
+
         post_phy2log = phy2log.copy()
         post_phy_replicas_idx = phy_replicas_idx.copy()
 

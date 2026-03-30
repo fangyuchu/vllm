@@ -321,10 +321,25 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
+        from vllm.config import get_current_vllm_config
+
+        config = get_current_vllm_config()
+
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            if (
+                config.parallel_config.enable_stateless_pg
+                and len(ranks) > 1
+                and self.rank in ranks
+            ):
+                # only DP and EP are currently supported.
+                self.stateless_backend = torch_distributed_backend
+                device_group = config.parallel_config.stateless_init_dp_group(
+                    backend=self.stateless_backend
+                )
+            else:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
@@ -986,10 +1001,43 @@ class GroupCoordinator:
 
     def destroy(self):
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
+            # Detect stateless process groups: they are not registered in PyTorch's
+            # global world group map; use stateless_destroy_torch_distributed_process_group()
+            # or shutdown() directly.
+            if hasattr(self, "stateless_backend"):
+                # Stateless process group: use the dedicated destroy path.
+                from vllm.distributed.utils import stateless_destroy_torch_distributed_process_group
+                try:
+                    stateless_destroy_torch_distributed_process_group(self.device_group)
+                except Exception as e:
+                    # If destroy fails, fall back to shutdown().
+                    logger.warning(
+                        "Failed to destroy stateless process group using stateless_destroy: %s. "
+                        "Trying shutdown() instead.",
+                        e,
+                    )
+                    try:
+                        self.device_group.shutdown()
+                    except Exception:
+                        pass
+            else:
+                # Standard process group: use PyTorch destroy.
+                try:
+                    torch.distributed.destroy_process_group(self.device_group)
+                except ValueError as e:
+                    # Group may already be invalid or destroyed; log and continue.
+                    logger.warning(
+                        "Failed to destroy process group (may already be destroyed): %s", e
+                    )
             del self.device_group
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
+            try:
+                torch.distributed.destroy_process_group(self.cpu_group)
+            except ValueError as e:
+                # Group may already be invalid or destroyed; log and continue.
+                logger.warning(
+                    "Failed to destroy CPU process group (may already be destroyed): %s", e
+                )
             del self.cpu_group
         if self.device_communicator is not None:
             self.device_communicator.destroy()
@@ -1467,7 +1515,14 @@ def ensure_model_parallel_initialized(
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
     values if the model parallel groups are initialized.
     """
-    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config()
+    if backend is None:
+        if config.parallel_config.enable_stateless_pg:
+            backend = get_world_group().stateless_backend
+        else:
+            backend = torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
             tensor_model_parallel_size,
