@@ -606,6 +606,7 @@ class Platform:
         group_rank: int,
         group_size: int,
         timeout: timedelta,
+        **kwargs,
     ) -> "ProcessGroup":
         """
         Init platform-specific torch distributed process group.

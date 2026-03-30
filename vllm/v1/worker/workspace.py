@@ -66,6 +66,23 @@ class WorkspaceManager:
                 ],
             )
 
+    def unlock(self) -> None:
+        """Unlock the workspace to allow further growth.
+
+        This is useful during reconfiguration (e.g., External LB scale-up)
+        when workspace needs to be resized for warmup/profiling.
+        """
+        self._locked = False
+        if envs.VLLM_DEBUG_WORKSPACE:
+            logger.info(
+                "[WORKSPACE DEBUG] Workspace unlocked. Current sizes: %s",
+                [
+                    self._workspace_size_bytes(ws) / _MB
+                    for ws in self._current_workspaces
+                    if ws is not None
+                ],
+            )
+
     def is_locked(self) -> bool:
         """Check if workspace is locked."""
         return self._locked
@@ -240,6 +257,22 @@ def lock_workspace() -> None:
         # Now all get_workspace calls must fit in pre-allocated size
     """
     current_workspace_manager().lock()
+
+
+def unlock_workspace() -> None:
+    """Unlock the workspace to allow further growth.
+
+    This is useful during reconfiguration (e.g., External LB scale-up)
+    when workspace needs to be resized for warmup/profiling.
+
+    Example:
+        # During reconfiguration
+        unlock_workspace()
+        # Now workspace can grow if needed
+        compile_or_warm_up_model()
+        lock_workspace()
+    """
+    current_workspace_manager().unlock()
 
 
 def reset_workspace_manager() -> None:

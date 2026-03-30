@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -478,6 +479,8 @@ class MPClient(EngineCoreClient):
             self.engines_running = False
 
             self.stats_update_address: str | None = None
+            self.coordinator_input_address: str | None = None
+            self.coordinator_output_address: str | None = None
             if client_addresses:
                 # Engines are managed externally to this client.
                 input_address = client_addresses["input_address"]
@@ -500,6 +503,7 @@ class MPClient(EngineCoreClient):
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
                     )
+                    self.coordinator_input_address, self.coordinator_output_address = coordinator.get_engine_socket_addresses()
 
             # Create input and output sockets.
             self.input_socket = self.resources.input_socket = make_zmq_socket(
@@ -1183,6 +1187,395 @@ class DPAsyncMPClient(AsyncMPClient):
 
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine
+
+    async def start_handshake_listener_if_needed(self, new_data_parallel_size: int | None = None):
+        """On rank 0, start the long-running handshake listener if not already running."""
+        if self.vllm_config.parallel_config.data_parallel_rank != 0:
+            return
+
+        # Skip if listener task is already running.
+        if hasattr(self, "_handshake_listener_task") and self._handshake_listener_task is not None:
+            if not self._handshake_listener_task.done():
+                # Refresh target DP size while the task is active.
+                if new_data_parallel_size is not None:
+                    self._target_data_parallel_size = new_data_parallel_size
+                return
+
+        # Persist target data_parallel_size when provided.
+        if new_data_parallel_size is not None:
+            self._target_data_parallel_size = new_data_parallel_size
+
+        # Start listener task.
+        self._handshake_listener_task = asyncio.create_task(
+            self._listen_for_new_ranks()
+        )
+        logger.info("Started handshake listener task for new ranks")
+    
+    def _handshake_recv_from_identity(
+        self,
+        handshake_socket: zmq.Socket,
+        poller: zmq.Poller,
+        expected_identity: bytes,
+        deadline: float,
+    ) -> bytes:
+        """On ROUTER, take the next frame only from expected_identity; queue others to avoid mismatch."""
+        if not hasattr(self, "_handshake_deferred_multipart"):
+            self._handshake_deferred_multipart: list[list[bytes]] = []
+        deferred = self._handshake_deferred_multipart
+
+        while time.time() < deadline:
+            for i, parts in enumerate(deferred):
+                if parts[0] == expected_identity:
+                    matched = deferred.pop(i)
+                    return matched[-1] if len(matched) > 2 else matched[1]
+
+            events = poller.poll(timeout=1000)
+            if not events:
+                continue
+            parts = handshake_socket.recv_multipart()
+            if parts[0] == expected_identity:
+                return parts[-1] if len(parts) > 2 else parts[1]
+            deferred.append(parts)
+            logger.debug(
+                "Deferred handshake frame from other identity (len=%d)",
+                len(parts[0]),
+            )
+
+        raise TimeoutError(
+            f"Timed out waiting for READY from identity {expected_identity!r}"
+        )
+
+    def _pop_handshake_multipart(
+        self,
+        handshake_socket: zmq.Socket,
+        poller: zmq.Poller,
+    ) -> list[bytes] | None:
+        """Next ROUTER multipart frame from deferred queue or socket; None on poll timeout."""
+        if not hasattr(self, "_handshake_deferred_multipart"):
+            self._handshake_deferred_multipart: list[list[bytes]] = []
+        deferred = self._handshake_deferred_multipart
+        if deferred:
+            return deferred.pop(0)
+        events = poller.poll(timeout=1000)
+        if not events:
+            return None
+        return handshake_socket.recv_multipart()
+
+    async def _listen_for_new_ranks(self):
+        """Listen for handshake HELLO/READY from new ranks (rank 0 only)."""
+        from vllm.v1.utils import get_engine_client_zmq_addr
+        from vllm.v1.engine.utils import EngineHandshakeMetadata, EngineZmqAddresses
+
+        if not hasattr(self, "_handshake_deferred_multipart"):
+            self._handshake_deferred_multipart: list[list[bytes]] = []
+
+        # Handshake address: tcp://<master_ip>:<data_parallel_rpc_port>
+        # Uses data_parallel_rpc_port (default 29550), not data_parallel_master_port.
+        handshake_address = get_engine_client_zmq_addr(
+            False,  # handshake_local_only
+            self.vllm_config.parallel_config.data_parallel_master_ip,
+            self.vllm_config.parallel_config.data_parallel_rpc_port,  # default 29550
+        )
+
+        # Synchronous ZMQ context/socket (ROUTER must bind here).
+        sync_ctx = zmq.Context()
+        handshake_socket = make_zmq_socket(
+            sync_ctx, handshake_address, zmq.ROUTER, bind=True
+        )
+
+        poller = zmq.Poller()
+        poller.register(handshake_socket, zmq.POLLIN)
+
+        # Idle timeout (e.g. exit ~5 minutes after scale-up completes).
+        timeout_seconds = 300
+        start_time = time.time()
+
+        logger.info(
+            f"Handshake listener started on {handshake_address}, "
+            f"will timeout after {timeout_seconds} seconds"
+        )
+
+        def _send_init_to_new_rank(
+            eng_identity: bytes,
+            eng_index: int,
+            effective_dp_size: int,
+        ) -> None:
+            addresses = EngineZmqAddresses(
+                inputs=[],
+                outputs=[],
+                frontend_stats_publish_address=self.stats_update_address,
+                coordinator_input=self.coordinator_input_address,
+                coordinator_output=self.coordinator_output_address,
+            )
+            parallel_config = self.vllm_config.parallel_config
+            init_parallel_config = {
+                "data_parallel_master_ip": parallel_config.data_parallel_master_ip,
+                "data_parallel_master_port": parallel_config.data_parallel_master_port,
+                "data_parallel_size": effective_dp_size,
+            }
+            init_parallel_config["_data_parallel_master_port_list"] = []
+            logger.info(
+                "Sending INIT to new rank %s with parallel config: "
+                "master_ip=%s, master_port=%s, data_parallel_size=%s",
+                eng_index,
+                init_parallel_config["data_parallel_master_ip"],
+                init_parallel_config["data_parallel_master_port"],
+                init_parallel_config["data_parallel_size"],
+            )
+            init_message = msgspec.msgpack.encode(
+                EngineHandshakeMetadata(
+                    addresses=addresses,
+                    parallel_config=init_parallel_config,
+                )
+            )
+            handshake_socket.send_multipart((eng_identity, init_message))
+
+        try:
+            while True:
+                # Idle timeout check.
+                if time.time() - start_time > timeout_seconds:
+                    logger.info("Handshake listener timeout, exiting")
+                    break
+
+                current_dp_size = self.vllm_config.parallel_config.data_parallel_size
+                target_dp_size = getattr(self, "_target_data_parallel_size", None)
+                effective_dp_size = (
+                    target_dp_size if target_dp_size is not None else current_dp_size
+                )
+                ready_deadline = start_time + timeout_seconds
+
+                # Multi-rank scale-up: send INIT to every expected new rank first, then
+                # wait for READY from each. Otherwise ranks that got INIT early block in
+                # process-group rendezvous while the listener waits for READY and cannot
+                # send INIT to later ranks (deadlock).
+                batch_expected = (
+                    target_dp_size is not None and target_dp_size > current_dp_size
+                )
+
+                if batch_expected:
+                    expected_new_ranks = set(range(current_dp_size, target_dp_size))
+                    init_sent: set[int] = set()
+
+                    # Phase 1: collect HELLO and send INIT to each expected new rank (no READY yet).
+                    while len(init_sent) < len(expected_new_ranks):
+                        if time.time() > ready_deadline:
+                            logger.error(
+                                "Handshake timeout: INIT broadcast phase "
+                                "(expected HELLO from ranks %s)",
+                                sorted(expected_new_ranks),
+                            )
+                            return
+                        parts = self._pop_handshake_multipart(
+                            handshake_socket, poller
+                        )
+                        if parts is None:
+                            continue
+
+                        eng_identity = parts[0]
+                        hello_msg_bytes = (
+                            parts[-1] if len(parts) > 2 else parts[1]
+                        )
+                        eng_index = int.from_bytes(eng_identity, "little")
+
+                        hello_msg = msgspec.msgpack.decode(hello_msg_bytes)
+                        status = hello_msg.get("status")
+                        if status != "HELLO":
+                            logger.warning(
+                                "Unexpected message status from rank %s: %s",
+                                eng_index,
+                                status,
+                            )
+                            continue
+
+                        if eng_index < current_dp_size:
+                            logger.debug(
+                                "Ignoring HELLO from existing rank %s during batch "
+                                "(current_dp_size=%s)",
+                                eng_index,
+                                current_dp_size,
+                            )
+                            continue
+
+                        if eng_index not in expected_new_ranks:
+                            logger.warning(
+                                "HELLO from rank %s not in expected new ranks %s "
+                                "(target=%s)",
+                                eng_index,
+                                sorted(expected_new_ranks),
+                                target_dp_size,
+                            )
+                            continue
+
+                        if eng_index in init_sent:
+                            continue
+
+                        logger.info("Received HELLO from new rank %s (batch INIT)", eng_index)
+                        _send_init_to_new_rank(
+                            eng_identity, eng_index, effective_dp_size
+                        )
+                        init_sent.add(eng_index)
+
+                    # Phase 2: wait for READY from each new rank (by identity).
+                    for eng_index in sorted(expected_new_ranks):
+                        eng_identity = eng_index.to_bytes(length=2, byteorder="little")
+                        try:
+                            ready_msg_bytes = self._handshake_recv_from_identity(
+                                handshake_socket,
+                                poller,
+                                eng_identity,
+                                ready_deadline,
+                            )
+                        except TimeoutError:
+                            logger.error(
+                                "Handshake timeout waiting READY from rank %s",
+                                eng_index,
+                            )
+                            return
+                        ready_msg = msgspec.msgpack.decode(ready_msg_bytes)
+                        if ready_msg.get("status") == "READY":
+                            logger.info(
+                                "New rank %s handshake completed (batch)",
+                                eng_index,
+                            )
+                        else:
+                            logger.warning(
+                                "Unexpected status from rank %s: %s",
+                                eng_index,
+                                ready_msg.get("status"),
+                            )
+                    logger.info(
+                        "Handshake batch completed for new ranks %s; "
+                        "stopping listener until the next scale-up request.",
+                        sorted(expected_new_ranks),
+                    )
+                    return
+
+                # Non-batch path (no target or single-step): legacy per-rank flow.
+                deferred = self._handshake_deferred_multipart
+                events = poller.poll(timeout=1000)
+                if not events and not deferred:
+                    continue
+
+                if deferred:
+                    parts = deferred.pop(0)
+                elif events:
+                    parts = handshake_socket.recv_multipart()
+                else:
+                    continue
+
+                eng_identity = parts[0]
+                hello_msg_bytes = parts[-1] if len(parts) > 2 else parts[1]
+                eng_index = int.from_bytes(eng_identity, "little")
+
+                hello_msg = msgspec.msgpack.decode(hello_msg_bytes)
+                status = hello_msg.get("status")
+                if status != "HELLO":
+                    logger.warning(
+                        f"Unexpected message status from rank {eng_index}: {status}"
+                    )
+                    continue
+
+                if eng_index >= current_dp_size:
+                    logger.info(f"Received HELLO from new rank {eng_index}")
+
+                    _send_init_to_new_rank(
+                        eng_identity, eng_index, effective_dp_size
+                    )
+
+                    try:
+                        ready_msg_bytes = self._handshake_recv_from_identity(
+                            handshake_socket,
+                            poller,
+                            eng_identity,
+                            ready_deadline,
+                        )
+                    except TimeoutError:
+                        logger.error(
+                            "Handshake timeout waiting READY from rank %s", eng_index
+                        )
+                        continue
+                    ready_msg = msgspec.msgpack.decode(ready_msg_bytes)
+
+                    if ready_msg.get("status") == "READY":
+                        logger.info(f"New rank {eng_index} handshake completed")
+                    else:
+                        logger.warning(
+                            f"Unexpected status from rank {eng_index}: {ready_msg.get('status')}"
+                        )
+                else:
+                    logger.debug(
+                        f"Ignoring HELLO from existing rank {eng_index} "
+                        f"(current_dp_size={current_dp_size})"
+                    )
+        except asyncio.CancelledError:
+            logger.info("Handshake listener task cancelled")
+        except Exception as e:
+            logger.error(f"Error in handshake listener: {e}", exc_info=True)
+        finally:
+            # Cleanup.
+            if hasattr(self, "_handshake_deferred_multipart"):
+                self._handshake_deferred_multipart.clear()
+            handshake_socket.close()
+            sync_ctx.destroy()
+            self._handshake_listener_task = None
+            logger.info("Handshake listener task stopped")
+
+    async def reconfigure_for_external_scale(
+        self,
+        new_data_parallel_size: int,
+        new_data_parallel_master_port: int | None = None,
+    ) -> None:
+        """
+        External LB: reconfigure this node's engine only; do not spawn new engines.
+        New engines are started by the external orchestrator.
+
+        Args:
+            new_data_parallel_size: Target DP world size.
+            new_data_parallel_master_port: New master port, or None to keep the current one.
+        """
+        # Clear port list so data_parallel_master_port is the base for allocation.
+        parallel_config = self.vllm_config.parallel_config
+        if hasattr(parallel_config, "_data_parallel_master_port_list"):
+            parallel_config._data_parallel_master_port_list.clear()
+
+        # Use caller-supplied master port, or keep the existing one.
+        master_port = (
+            new_data_parallel_master_port
+            if new_data_parallel_master_port is not None
+            else parallel_config.data_parallel_master_port
+        )
+
+        # Apply new master port when explicitly provided.
+        if new_data_parallel_master_port is not None:
+            parallel_config.data_parallel_master_port = new_data_parallel_master_port
+
+        # Build reconfigure request.
+        reconfig_request = ReconfigureDistributedRequest(
+            new_data_parallel_size=new_data_parallel_size,
+            new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
+            new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
+            new_data_parallel_master_ip=parallel_config.data_parallel_master_ip,
+            new_data_parallel_master_port=master_port,
+        )
+
+        # Send reconfigure to local engine core.
+        await self._call_utility_async(
+            "reinitialize_distributed", reconfig_request, engine=self.core_engine
+        )
+
+        # Update local parallel config.
+        parallel_config.data_parallel_size = new_data_parallel_size
+
+        # Notify coordinator when present.
+        self._ensure_stats_update_task()
+        scale_msg = msgspec.msgpack.encode(
+            ("SCALE_ELASTIC_EP", new_data_parallel_size)
+        )
+        await self.first_req_send_socket.send(scale_msg)
+
+        logger.info(
+            f"[External LB] Reconfigured to data parallel size: {new_data_parallel_size}"
+        )
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):

@@ -1152,6 +1152,8 @@ class EngineCoreProc(EngineCore):
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    if bytes(type_frame.buffer) == b"READY":
+                        continue
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
                     # Deserialize the request data.
@@ -1442,6 +1444,10 @@ class DPEngineCoreProc(EngineCoreProc):
         parallel_config.data_parallel_master_port = (
             reconfig_request.new_data_parallel_master_port
         )
+        # Clear port list so data_parallel_master_port is the base for allocation.
+        if parallel_config.data_parallel_external_lb:
+            if hasattr(parallel_config, "_data_parallel_master_port_list"):
+                parallel_config._data_parallel_master_port_list.clear()
         if reconfig_request.new_data_parallel_rank != -2:
             self.dp_rank = parallel_config.data_parallel_rank
             self.dp_group = parallel_config.stateless_init_dp_group()
@@ -1460,7 +1466,15 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             # NOTE(yongji): newly joined workers require dummy_run even
             # CUDA graph is not used
-            self.model_executor.collective_rpc("compile_or_warm_up_model")
+            # Unlock workspace before compile_or_warm_up_model to allow workspace growth
+            # during warmup/profiling (e.g., flashinfer_autotune)
+            from vllm.v1.worker.workspace import unlock_workspace, lock_workspace
+            unlock_workspace()
+            try:
+                self.model_executor.collective_rpc("compile_or_warm_up_model")
+            finally:
+                # Re-lock workspace after warmup
+                lock_workspace()
         if (
             reconfig_request.new_data_parallel_rank
             == ReconfigureRankType.SHUTDOWN_CURRENT_RANK

@@ -415,44 +415,70 @@ class Worker(WorkerBase):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> None:
-        warmup_sizes = []
+        restore_disable_compile_cache: str | None = None
+        had_disable_compile_cache = False
+        if getattr(self, "_reset_compile_state_before_next_warmup", False):
+            self._reset_compile_state_before_next_warmup = False
+            restore_disable_compile_cache = os.environ.get("VLLM_DISABLE_COMPILE_CACHE")
+            had_disable_compile_cache = "VLLM_DISABLE_COMPILE_CACHE" in os.environ
+            os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+            self._reset_model_compilation_state()
+        eep_scale_up_launch = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
+        if getattr(self, "_reset_cudagraph_state_after_elastic_reconfig", False):
+            self._reset_cudagraph_state_after_elastic_reconfig = False
+            self._reset_cudagraph_state_for_elastic_scale(reason="reconfigure")
+        elif eep_scale_up_launch:
+            self._reset_cudagraph_state_for_elastic_scale(
+                reason="scale-up launch"
+            )
 
-        if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
-            # warm up sizes that are not in cudagraph capture sizes,
-            # but users still want to compile for better performance,
-            # e.g. for the max-num-batched token size in chunked prefill.
-            compile_sizes = self.vllm_config.compilation_config.compile_sizes
-            warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []
-            cg_capture_sizes: list[int] = []
+        try:
+            warmup_sizes = []
 
-            if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-                cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
-                cg_capture_sizes = [] if cg_sizes is None else cg_sizes
-                warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]
+            if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+                # warm up sizes that are not in cudagraph capture sizes,
+                # but users still want to compile for better performance,
+                # e.g. for the max-num-batched token size in chunked prefill.
+                compile_sizes = self.vllm_config.compilation_config.compile_sizes
+                warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []
+                cg_capture_sizes: list[int] = []
 
-            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()
-            # For each compile_range, if none of the batch sizes
-            # in warmup_sizes or cudagraph_capture_sizes are in the range,
-            # add the end of the range to ensure compilation/warmup.
-            all_sizes = set(cg_capture_sizes)
-            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
-            for compile_range in compile_ranges:
-                if not any(x in compile_range for x in all_sizes):
-                    warmup_sizes.append(compile_range.end)
+                if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                    cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
+                    cg_capture_sizes = [] if cg_sizes is None else cg_sizes
+                    warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]
 
-        # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
-        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+                compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()
+                # For each compile_range, if none of the batch sizes
+                # in warmup_sizes or cudagraph_capture_sizes are in the range,
+                # add the end of the range to ensure compilation/warmup.
+                all_sizes = set(cg_capture_sizes)
+                all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
+                for compile_range in compile_ranges:
+                    if not any(x in compile_range for x in all_sizes):
+                        warmup_sizes.append(compile_range.end)
 
-        # Warmup and tune the kernels used during model execution before
-        # cuda graph capture.
-        kernel_warmup(self)
+            # We skip EPLB here since we don't want to record dummy metrics
+            for size in sorted(warmup_sizes, reverse=True):
+                logger.info("Compile and warming up model for size %d", size)
+                self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+            self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
-        cuda_graph_memory_bytes = 0
-        if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            # Warmup and tune the kernels used during model execution before
+            # cuda graph capture.
+            kernel_warmup(self)
+
+            cuda_graph_memory_bytes = 0
+            if not self.model_config.enforce_eager:
+                cuda_graph_memory_bytes = self.model_runner.capture_model()
+        finally:
+            if restore_disable_compile_cache is not None:
+                if had_disable_compile_cache:
+                    os.environ["VLLM_DISABLE_COMPILE_CACHE"] = (
+                        restore_disable_compile_cache
+                    )
+                else:
+                    os.environ.pop("VLLM_DISABLE_COMPILE_CACHE", None)
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"
@@ -729,6 +755,15 @@ class Worker(WorkerBase):
             global_expert_loads=global_expert_loads,
             rank_mapping=rank_mapping,
         )
+        model = self.model_runner.get_model()
+        self._refresh_eplb_runtime_state_after_rearrange(model)
+        drafter_model = getattr(
+            getattr(self.model_runner, "drafter", None), "model", None
+        )
+        while hasattr(drafter_model, "unwrap"):
+            drafter_model = drafter_model.unwrap()
+        if isinstance(drafter_model, nn.Module):
+            self._refresh_eplb_runtime_state_after_rearrange(drafter_model)
         if get_ep_group().rank == 0:
             logger.info("[Elastic EP] Expert resharding completed!")
 
@@ -790,6 +825,11 @@ class Worker(WorkerBase):
                 )
             ]
 
+        def unwrap_model(model: Any) -> Any:
+            while hasattr(model, "unwrap"):
+                model = model.unwrap()
+            return model
+
         def update_moe_modules(moe_modules: list[FusedMoE], num_local_experts: int):
             assert all(
                 module.moe_config.num_local_experts == num_local_experts
@@ -807,7 +847,8 @@ class Worker(WorkerBase):
                 module.moe_config.moe_parallel_config = module.moe_parallel_config
             return moe_modules
 
-        model_moe_modules = get_moe_modules(self.model_runner.model)
+        base_model = unwrap_model(self.model_runner.model)
+        model_moe_modules = get_moe_modules(base_model)
         num_local_experts = model_moe_modules[0].moe_config.num_local_experts
 
         update_moe_modules(model_moe_modules, num_local_experts)
@@ -815,7 +856,7 @@ class Worker(WorkerBase):
         if hasattr(self.model_runner, "drafter") and hasattr(
             self.model_runner.drafter, "model"
         ):
-            drafter_model = self.model_runner.drafter.model
+            drafter_model = unwrap_model(self.model_runner.drafter.model)
         if drafter_model is not None and is_mixture_of_experts(drafter_model):
             drafter_moe_modules = get_moe_modules(drafter_model)
             # Check if drafter and model have matching configs
@@ -854,13 +895,13 @@ class Worker(WorkerBase):
             parallel_config.eplb_config.num_redundant_experts = (
                 new_physical_experts - global_expert_loads[0].shape[1]
             )
-        prepare_communication_buffer_for_model(self.model_runner.model)
-        if drafter_model is not None:
-            prepare_communication_buffer_for_model(drafter_model)
-        self.model_runner.model.update_physical_experts_metadata(
+        base_model.update_physical_experts_metadata(
             num_physical_experts=new_physical_experts,
             num_local_physical_experts=num_local_physical_experts,
         )
+        prepare_communication_buffer_for_model(base_model)
+        if drafter_model is not None:
+            prepare_communication_buffer_for_model(drafter_model)
         return global_expert_loads
 
     def reinitialize_distributed(
@@ -907,6 +948,217 @@ class Worker(WorkerBase):
         if new_ep_size > old_ep_size:
             assert global_expert_loads is not None
             self._eplb_after_scale_up(old_ep_size, new_ep_size, global_expert_loads)
+
+        if new_ep_size != old_ep_size:
+            self._reset_compile_state_before_next_warmup = True
+            self._reset_cudagraph_state_after_elastic_reconfig = True
+
+    def _reset_model_compilation_state(self) -> None:
+        from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+        def _reset_module_tree(root: nn.Module) -> int:
+            reset_count = 0
+            for module in root.modules():
+                if not isinstance(module, TorchCompileWithNoGuardsWrapper):
+                    continue
+                if hasattr(module, "aot_compiled_fn"):
+                    module.aot_compiled_fn = None
+                if hasattr(module, "was_aot_compile_fn_loaded_from_disk"):
+                    module.was_aot_compile_fn_loaded_from_disk = False
+                if hasattr(module, "_compiled_bytecode"):
+                    module._compiled_bytecode = None
+                TorchCompileWithNoGuardsWrapper.__init__(module)
+                reset_count += 1
+            return reset_count
+
+        with set_current_vllm_config(self.vllm_config):
+            torch._dynamo.reset()
+            total_reset = _reset_module_tree(self.model_runner.model)
+            drafter_model = getattr(
+                getattr(self.model_runner, "drafter", None), "model", None
+            )
+            if isinstance(drafter_model, nn.Module):
+                total_reset += _reset_module_tree(drafter_model)
+        logger.info(
+            "[Elastic EP] Reset torch.compile wrappers after distributed "
+            "reconfiguration (modules=%d)",
+            total_reset,
+        )
+
+    def _clear_cached_cudagraph_wrappers(self, root: Any) -> int:
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+
+        cleared_graphs = 0
+        visited: set[int] = set()
+
+        def _clear(node: Any) -> None:
+            nonlocal cleared_graphs
+            if node is None:
+                return
+            node_id = id(node)
+            if node_id in visited:
+                return
+            visited.add(node_id)
+
+            if isinstance(node, CUDAGraphWrapper):
+                cleared_graphs += len(node.concrete_cudagraph_entries)
+                node.concrete_cudagraph_entries.clear()
+                _clear(node.runnable)
+                return
+
+            if isinstance(node, UBatchWrapper):
+                cleared_graphs += len(node.cudagraphs)
+                node.cudagraphs.clear()
+                if node.cudagraph_wrapper is not None:
+                    _clear(node.cudagraph_wrapper)
+                _clear(node.runnable)
+
+        _clear(root)
+        return cleared_graphs
+
+    def _reset_cudagraph_state_for_elastic_scale(self, reason: str) -> None:
+        current_cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        if not current_cudagraph_mode.has_full_cudagraphs():
+            return
+
+        # Old ranks keep the FULL cudagraph wrapper objects across elastic
+        # reconfiguration. Clear their cached graphs so the next warmup
+        # recaptures against the new EP/DP topology instead of replaying stale
+        # graphs captured before scale-up.
+        cleared_graphs = self._clear_cached_cudagraph_wrappers(
+            self.model_runner.model
+        )
+        drafter = getattr(self.model_runner, "drafter", None)
+        drafter_model = getattr(drafter, "model", None)
+        cleared_graphs += self._clear_cached_cudagraph_wrappers(drafter_model)
+
+        dispatcher = getattr(self.model_runner, "cudagraph_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.cudagraph_keys[CUDAGraphMode.PIECEWISE].clear()
+            dispatcher.cudagraph_keys[CUDAGraphMode.FULL].clear()
+            dispatcher.keys_initialized = False
+            dispatcher.initialize_cudagraph_keys(
+                current_cudagraph_mode,
+                self.model_runner.uniform_decode_query_len,
+            )
+        if (
+            drafter is not None
+            and hasattr(drafter, "initialize_cudagraph_keys")
+            and self.model_runner.speculative_config
+        ):
+            drafter.initialize_cudagraph_keys(current_cudagraph_mode)
+        cudagraph_manager = getattr(drafter, "cudagraph_manager", None)
+        if cudagraph_manager is not None and hasattr(cudagraph_manager, "graphs"):
+            cleared_graphs += len(cudagraph_manager.graphs)
+            cudagraph_manager.graphs.clear()
+
+        if cleared_graphs > 0:
+            gc.collect()
+
+        logger.warning(
+            "[Elastic EP] Reset cudagraph state for %s after %s "
+            "(cleared_cached_graphs=%d).",
+            current_cudagraph_mode.name,
+            reason,
+            cleared_graphs,
+        )
+
+    def _refresh_eplb_runtime_state_after_rearrange(
+        self, target_model: nn.Module | None
+    ) -> None:
+        if target_model is None or not is_mixture_of_experts(target_model):
+            return
+        eplb_state = self.model_runner.eplb_state
+        if eplb_state is None:
+            return
+
+        for model_state in eplb_state.model_states.values():
+            if model_state.model is not target_model:
+                continue
+
+            num_layers = model_state.physical_to_logical_map.shape[0]
+            num_physical_experts = model_state.physical_to_logical_map.shape[1]
+
+            if model_state.expert_load_pass.shape[1] != num_physical_experts:
+                model_state.expert_load_pass = torch.zeros(
+                    (num_layers, num_physical_experts),
+                    dtype=model_state.expert_load_pass.dtype,
+                    device=model_state.expert_load_pass.device,
+                )
+            else:
+                model_state.expert_load_pass.zero_()
+
+            if model_state.expert_load_window.shape[2] != num_physical_experts:
+                model_state.expert_load_window = torch.zeros(
+                    (
+                        eplb_state.expert_load_window_size,
+                        num_layers,
+                        num_physical_experts,
+                    ),
+                    dtype=model_state.expert_load_window.dtype,
+                    device=model_state.expert_load_window.device,
+                )
+            else:
+                model_state.expert_load_window.zero_()
+
+            for layer_idx, layer in enumerate(target_model.moe_layers):
+                layer.set_eplb_state(
+                    moe_layer_idx=layer_idx,
+                    expert_load_view=model_state.expert_load_pass,
+                    logical_to_physical_map=model_state.logical_to_physical_map,
+                    logical_replica_count=model_state.logical_replica_count,
+                )
+
+            logical_to_physical_cpu = model_state.logical_to_physical_map.detach().cpu()
+            logical_replica_count_cpu = model_state.logical_replica_count.detach().cpu()
+            max_slots = logical_to_physical_cpu.shape[-1]
+            for layer_idx in range(num_layers):
+                replica_count = logical_replica_count_cpu[layer_idx]
+                if int(replica_count.min().item()) <= 0:
+                    raise RuntimeError(
+                        "EPLB post-rearrange produced non-positive "
+                        f"logical_replica_count: layer={layer_idx}, "
+                        f"min={int(replica_count.min().item())}, "
+                        f"max={int(replica_count.max().item())}"
+                    )
+                if int(replica_count.max().item()) > max_slots:
+                    raise RuntimeError(
+                        "EPLB post-rearrange produced replica_count larger than "
+                        f"logical_to_physical_map slots: layer={layer_idx}, "
+                        f"max_replica_count={int(replica_count.max().item())}, "
+                        f"max_slots={max_slots}"
+                    )
+                slot_mask = (
+                    torch.arange(max_slots).unsqueeze(0)
+                    < replica_count.unsqueeze(1)
+                )
+                active_slots = logical_to_physical_cpu[layer_idx][slot_mask]
+                if active_slots.numel() != num_physical_experts:
+                    raise RuntimeError(
+                        "EPLB post-rearrange active physical slot count mismatch: "
+                        f"layer={layer_idx}, active_slots={active_slots.numel()}, "
+                        f"expected={num_physical_experts}"
+                    )
+                if (
+                    int(active_slots.min().item()) < 0
+                    or int(active_slots.max().item()) >= num_physical_experts
+                ):
+                    raise RuntimeError(
+                        "EPLB post-rearrange produced invalid physical ids: "
+                        f"layer={layer_idx}, min={int(active_slots.min().item())}, "
+                        f"max={int(active_slots.max().item())}, "
+                        f"expected_range=[0, {num_physical_experts - 1}]"
+                    )
+
+            logger.info(
+                "[Elastic EP] Validated post-rearrange EPLB state for model=%s, "
+                "num_layers=%d, num_physical_experts=%d",
+                model_state.model_name,
+                num_layers,
+                num_physical_experts,
+            )
+            break
 
     def save_sharded_state(
         self,

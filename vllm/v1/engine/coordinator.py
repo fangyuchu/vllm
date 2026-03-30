@@ -265,11 +265,28 @@ class DPCoordinatorProc:
                                 current_count,
                                 new_engine_count,
                             )
-                        else:
+
+                            # Handle subscription messages from new engines.
+                            # Poll publish_back and drain any pending subscription frames.
+                            num_new_engines = new_engine_count - current_count
+                            for _ in range(num_new_engines):
+                                if publish_back.poll(timeout=10000):  # 10000 ms timeout
+                                    buffer = publish_back.recv()
+                                    if buffer == b"\x01":
+                                        logger.info("Received subscription from new engine, sending READY")
+                                        publish_back.send(b"READY")
+                            continue
+                        elif new_engine_count < current_count:
                             self.engines = self.engines[:new_engine_count]
                             logger.info(
                                 "DPCoordinator scaled down from %s to %s engines",
                                 current_count,
+                                new_engine_count,
+                            )
+                        else:
+                            logger.info(
+                                "DPCoordinator received duplicate scale "
+                                "notification for %s engines; ignoring",
                                 new_engine_count,
                             )
                         continue  # Skip normal engine notification processing
