@@ -19,6 +19,11 @@ class FaultToleranceConfig:
     such as scaling down fault DPEngineCore.
     """
 
+    enable_fault_tolerance_rebalance: bool = False
+    """
+    After a fault occurs, re-invoke EPLB for expert placement to achieve load balancing.
+    """
+
     shutdown_on_fault_tolerance_failure: bool = False
     """Whether to shut down vLLM when a fault tolerance action fails.
     """

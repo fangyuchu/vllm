@@ -586,6 +586,7 @@ class EngineArgs:
 
     # fault tolerance fields
     enable_fault_tolerance: bool = FaultToleranceConfig.enable_fault_tolerance
+    enable_fault_tolerance_rebalance: bool = FaultToleranceConfig.enable_fault_tolerance_rebalance
     engine_recovery_timeout: int = FaultToleranceConfig.engine_recovery_timeout
     internal_fault_report_port: int = FaultToleranceConfig.internal_fault_report_port
     external_fault_notify_port: int = FaultToleranceConfig.external_fault_notify_port
@@ -1244,6 +1245,10 @@ class EngineArgs:
             **fault_tolerance_kwargs["enable_fault_tolerance"],
         )
         fault_tolerance_group.add_argument(
+            "--enable-fault-tolerance-rebalance",
+            **fault_tolerance_kwargs["enable_fault_tolerance_rebalance"],
+        )
+        fault_tolerance_group.add_argument(
             "--shutdown-on-fault-tolerance-failure",
             **fault_tolerance_kwargs["shutdown_on_fault_tolerance_failure"],
         )
@@ -1815,6 +1820,7 @@ class EngineArgs:
 
         fault_tolerance_config = FaultToleranceConfig(
             enable_fault_tolerance=self.enable_fault_tolerance,
+            enable_fault_tolerance_rebalance=self.enable_fault_tolerance_rebalance,
             shutdown_on_fault_tolerance_failure=self.shutdown_on_fault_tolerance_failure,
             engine_recovery_timeout=self.engine_recovery_timeout,
             internal_fault_report_port=self.internal_fault_report_port,
