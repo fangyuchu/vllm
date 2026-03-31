@@ -315,10 +315,20 @@ class Worker(WorkerBase):
             report_usage_stats(self.vllm_config)
 
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+
+            def clear_input_batch_callback():
+                input_batch = self.model_runner.input_batch
+                cached_req_ids = input_batch.req_id_to_index.keys()
+                for req_id in list(cached_req_ids):
+                    input_batch.remove_request(req_id)
+
+            deep_ep_buffer = getattr(self.model_runner, "deep_ep_buffer", None)
             self.worker_sentinel = WorkerSentinel(
-                vllm_config=self.vllm_config,
-                pause_event=self.model_runner.pause_event,
-                device=self.device,
+                self.vllm_config,
+                self.model_runner.pause_event,
+                self.device,
+                clear_input_batch_callback,
+                deep_ep_buffer,
             )
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool

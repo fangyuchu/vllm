@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from collections.abc import Callable
+from typing import Any
 
 import msgspec
 import torch
@@ -19,6 +21,8 @@ class WorkerSentinel(BaseSentinel):
         vllm_config: VllmConfig,
         pause_event: threading.Event,
         device: torch.device,
+        clear_input_batch_callback: Callable,
+        deep_ep_buffer: Any,
     ):
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         tp_rank = get_tp_group().rank_in_group
@@ -42,6 +46,9 @@ class WorkerSentinel(BaseSentinel):
             identity=self.identity,
         )
         self.engine_core_cmd_socket.setsockopt(zmq.RCVTIMEO, 100)
+
+        self.clear_input_batch_callback = clear_input_batch_callback
+        self.deep_ep_buffer = deep_ep_buffer
 
         threading.Thread(
             target=self.run, daemon=True, name="WorkerSentinelThread"
@@ -71,6 +78,13 @@ class WorkerSentinel(BaseSentinel):
 
     def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         self.pause_event.set()
+        return FaultToleranceResult(ft_request.request_id, True)
+
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        self.clear_input_batch_callback()
+        self.pause_event.clear()
+        if self.deep_ep_buffer is not None:
+            self.deep_ep_buffer.low_latency_clean_mask_buffer()
         return FaultToleranceResult(ft_request.request_id, True)
 
     def shutdown(self):

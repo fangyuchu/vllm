@@ -8,7 +8,7 @@ import msgspec.msgpack
 import zmq.asyncio
 
 from vllm.config import VllmConfig
-from vllm.utils.network_utils import close_sockets, make_zmq_socket
+from vllm.utils.network_utils import close_sockets, get_open_port, make_zmq_socket
 from vllm.v1.engine import EngineCoreOutputs as FTUtilityOutputs
 from vllm.v1.engine import EngineStatusType, UtilityOutput
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
@@ -119,6 +119,34 @@ class ClientSentinel(BaseSentinel):
         res = await self._execute_cmd_on_engines(ft_request, target_engines)
         if res.success:
             self.logger("vLLM instance is paused and waiting for recovery commands.")
+        return res
+
+    async def retry(self, ft_request: FaultToleranceRequest):  # type: ignore[override]
+        """Expected params: timeout."""
+        for engine_status in self.engine_status_dict.values():
+            if engine_status["status"] == EngineStatusType.DEAD:
+                self.logger(
+                    "Engine core is dead; retry won't work.",
+                    level="warning",
+                )
+                return FaultToleranceResult(ft_request.request_id, False, "Engine dead")
+
+        # try to recover all engines except ones already marked dead or being excluded.
+        if "new_stateless_dp_group_port" not in ft_request.params:
+            ft_request.params["new_stateless_dp_group_port"] = get_open_port()
+        target_engines = [
+            self.engine_identities[i - self.start_rank]
+            for i, status in self.engine_status_dict.items()
+            if status["status"] != "dead"
+        ]
+        res = await self._execute_cmd_on_engines(ft_request, target_engines)
+        if res.success:
+            self.logger("vLLM instance is recovered after retry command.")
+            for i in self.engine_status_dict:
+                self.engine_status_dict[i + self.start_rank]["status"] = (
+                    EngineStatusType.HEALTHY.name.lower()
+                )
+            await self._pub_engine_status()
         return res
 
     async def _pub_engine_status(self):
