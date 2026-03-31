@@ -17,6 +17,11 @@ class FaultToleranceConfig:
     time, the original error is raised.
     """
 
+    enable_fault_tolerance_rebalance: bool = False
+    """
+    After a fault occurs, re-invoke EPLB for expert placement to achieve load balancing.
+    """
+
     internal_fault_report_port: int = 22866
     """
     The port to use for engines to report fault to client sentinel.
