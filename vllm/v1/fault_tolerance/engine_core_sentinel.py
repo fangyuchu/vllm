@@ -19,6 +19,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
+from vllm.v1.serial_utils import run_method
 
 
 class EngineCoreSentinel(BaseSentinel):
@@ -33,6 +34,7 @@ class EngineCoreSentinel(BaseSentinel):
         self,
         engine_index: int,
         fault_signal_q: queue.Queue,
+        cmd_q: queue.Queue,
         busy_loop_paused: threading.Event,
         stop_busy_loop: threading.Event,
         engine_input_q: queue.Queue,
@@ -48,6 +50,7 @@ class EngineCoreSentinel(BaseSentinel):
         )
 
         self.fault_signal_q = fault_signal_q
+        self.cmd_q = cmd_q
         self.stop_busy_loop = stop_busy_loop
         self.busy_loop_paused = busy_loop_paused
         self.engine_input_q = engine_input_q
@@ -132,6 +135,42 @@ class EngineCoreSentinel(BaseSentinel):
             reason=None if success else "Busy loop did not pause within timeout.",
         )
 
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        """
+        Handle the retry instruction from the ClientSentinel.
+        This instruction tells the EngineCore to continue its busy loop
+        after being suspended due to an exception.
+        """
+        if not self.busy_loop_paused.is_set():
+            return FaultToleranceResult(ft_request.request_id, True)
+        timeout = ft_request.params["timeout"]
+        new_stateless_dp_group_port = ft_request.params.get(
+            "new_stateless_dp_group_port"
+        )
+        self._execute_command_on_workers(
+            FaultToleranceRequest(str(uuid.uuid4()), "retry", ft_request.params),
+            self.worker_identities,
+            timeout=timeout,
+        )
+        if self.vllm_config.parallel_config.data_parallel_size > 1:
+            # If the Gloo communication times out,
+            # the data parallel group (dp_group) needs to be reinitialized
+            reinit_request = FaultToleranceRequest(
+                instruction="reinit_dp_group_on_fault_tolerance",
+                request_id=str(uuid.uuid4()),
+                params={"new_stateless_dp_group_port": new_stateless_dp_group_port},
+            )
+            self.cmd_q.put(reinit_request)
+        else:
+            self.cmd_q.put(None)
+
+        self.stop_busy_loop.clear()
+        return FaultToleranceResult(
+            request_id=ft_request.request_id,
+            success=True,
+            reason=None if True else "Worker don't recovered within timeout.",
+        )
+
     def _execute_command_on_workers(
         self,
         ft_request: FaultToleranceRequest,
@@ -213,14 +252,47 @@ def busy_loop_wrapper(busy_loop_func):
                         "Suspended and waiting for fault tolerance instructions.",
                         type(original_exc).__name__,
                     )
-                    # todo: Currently only wait a certain time before shutting
-                    #  down the engine. Will implement fault tolerance methods
-                    #  in the upcoming PRs.
-                    time.sleep(self.engine_recovery_timeout_sec)
+                    # Put running requests into waiting list.
+                    timestamp = time.monotonic()
+                    while self.scheduler.running:
+                        request = self.scheduler.running.pop()
+                        self.scheduler.preempt_request(request, timestamp)
+                    self.scheduler.prev_step_scheduled_req_ids.clear()
+                    if self.batch_queue is not None:
+                        self.batch_queue.clear()
 
-                # Fault tolerance not enabled OR no instruction received
-                # before timeout. Re-raise the original exception
-                # for upper level handling.
-                raise
+                    try:
+                        # Block until recovery command received
+                        ft_request = self.cmd_q.get(
+                            timeout=self.engine_recovery_timeout_sec
+                        )
+
+                        if ft_request is not None:
+                            logger.debug(
+                                "[BusyLoopWrapper] Received fault tolerance "
+                                "command: %s",
+                                ft_request.instruction,
+                            )
+                            method, params = (ft_request.instruction, ft_request.params)
+                            run_method(self, method, args=(), kwargs=params)
+                        # recovery succeeded; restart the busy loop
+                        continue
+                    except queue.Empty:
+                        # No handling instruction received within predefined
+                        # timeout period.
+                        logger.error(
+                            "[BusyLoopWrapper] Fault tolerance instruction not received"
+                            " within timeout. Proceeding with default exception "
+                            "handling."
+                        )
+                    except Exception as cmd_exc:
+                        raise RuntimeError(
+                            "Fault tolerance execution failed."
+                        ) from cmd_exc
+
+                    # Fault tolerance not enabled OR no instruction received
+                    # before timeout. Re-raise the original exception
+                    # for upper level handling.
+                raise original_exc
 
     return run_with_fault_tolerance

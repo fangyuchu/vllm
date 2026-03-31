@@ -866,6 +866,7 @@ class GPUModelRunner(
         self.layerwise_nvtx_hooks_registered = False
 
         self.pause_event = threading.Event()
+        self.deep_ep_buffer = None
 
     def _check_pause_event(self):
         if (
@@ -4844,6 +4845,17 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+
+        if (
+            self.vllm_config.fault_tolerance_config.enable_fault_tolerance
+            and "deepep" in self.parallel_config.all2all_backend
+        ):
+            # TODO find a more elegant way to get deepep_buffer
+            for name, module in self.model.named_modules():
+                if hasattr(module, "experts"):
+                    pf = module.experts.quant_method.moe_kernel.prepare_finalize
+                    self.deep_ep_buffer = getattr(pf, "buffer", None)
+                    break
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
