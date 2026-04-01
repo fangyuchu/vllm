@@ -250,6 +250,15 @@ class EngineCoreSentinel(BaseSentinel):
                     soft_pause=False,
                 )
         return success
+    
+    def recover_raw_data(self, timeout = 1, **kwargs) -> bool:
+        self.logger("Start recovering raw data for EngineCore", level="info")
+        success, _ = self._broadcast_command_to_downstream(
+                "recover_raw_data",
+                self._get_target_worker_identity(),
+                timeout=timeout,
+            )
+        return success
 
     def descale(self, timeout: int = 60, **kwargs) -> bool:
         """Scale down the engine cluster by removing specified DP ranks.
@@ -543,6 +552,8 @@ class EngineCore:
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
+
+        self.collective_rpc("dp_descale_for_the_half_dp")
 
         self.available_gpu_memory_for_kv_cache = -1
 
