@@ -965,6 +965,9 @@ class EngineCoreProc(EngineCore):
             with handshake as addresses, local_handshake as client_addresses:
                 addresses.inputs = client_addresses.inputs
                 addresses.outputs = client_addresses.outputs
+                addresses.fault_tolerance_addresses = (
+                    client_addresses.fault_tolerance_addresses
+                )
                 yield addresses
 
         # Update config which may have changed from the handshake
