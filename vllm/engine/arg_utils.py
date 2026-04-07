@@ -629,8 +629,8 @@ class EngineArgs:
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
 
-    # fault tolerance fields
-    fault_tolerance_config: FaultToleranceConfig = get_field(
+    # fault tolerance fields (`None` means not explicitly provided).
+    fault_tolerance_config: FaultToleranceConfig | None = get_field(
         ParallelConfig, "fault_tolerance_config"
     )
     enable_fault_tolerance: bool = ParallelConfig.enable_fault_tolerance
@@ -998,7 +998,11 @@ class EngineArgs:
             "--enable-fault-tolerance", **parallel_kwargs["enable_fault_tolerance"]
         )
         parallel_group.add_argument(
-            "--fault-tolerance-config", **parallel_kwargs["fault_tolerance_config"]
+            "--fault-tolerance-config",
+            **{
+                **parallel_kwargs["fault_tolerance_config"],
+                "default": None,
+            },
         )
 
         # KV cache arguments
@@ -1408,6 +1412,13 @@ class EngineArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
+
+        # If --fault-tolerance-config is provided, enable fault tolerance by default.
+        if args.fault_tolerance_config is not None:
+            args.enable_fault_tolerance = True
+        if args.enable_fault_tolerance and args.fault_tolerance_config is None:
+            args.fault_tolerance_config = FaultToleranceConfig()
+
         # Set the attributes from the parsed arguments.
         engine_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
@@ -1835,7 +1846,9 @@ class EngineArgs:
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
             enable_fault_tolerance=self.enable_fault_tolerance,
-            fault_tolerance_config=self.fault_tolerance_config,
+            fault_tolerance_config=(
+                self.fault_tolerance_config or FaultToleranceConfig()
+            ),
         )
 
         speculative_config = self.create_speculative_config(
