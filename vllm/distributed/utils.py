@@ -15,7 +15,7 @@ import uuid
 from collections import deque
 from collections.abc import Sequence
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed import ProcessGroup, Store, TCPStore
@@ -31,6 +31,9 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_tcp_uri
 from vllm.utils.system_utils import suppress_stdout
+
+if TYPE_CHECKING:
+    from vllm.config import FaultToleranceConfig
 
 logger = init_logger(__name__)
 
@@ -504,6 +507,7 @@ def stateless_init_torch_distributed_process_group(
     backend: str,
     group_name: str | None = None,
     return_store: bool = False,
+    fault_tolerance_config: "FaultToleranceConfig | None" = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -539,6 +543,8 @@ def stateless_init_torch_distributed_process_group(
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
     timeout = _get_default_timeout(backend)
+    if fault_tolerance_config is not None:
+        timeout = timedelta(seconds=fault_tolerance_config.gloo_comm_timeout_sec)
 
     store, rank, world_size = next(
         rendezvous(init_method, rank, world_size, timeout=timeout)

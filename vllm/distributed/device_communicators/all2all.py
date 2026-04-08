@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -397,6 +398,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         )
 
         assert num_rdma_bytes is not None
+        enable_ft = get_current_vllm_config().parallel_config.enable_fault_tolerance
         return dict(
             group=self.cpu_group,
             num_nvl_bytes=num_nvl_bytes,
@@ -406,6 +408,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             allow_nvlink_for_low_latency_mode=True,
             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
             explicitly_destroy=True,
+            enable_shrink=enable_ft,
         )
 
     def get_handle(self, kwargs):
