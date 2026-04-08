@@ -130,6 +130,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -852,6 +853,15 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+
+        self.pause_event = threading.Event()
+
+    def _check_pause_event(self):
+        if (
+            self.vllm_config.parallel_config.enable_fault_tolerance
+            and self.pause_event.is_set()
+        ):
+            raise EngineLoopPausedError("Worker is paused.")
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3552,6 +3562,7 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        self._check_pause_event()
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -4020,6 +4031,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            self._check_pause_event()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4027,6 +4039,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            self._check_pause_event()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5477,6 +5490,7 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                self._check_pause_event()
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -5484,6 +5498,7 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                self._check_pause_event()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs

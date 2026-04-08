@@ -317,6 +317,7 @@ class Worker(WorkerBase):
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(
                 self.parallel_config,
+                self.model_runner.pause_event,
                 self.device,
             )
 
@@ -1059,6 +1060,7 @@ def init_worker_distributed_environment(
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
+        fault_tolerance_config=parallel_config.fault_tolerance_config,
     )
 
     # Init ec connector here before KV caches init
