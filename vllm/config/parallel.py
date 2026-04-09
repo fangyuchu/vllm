@@ -570,18 +570,15 @@ class ParallelConfig:
     def stateless_init_dp_group(
         self,
         return_store: Literal[False] = False,
-        fault_tolerance_config: "FaultToleranceConfig | None" = None,
     ) -> ProcessGroup: ...
     @overload
     def stateless_init_dp_group(
         self,
         return_store: Literal[True] = True,
-        fault_tolerance_config: "FaultToleranceConfig | None" = None,
     ) -> tuple[ProcessGroup, Store]: ...
     def stateless_init_dp_group(
         self,
         return_store: bool = False,
-        fault_tolerance_config: "FaultToleranceConfig | None" = None,
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -610,7 +607,7 @@ class ParallelConfig:
                     backend="gloo",
                     return_store=return_store,
                     listen_socket=listen_socket,
-                    fault_tolerance_config=fault_tolerance_config,
+                    gloo_timeout_seconds=self.gloo_timeout_seconds,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.

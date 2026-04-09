@@ -59,7 +59,6 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.config import FaultToleranceConfig
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -325,7 +324,7 @@ class GroupCoordinator:
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
-        fault_tolerance_config: "FaultToleranceConfig | None" = None,
+        gloo_timeout_seconds: int | None = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -1177,7 +1176,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: str | None = None,
     use_device_communicator: bool = True,
-    fault_tolerance_config: "FaultToleranceConfig | None" = None,
+    gloo_timeout_seconds: int | None = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1186,7 +1185,7 @@ def init_model_parallel_group(
         use_device_communicator=use_device_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
-        fault_tolerance_config=fault_tolerance_config,
+        gloo_timeout_seconds=gloo_timeout_seconds,
     )
 
 
@@ -1197,7 +1196,7 @@ def _init_stateless_group(
     backend: str,
     coord_store: Store,
     use_device_communicator: bool = True,
-    fault_tolerance_config: "FaultToleranceConfig | None" = None,
+    gloo_timeout_seconds: int | None = None,
 ) -> "StatelessGroupCoordinator":
     """Create a StatelessGroupCoordinator with the given parameters."""
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
@@ -1213,7 +1212,7 @@ def _init_stateless_group(
         coord_store=coord_store,
         global_rank=world.rank,
         global_world_size=world.world_size,
-        fault_tolerance_config=fault_tolerance_config,
+        gloo_timeout_seconds=gloo_timeout_seconds,
     )
 
 
@@ -1515,7 +1514,6 @@ def initialize_model_parallel(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
-    fault_tolerance_config: "FaultToleranceConfig | None" = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1549,6 +1547,7 @@ def initialize_model_parallel(
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
+    gloo_timeout_seconds = parallel_config.gloo_timeout_seconds
     coord_store: Store | None = None
     if enable_elastic_ep:
         coord_store = get_cached_tcp_store_client(
@@ -1608,7 +1607,7 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=True,
         group_name="tp",
-        fault_tolerance_config=fault_tolerance_config,
+        gloo_timeout_seconds=gloo_timeout_seconds,
     )
 
     # Build the DCP model-parallel groups.
@@ -1631,6 +1630,7 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=True,
         group_name="dcp",
+        gloo_timeout_seconds=gloo_timeout_seconds,
     )
 
     global _PCP
@@ -1649,7 +1649,11 @@ def initialize_model_parallel(
         )
         group_ranks = [x.tolist() for x in group_ranks]
     _PCP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pcp"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="pcp",
+        gloo_timeout_seconds=gloo_timeout_seconds,
     )
 
     # Build the pipeline model-parallel groups.
@@ -1667,7 +1671,11 @@ def initialize_model_parallel(
         )
         group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pp"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="pp",
+        gloo_timeout_seconds=gloo_timeout_seconds,
     )
 
     global _DP
@@ -1681,7 +1689,7 @@ def initialize_model_parallel(
             parallel_config.data_parallel_master_ip,
             backend,
             coord_store=coord_store,
-            fault_tolerance_config=fault_tolerance_config,
+            gloo_timeout_seconds=gloo_timeout_seconds,
         )
     else:
         _DP = init_model_parallel_group(
@@ -1689,7 +1697,7 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="dp",
-            fault_tolerance_config=fault_tolerance_config,
+            gloo_timeout_seconds=gloo_timeout_seconds,
         )
 
     global _EP
@@ -1714,7 +1722,7 @@ def initialize_model_parallel(
                 parallel_config.data_parallel_master_ip,
                 backend,
                 coord_store=coord_store,
-                fault_tolerance_config=fault_tolerance_config,
+                gloo_timeout_seconds=gloo_timeout_seconds,
             )
         else:
             _EP = init_model_parallel_group(
@@ -1722,7 +1730,7 @@ def initialize_model_parallel(
                 get_world_group().local_rank,
                 backend,
                 group_name="ep",
-                fault_tolerance_config=fault_tolerance_config,
+                gloo_timeout_seconds=gloo_timeout_seconds,
             )
 
         # Create EPLB group with the same ranks as EP if EPLB is enabled.
@@ -1739,7 +1747,7 @@ def initialize_model_parallel(
                     parallel_config.data_parallel_master_ip,
                     backend,
                     coord_store=coord_store,
-                    fault_tolerance_config=fault_tolerance_config,
+                    gloo_timeout_seconds=gloo_timeout_seconds,
                 )
             else:
                 _EPLB = init_model_parallel_group(
@@ -1747,7 +1755,7 @@ def initialize_model_parallel(
                     get_world_group().local_rank,
                     backend,
                     group_name="eplb",
-                    fault_tolerance_config=fault_tolerance_config,
+                    gloo_timeout_seconds=gloo_timeout_seconds,
                 )
     # If no EP group needed, _EP remains None
     # If no EPLB group needed, _EPLB remains None
@@ -1773,7 +1781,6 @@ def ensure_model_parallel_initialized(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
-    fault_tolerance_config: "FaultToleranceConfig | None" = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1791,7 +1798,6 @@ def ensure_model_parallel_initialized(
             prefill_context_model_parallel_size,
             decode_context_model_parallel_size,
             backend,
-            fault_tolerance_config=fault_tolerance_config,
         )
         return
 
