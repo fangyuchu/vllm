@@ -50,6 +50,7 @@ class ClientSentinel(BaseSentinel):
         self.call_utility_async = call_utility_async
 
         self.ft_config = parallel_config.fault_tolerance_config
+        self.gloo_timeout_seconds = parallel_config.gloo_timeout_seconds
 
         self.sentinel_dead = False
         self._shutdown_task: asyncio.Task | None = None
@@ -208,7 +209,7 @@ class ClientSentinel(BaseSentinel):
                 ):
                     self.is_faulted.set()
                     # todo: Timeout for DeepEP/nixl-ep kernel is fixed to 100 seconds
-                    timeout = max(100, self.ft_config.gloo_comm_timeout_sec) + 5
+                    timeout = max(100, self.gloo_timeout_seconds) + 5
                     pause_request = FaultToleranceRequest.builder(
                         request_id=str(uuid.uuid4()),
                         instruction="pause",

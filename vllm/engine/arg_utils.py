@@ -404,6 +404,7 @@ class EngineArgs:
     nnodes: int = ParallelConfig.nnodes
     node_rank: int = ParallelConfig.node_rank
     distributed_timeout_seconds: int | None = ParallelConfig.distributed_timeout_seconds
+    gloo_timeout_seconds: int | None = ParallelConfig.gloo_timeout_seconds
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
@@ -838,6 +839,10 @@ class EngineArgs:
         parallel_group.add_argument(
             "--distributed-timeout-seconds",
             **parallel_kwargs["distributed_timeout_seconds"],
+        )
+        parallel_group.add_argument(
+            "--gloo-timeout-seconds",
+            **parallel_kwargs["gloo_timeout_seconds"],
         )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
@@ -1761,6 +1766,7 @@ class EngineArgs:
             nnodes=self.nnodes,
             node_rank=self.node_rank,
             distributed_timeout_seconds=self.distributed_timeout_seconds,
+            gloo_timeout_seconds=self.gloo_timeout_seconds,
             data_parallel_master_ip=data_parallel_address,
             data_parallel_rpc_port=data_parallel_rpc_port,
             data_parallel_backend=self.data_parallel_backend,
