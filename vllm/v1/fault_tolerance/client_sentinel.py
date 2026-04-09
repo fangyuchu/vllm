@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import msgspec.msgpack
 import zmq.asyncio
+from torch.distributed import default_pg_timeout
 
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
@@ -23,6 +24,7 @@ from vllm.v1.fault_tolerance.utils import (
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
 
 logger = init_logger(__name__)
+DEEP_EP_KERNEL_TIMEOUT = 100  # seconds (currently fixed)
 
 
 class ClientSentinel(BaseSentinel):
@@ -50,7 +52,28 @@ class ClientSentinel(BaseSentinel):
         self.call_utility_async = call_utility_async
 
         self.ft_config = parallel_config.fault_tolerance_config
-        self.gloo_timeout_seconds = parallel_config.gloo_timeout_seconds
+        self.gloo_timeout_seconds: int = (
+            parallel_config.gloo_timeout_seconds
+            if parallel_config.gloo_timeout_seconds is not None
+            else int(default_pg_timeout.total_seconds())
+        )
+        if parallel_config.gloo_timeout_seconds is None:
+            logger.warning(
+                "Gloo timeout not set, using default_pg_timeout:%s",
+                int(default_pg_timeout.total_seconds()),
+            )
+        # Gloo collective timeout and all2all kernel timeout (DeepEP / NIXL-EP)
+        # must both be shorter than the engine recovery timeout.
+        # Otherwise execution may block inside communication (CPU or GPU),
+        # and the recovery logic will not get a chance to run.
+        if (
+            max(self.gloo_timeout_seconds, DEEP_EP_KERNEL_TIMEOUT)
+            > self.ft_config.engine_recovery_timeout_sec
+        ):
+            raise ValueError(
+                "Engine recovery timeout must be greater than both Gloo timeout and "
+                "all2all kernel timeout (DeepEP / NIXL-EP) to ensure recovery can run."
+            )
 
         self.sentinel_dead = False
         self._shutdown_task: asyncio.Task | None = None
@@ -209,7 +232,7 @@ class ClientSentinel(BaseSentinel):
                 ):
                     self.is_faulted.set()
                     # todo: Timeout for DeepEP/nixl-ep kernel is fixed to 100 seconds
-                    timeout = max(100, self.gloo_timeout_seconds) + 5
+                    timeout = max(DEEP_EP_KERNEL_TIMEOUT, self.gloo_timeout_seconds) + 5
                     pause_request = FaultToleranceRequest.builder(
                         request_id=str(uuid.uuid4()),
                         instruction="pause",
