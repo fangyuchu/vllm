@@ -332,8 +332,9 @@ class GroupCoordinator:
 
         self_device_group = None
         self_cpu_group = None
+        gloo_timeout_timedelta: timedelta | None = None
         if gloo_timeout_seconds is not None:
-            gloo_timeout_seconds = timedelta(seconds=gloo_timeout_seconds)
+            gloo_timeout_timedelta = timedelta(seconds=gloo_timeout_seconds)
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
@@ -343,7 +344,7 @@ class GroupCoordinator:
             # processes through the CPU.
             with suppress_stdout():
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout_seconds
+                    ranks, backend="gloo", timeout=gloo_timeout_timedelta
                 )
             if self.rank in ranks:
                 self.ranks = ranks
