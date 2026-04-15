@@ -156,6 +156,10 @@ class BaseSentinel:
         (e.g., retry, scale-down, or other control commands).
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def recover_raw_data(self, timeout: int = 1, **kwargs) -> bool:
+        raise NotImplementedError
 
     @abstractmethod
     def retry(self, timeout: int = 1, **kwargs) -> bool:
