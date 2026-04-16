@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from collections.abc import Callable
+from typing import Any
 
 import msgspec
 import torch
 import zmq
 
 from vllm.config import ParallelConfig
-from vllm.distributed import get_pp_group, get_tp_group
+from vllm.distributed import (
+    get_dp_group,
+    get_pp_group,
+    get_tp_group,
+    stateless_init_torch_distributed_process_group,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
@@ -23,14 +30,20 @@ class WorkerSentinel(BaseSentinel):
         pause_event: threading.Event,
         device: torch.device,
         worker_cmd_addr: str,
+        clear_input_batch_callback: Callable,
+        deep_ep_buffer: Any,
     ):
-        dp_rank = parallel_config.data_parallel_rank
+        self.parallel_config = parallel_config
+        self.dp_rank = parallel_config.data_parallel_rank
         tp_rank = get_tp_group().rank_in_group
         pp_rank = get_pp_group().rank_in_group
         identity_str = f"PP{pp_rank}_TP{tp_rank}"
-        super().__init__(f"{dp_rank}_{identity_str}", identity_str.encode())
+        super().__init__(f"{self.dp_rank}_{identity_str}", identity_str.encode())
         self.device = device
         self.pause_event = pause_event
+        self.data_parallel_master_ip = parallel_config.data_parallel_master_ip
+        self.data_parallel_master_port = parallel_config.data_parallel_master_port
+        self.dp_size = parallel_config.data_parallel_size
         torch.accelerator.set_device_index(self.device)
 
         self.engine_core_cmd_socket = make_zmq_socket(
@@ -41,11 +54,16 @@ class WorkerSentinel(BaseSentinel):
             identity=self.identity,
         )
 
+        self.clear_input_batch_callback = clear_input_batch_callback
+        self.deep_ep_buffer = deep_ep_buffer
+
         threading.Thread(
             target=self.run, daemon=True, name="WorkerSentinelThread"
         ).start()
 
     def run(self):
+        # set CUDA device context for this thread
+        torch.accelerator.set_device_index(self.device)
         # Wait for fault tolerance instructions from EngineCoreSentinel
         while not self.sentinel_dead:
             self.poll_and_execute_upstream_cmd()
@@ -67,6 +85,22 @@ class WorkerSentinel(BaseSentinel):
 
     def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         self.pause_event.set()
+        return FaultToleranceResult(ft_request.request_id, True)
+
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        self.clear_input_batch_callback()
+        self.pause_event.clear()
+
+        if self.deep_ep_buffer is not None:
+            self.deep_ep_buffer.low_latency_clean_mask_buffer()
+
+        get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
+            self.data_parallel_master_ip,
+            self.data_parallel_master_port + 100,
+            self.dp_rank,
+            self.dp_size,
+            backend="gloo",
+        )
         return FaultToleranceResult(ft_request.request_id, True)
 
     def shutdown(self):

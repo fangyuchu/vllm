@@ -565,16 +565,19 @@ class ParallelConfig:
     @overload
     def stateless_init_dp_group(
         self,
-        return_store: Literal[False] = False,
+        return_store: Literal[False] = ...,
+        dp_init_port: int | None = None,
     ) -> ProcessGroup: ...
     @overload
     def stateless_init_dp_group(
         self,
-        return_store: Literal[True] = True,
+        return_store: Literal[True] = ...,
+        dp_init_port: int | None = None,
     ) -> tuple[ProcessGroup, Store]: ...
     def stateless_init_dp_group(
         self,
         return_store: bool = False,
+        dp_init_port: int | None = None,
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -594,6 +597,9 @@ class ParallelConfig:
         for _ in range(max_retries):
             try:
                 port, listen_socket = self._pick_stateless_dp_port()
+                if dp_init_port is not None:
+                    port = dp_init_port
+                    listen_socket = None
                 # use gloo since the engine process might not have cuda device
                 return stateless_init_torch_distributed_process_group(
                     self.data_parallel_master_ip,
