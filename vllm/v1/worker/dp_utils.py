@@ -40,17 +40,32 @@ def _run_ar(
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
 ) -> torch.Tensor:
+    from vllm.v1.engine.exceptions import EngineLoopPausedError
+    from vllm.v1.worker.sentinel.gpu_worker_sentinel import get_pause_event
+
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
+    should_pause = parallel_config.enable_fault_tolerance and get_pause_event().is_set()
     # Populate this rank's contribution on CPU to reduce GPU syncs.
-    tensor_cpu = torch.zeros(4, dp_size, dtype=torch.int32)
+    tensor_cpu = torch.zeros(5, dp_size, dtype=torch.int32)
     tensor_cpu[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
+    tensor_cpu[4][dp_rank] = 1 if should_pause else 0
     tensor = tensor_cpu.to(device, non_blocking=True)
-    dist.all_reduce(tensor, group=group)
+    handle = dist.all_reduce(tensor, group=group, async_op=True)
+    try:
+        handle.wait()
+    except RuntimeError:
+        should_pause = True
+
+    if should_pause or bool(tensor[4].any().item()):
+        raise EngineLoopPausedError(
+            "Pausing workers due to fault tolerance signal from DP ranks."
+        )
+
     return tensor
 
 
