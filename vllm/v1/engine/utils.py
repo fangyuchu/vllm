@@ -5,6 +5,7 @@ import contextlib
 import os
 import threading
 import weakref
+import msgpack
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -182,10 +183,21 @@ class CoreEngineProcManager:
                     ),
                 ):
                     proc.start()
+            if (
+                    not local_client
+                    and vllm_config.parallel_config.enable_fault_tolerance
+            ):
+                self.recv_engine_identity(start_index, local_engine_count)
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():
                 self.shutdown()
+
+    def recv_engine_identity(self, start_engine_index, local_engine_count):
+        start_engine_bytes = str(start_engine_index).encode("utf-8")
+        local_engine_count_bytes = str(local_engine_count).encode("utf-8")
+        self.engine_down_socket.send_multipart([b"", start_engine_bytes])
+        self.engine_down_socket.send_multipart([b"", local_engine_count_bytes])
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
@@ -196,16 +208,30 @@ class CoreEngineProcManager:
         if self._finalizer.detach() is not None:
             shutdown(self.processes, timeout=timeout)
 
-    def monitor_engine_liveness(self) -> None:
+    def monitor_engine_liveness(self,engine_identity,run_headless=False) -> None:
         """Monitor engine core process liveness."""
+        if run_headless and self.enable_fault_tolerance:
+            engine_identity = msgpack.loads(
+                self.engine_down_socket.recv_multipart()[1], strict_map_key=False
+            )
 
         sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
         sentinels = set(sentinel_to_proc.keys())
+        pids = [proc.pid for proc in self.processes]
+        pid_mapping = {}
+        if self.enable_fault_tolerance:
+            pid_mapping = {
+                proc: byte_data
+                for proc, byte_data in zip(pids, engine_identity.values())
+            }
         while sentinels and not self.manager_stopped.is_set():
             died_sentinels = connection.wait(sentinels, timeout=1)
 
             for sentinel in died_sentinels:
                 proc = sentinel_to_proc.pop(cast(int, sentinel))
+                died_proc = next(
+                    proc for proc in self.processes if proc.sentinel == sentinel
+                )
                 exitcode = proc.exitcode
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
@@ -214,6 +240,7 @@ class CoreEngineProcManager:
                     notify_engine_down(
                         self.engine_down_socket,
                         engine_id=str(engine_rank + self.start_index),
+                        engine_identity=pid_mapping[died_proc.pid],
                     )
                     sentinels.remove(cast(int, sentinel))
 

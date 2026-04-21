@@ -26,3 +26,5 @@ class FaultToleranceConfig:
     """
     Port used to publish engine fault and status change notifications.
     """
+
+    gloo_comm_timeout: int = 30

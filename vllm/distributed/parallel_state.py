@@ -49,6 +49,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 from vllm.distributed.utils import (
     StatelessProcessGroup,
     get_cached_tcp_store_client,
+    stateless_destroy_torch_distributed_process_group
 )
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -338,7 +339,7 @@ class GroupCoordinator:
         gloo_timeout_timedelta: timedelta | None = None
         if gloo_timeout_seconds is not None:
             gloo_timeout_timedelta = timedelta(seconds=gloo_timeout_seconds)
-
+        self.group_type = "normal"
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
@@ -1069,6 +1070,14 @@ class GroupCoordinator:
             self.device_communicator.destroy()
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
+
+    def destroy_cpu_group(self):
+        if hasattr(self, "cpu_group"):
+            if self.group_type == "normal":
+                torch.distributed.destroy_process_group(self.cpu_group)
+            else:
+                stateless_destroy_torch_distributed_process_group(self.cpu_group)
+            del self.cpu_group
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
         if self.device_communicator is not None:
