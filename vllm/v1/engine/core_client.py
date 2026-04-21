@@ -610,6 +610,7 @@ class MPClient(EngineCoreClient):
                     self.resources.engine_manager = engine_manager
 
                 self.addresses = addresses
+                self.engine_registry = addresses.fault_tolerance_addresses.engine_core_sentinel_identities
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if self.enable_fault_tolerance:
                     assert client_addresses is not None
@@ -723,8 +724,7 @@ class MPClient(EngineCoreClient):
         # logs an error, shuts down the client and invokes the failure
         # callback to inform the engine.
         def monitor_engine_cores():
-            sentinels = [proc.sentinel for proc in engine_processes]
-            died = multiprocessing.connection.wait(sentinels)
+            engine_manager.monitor_engine_liveness(self.engine_registry)
             _self = self_ref()
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
@@ -980,6 +980,7 @@ class AsyncMPClient(MPClient):
                     fault_tolerance_addresses=ft_addr,
                     call_utility_async=self._call_utility_async,
                     core_engines=self.core_engines,
+                    core_client=self,
                 )
                 self.resources.client_sentinel = self.client_sentinel
             self.engine_status = {

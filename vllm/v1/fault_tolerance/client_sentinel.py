@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
 import asyncio
 import uuid
 from collections.abc import Callable
-
+import msgpack
 import msgspec.msgpack
 import zmq.asyncio
 from torch.distributed import default_pg_timeout
@@ -11,6 +14,7 @@ from torch.distributed import default_pg_timeout
 from vllm.config import ParallelConfig
 from vllm.distributed.utils import init_distributed_coordination
 from vllm.logger import init_logger
+from vllm.utils.network_utils import close_sockets, make_zmq_socket, get_open_port
 from vllm.utils.network_utils import close_sockets, get_open_port, make_zmq_socket
 from vllm.v1.engine import EngineCoreOutputs as FTUtilityOutputs
 from vllm.v1.engine import EngineStatusType, UtilityOutput
@@ -23,6 +27,8 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceZmqAddresses,
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
+if TYPE_CHECKING:
+    from vllm.v1.engine.core_client import MPClient
 
 logger = init_logger(__name__)
 DEEP_EP_KERNEL_TIMEOUT = 100  # seconds (currently fixed)
@@ -46,6 +52,7 @@ class ClientSentinel(BaseSentinel):
         fault_tolerance_addresses: FaultToleranceZmqAddresses,
         call_utility_async: Callable,
         core_engines: list[bytes],
+        core_client: "MPClient",
     ):
         self.ctx = zmq.asyncio.Context()
         super().__init__(parallel_config, None, b"client_sentinel")
@@ -78,6 +85,8 @@ class ClientSentinel(BaseSentinel):
 
         self.sentinel_dead = False
         self._shutdown_task: asyncio.Task | None = None
+        self.core_client = core_client
+        self.killed_engine_identity = []
 
         # Port for receiving fault signals:
         # 1. Exceptions caught by fault_tolerant_wrapper in EngineCore
@@ -126,6 +135,16 @@ class ClientSentinel(BaseSentinel):
             engine_index: {"status": "healthy"}
             for engine_index in range(self.start_rank, self.start_rank + num_dp_managed)
         }
+        logger.info(f'self.engine_status_dict is {self.engine_status_dict}')
+        self.descaled_core_engines_dict = {
+            engine_identity: engine_index
+            for engine_index, engine_identity in enumerate(
+                self.core_client.core_engines
+            )
+        }
+
+        self.engine_registry = self.core_client.engine_registry
+
         self.engine_identity_to_index = {
             identity: index
             for index, identity in zip(
@@ -134,8 +153,37 @@ class ClientSentinel(BaseSentinel):
             )
         }
         self._coord_store = None
+        asyncio.create_task(self.send_engine_registry(dp_size,dp_local_size))
+        import time
+        time.sleep(5)
         asyncio.create_task(self.run())
         asyncio.create_task(self.poll_and_execute_cmd())
+
+    async def send_engine_registry(self, dp_size, dp_size_local) -> None:
+        recv_engine_count = dp_size_local
+        while recv_engine_count < dp_size:
+            sender_identity, empty_frame, start_engine_index_bytes = await self.fault_receiver_socket.recv_multipart()
+            start_engine_index = start_engine_index_bytes.decode("utf-8")
+
+            sender_identity, empty_frame, node_engine_count_bytes = await self.fault_receiver_socket.recv_multipart()
+            node_engine_count = node_engine_count_bytes.decode("utf-8")
+
+            assert node_engine_count is not None, "node_engine_count cannot be None"
+            assert start_engine_index is not None, "start_engine_index cannot be None"
+            recv_engine_count += int(node_engine_count)
+            send_engine_registry = {
+                key: self.engine_registry[key]
+                for key in range(
+                    int(start_engine_index),
+                    int(start_engine_index) + int(node_engine_count),
+                )
+            }
+            send_engine_registry_byte = msgpack.dumps(
+                send_engine_registry, use_bin_type=True
+            )
+            await self.fault_receiver_socket.send_multipart(
+                [sender_identity, b"", send_engine_registry_byte]
+            )
 
     async def _send_utility_result(
         self,
@@ -155,12 +203,17 @@ class ClientSentinel(BaseSentinel):
         exclude_engine_index = ft_request.params.get("exclude_engine_index")
 
         # Pause all engines except ones already marked dead or being excluded.
-        target_engines = [
-            self.engine_identities[i - self.start_rank]
-            for i, status in self.engine_status_dict.items()
-            if status["status"] != "dead"
-            and (exclude_engine_index is None or i not in exclude_engine_index)
-        ]
+        target_engines = []
+        for i, status in self.engine_status_dict.items():
+            for id, new_index in self.engine_identity_to_index:
+                if new_index == i:
+                    target_engines.append(id.to_bytes(2, "little"))
+        # target_engines = [
+        #     self.engine_identities[i - self.start_rank]
+        #     for i, status in self.engine_status_dict.items()
+        #     if status["status"] != "dead"
+        #     and (exclude_engine_index is None or i not in exclude_engine_index)
+        # ]
         res = await self._execute_cmd_on_engines(ft_request, target_engines)
         if res.success:
             logger.info("vLLM instance is paused and waiting for recovery commands.")
@@ -192,6 +245,139 @@ class ClientSentinel(BaseSentinel):
                     EngineStatusType.HEALTHY.name.lower()
                 )
             await self._pub_engine_status()
+        return res
+
+    def get_mapping(self,original_list, to_remove) -> tuple[dict, list]:
+        remaining = [num for num in original_list if num not in to_remove]
+        original_to_new_dp_rank = {
+            str(original_num): new_index for new_index, original_num in enumerate(remaining)
+        }
+        new_list = list(original_to_new_dp_rank.values())
+
+        return original_to_new_dp_rank, new_list
+
+    async def terminate_scaledown_cores(self, exclude_dp_ranks, original_to_new, timeout) -> None:
+        dead_engine_identities = list({
+            identity
+            for identity, index in self.engine_identity_to_index.items()
+            if index in exclude_dp_ranks
+        })
+
+        shutdown_request = FaultToleranceRequest.builder(
+            request_id=str(uuid.uuid4()),
+            instruction="shutdown_engine_core",
+            params={"timeout": timeout,
+                    "exclude_dp_ranks": exclude_dp_ranks,
+                    "original_to_new": original_to_new},
+        )
+        res = await self._execute_cmd_on_engines(shutdown_request, dead_engine_identities)
+        logger.info(f'client res is {res}')
+        return
+
+
+    def update_config(self, exclude_dp_ranks, original_to_new):
+        for engine_index in exclude_dp_ranks:
+            self.engine_status_dict.pop(engine_index)
+            self.engine_registry.pop(engine_index)
+
+        exclude_set = set(exclude_dp_ranks)
+
+        self.engine_identity_to_index = {
+            identity: idx
+            for identity, idx in self.engine_identity_to_index.items()
+            if idx not in exclude_set
+        }
+
+        original_to_new_int = {int(old): new for old, new in original_to_new.items()}
+        for old_idx, new_idx in original_to_new_int.items():
+            # Migrate engine status
+            if old_idx in self.engine_status_dict:
+                status_value = self.engine_status_dict[old_idx]
+                del self.engine_status_dict[old_idx]
+                self.engine_status_dict[new_idx] = status_value
+
+            # Migrate engine registry
+            if old_idx in self.engine_registry:
+                self.engine_registry[new_idx] = self.engine_registry.pop(old_idx)
+
+            # Update the mapping from engine identifier to index
+            for identity, idx in self.engine_identity_to_index.items():
+                if idx == old_idx:
+                    self.engine_identity_to_index[identity] = new_idx
+
+        self.descaled_core_engines_dict = {
+            engine_identity: original_to_new[str(engine_index)]
+            for engine_identity, engine_index in (
+                self.descaled_core_engines_dict.items()
+            )
+            if str(engine_index) in original_to_new
+        }
+
+        self.core_client.core_engines = [
+            engine_identity
+            for engine_identity in self.core_client.core_engines
+            if engine_identity in self.descaled_core_engines_dict
+        ]
+
+        _, self.core_client.engine_ranks_managed = self.get_mapping(
+            self.core_client.engine_ranks_managed, exclude_dp_ranks
+        )
+
+        self.core_client.vllm_config.parallel_config.data_parallel_size = len(original_to_new)
+        scale_down_marker = msgspec.msgpack.encode(
+            ("SCALE_ELASTIC_EP", len(original_to_new))
+        )
+        if self.core_client.resources.first_req_send_socket:
+            self.core_client.resources.first_req_send_socket.send(scale_down_marker)
+        for dead_engine in exclude_dp_ranks:
+            dp_rank = self.core_client.vllm_config.parallel_config.data_parallel_rank
+            local_rank = dead_engine - dp_rank
+            if hasattr(self.core_client, "lb_engines") and local_rank in range(
+                len(self.core_client.lb_engines)
+            ):
+                del self.core_client.lb_engines[local_rank]
+        logger.info(f'self.core_client.lb_engines is {self.core_client.lb_engines}')
+
+    async def descale(self, ft_request: FaultToleranceRequest) -> bool:
+        exclude_dp_ranks = ft_request.params.get("exclude_dp_ranks")
+        timeout = ft_request.params.get("timeout")
+        for faulty_rank in exclude_dp_ranks:
+            if self.engine_status_dict[faulty_rank]["status"] != "dead":
+                self.engine_status_dict[faulty_rank]["status"] = "dead"
+
+        healthy_ranks_old = [
+            engine_id for engine_id, status in self.engine_status_dict.items()
+        ]
+
+        logger.info(f'healthy_ranks_old is {healthy_ranks_old}')
+        original_to_new, _ = self.get_mapping(healthy_ranks_old, exclude_dp_ranks)
+        logger.info(f'original_to_new is {original_to_new}')
+        target_engines = list({
+            identity
+            for identity, index in self.engine_identity_to_index.items()
+            if index not in exclude_dp_ranks
+        })
+
+        new_stateless_dp_group_port = get_open_port()
+        logger.info(f'exclude_dp_ranks is {exclude_dp_ranks}'
+                    f'original_to_new is {original_to_new}')
+        descale_request = FaultToleranceRequest.builder(
+            request_id=str(uuid.uuid4()),
+            instruction="descale",
+            params={"timeout": timeout,
+                    "exclude_dp_ranks": exclude_dp_ranks,
+                    "original_to_new":original_to_new,
+                    "new_stateless_dp_group_port":new_stateless_dp_group_port},
+        )
+        res =await self._execute_cmd_on_engines(descale_request, target_engines)
+        logger.info(f'client res is {res}')
+
+        if res.success:
+            await self.terminate_scaledown_cores(exclude_dp_ranks, original_to_new, timeout)
+            self.update_config(exclude_dp_ranks, original_to_new)
+            #self.engine_running.set()
+            self.is_faulted.clear()
+
         return res
 
     async def _pub_engine_status(self):
@@ -251,6 +437,9 @@ class ClientSentinel(BaseSentinel):
                 _, _, message = await self.fault_receiver_socket.recv_multipart()
                 fault_info = msgspec.msgpack.decode(message, type=FaultInfo)
                 # Update engine status
+                if fault_info.engine_identity and fault_info.engine_identity not in self.engine_registry.values():
+                    self.killed_engine_identity.append(fault_info.engine_identity)
+                    continue
                 status_enum = EngineStatusType(fault_info.engine_status)
                 self.engine_status_dict[int(fault_info.engine_id)] = {
                     "status": status_enum.name.lower()

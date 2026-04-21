@@ -23,6 +23,7 @@ class FaultInfo(msgspec.Struct):
     message: str
     engine_id: str
     engine_status: EngineStatusType
+    engine_identity: bytes | None = None
     timestamp: str | None = None
     additional_info: dict | None = None
 
@@ -32,6 +33,7 @@ class FaultInfo(msgspec.Struct):
         exception: Exception,
         engine_id: str | int,
         engine_status: EngineStatusType,
+        engine_identity: bytes | None = None,
         additional_info: dict | None = None,
     ) -> "FaultInfo":
         """Create FaultInfo from an exception."""
@@ -41,6 +43,7 @@ class FaultInfo(msgspec.Struct):
             message=str(exception),
             engine_id=str(engine_id),
             engine_status=engine_status,
+            engine_identity=engine_identity,
             timestamp=time.strftime("%H:%M:%S", local_time),
             additional_info=additional_info or {},
         )
@@ -162,14 +165,16 @@ def make_engine_down_report_socket(vllm_config):
     return zmq_ctx, engine_down_socket
 
 
-def notify_engine_down(engine_down_socket, engine_id):
+def notify_engine_down(engine_down_socket, engine_id, engine_identity):
     fault_info = FaultInfo(
         type="EngineDeadError",
         message="Engine died unexpectedly.",
         engine_id=str(engine_id),
+        engine_identity=engine_identity,
         engine_status=EngineStatusType.DEAD,
     )
     # During normal shutdown, the DEALER socket may already be closed.
     # Sending the final fault report can then raise ZMQError, which is safe to ignore.
+    print(f'notify_engine_down fault_info is {fault_info}')
     with contextlib.suppress(zmq.ZMQError):
         engine_down_socket.send_multipart([b"", msgspec.msgpack.encode(fault_info)])

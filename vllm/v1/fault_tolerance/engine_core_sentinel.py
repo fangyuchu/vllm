@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import queue
+import sys
 import threading
 import time
 import traceback
 import uuid
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import msgspec.msgpack
 import zmq
-
-from vllm.config import ParallelConfig
+from vllm.v1.serial_utils import run_method
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.logger import init_logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.engine import EngineCoreRequestType, EngineStatusType
@@ -46,6 +48,7 @@ class EngineCoreSentinel(BaseSentinel):
         engine_fault_socket_addr: str,
         sentinel_identity: bytes,
         worker_cmd_addr: str,
+        engine_core: "EngineCoreProc",
     ):
         self.engine_index = engine_index
         super().__init__(
@@ -53,9 +56,11 @@ class EngineCoreSentinel(BaseSentinel):
             f"DP_{engine_index}",
             sentinel_identity,
         )
+        self.engine_core = engine_core
         self.data_parallel_size = parallel_config.data_parallel_size
         self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
         self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue(maxsize=1)
+
         self.engine_recovery_timeout_sec = (
             parallel_config.fault_tolerance_config.engine_recovery_timeout_sec
         )
@@ -178,6 +183,137 @@ class EngineCoreSentinel(BaseSentinel):
             reason=None if True else "Worker don't recovered within timeout.",
         )
 
+    def _calculate_exclude_ep_ranks(
+        self, exclude_dp_ranks: list[int], vllm_config: VllmConfig
+    ) -> list[int]:
+        """Calculate excluded EP ranks from excluded DP ranks."""
+        tensor_model_parallel_size = vllm_config.parallel_config.tensor_parallel_size
+        exclude_ep_ranks: list[int] = []
+        for dp_rank in exclude_dp_ranks:
+            start = dp_rank * tensor_model_parallel_size
+            end = (dp_rank + 1) * tensor_model_parallel_size
+            exclude_ep_ranks.extend(range(start, end))
+
+        exclude_ep_ranks = sorted(list(set(exclude_ep_ranks)))
+        return exclude_ep_ranks
+
+    def parse_exclude_ep_ranks(self,vllm_config: VllmConfig, exclude_ep_ranks_list: list[int]):
+        """Parse excluded DP ranks to calculate scaled-down EP/DP sizes and DP rank mapping."""
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Pipeline parallel is not supported for scaling down."
+            )
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        old_dp_size = vllm_config.parallel_config.data_parallel_size
+
+        new_dp_size = old_dp_size - len(exclude_ep_ranks_list)
+        new_ep_size = new_dp_size * tp_size
+        exclude_dp_ranks = set(exclude_ep_ranks_list)
+
+        dp_rank_mapping = {}
+        rank_left = [i for i in range(old_dp_size) if i not in exclude_dp_ranks]
+        for i in range(new_dp_size):
+            dp_rank_mapping[rank_left[i]] = i
+        return new_ep_size, new_dp_size, dp_rank_mapping
+
+    def _build_vllm_config_update_dict(
+            self,
+            parallel_config: Any,
+            new_ep_size: int,
+            data_parallel_size: int,
+            rank_mapping: Any,
+    ) -> dict[str, Any]:
+        """Build dictionary of VLLM config updates for downstream workers.
+
+        Args:
+            parallel_config: Current parallel configuration object
+            new_ep_size: New expert parallelism size
+            data_parallel_size: New data parallelism size
+            rank_mapping: New rank mapping after exclusion
+
+        Returns:
+            Dict[str, Any]: VLLM configuration update parameters
+        """
+        return {
+            "ep_world_size": new_ep_size,
+            "rank_mapping": rank_mapping,
+            "data_parallel_size": data_parallel_size,
+            "data_parallel_rank": parallel_config.data_parallel_rank,
+            "data_parallel_size_local": parallel_config.data_parallel_size_local,
+            "expert_parallel_size": (
+                    data_parallel_size
+                    * parallel_config.pipeline_parallel_size
+                    * parallel_config.tensor_parallel_size
+            ),
+            "data_parallel_master_port": parallel_config.data_parallel_master_port,
+        }
+
+    def reinit_dp_group_on_fault_tolerance(self,new_stateless_dp_group_port):
+        stateless_destroy_torch_distributed_process_group(self.engine_core.dp_group)
+        self.engine_core.dp_group = self.engine_core.vllm_config.parallel_config.stateless_init_dp_group(dp_init_port=new_stateless_dp_group_port)
+        self.engine_core.step_counter = 0
+
+
+    def descale(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        """Scale down the engine cluster by removing specified DP ranks.
+
+        This method adjusts parallel configuration parameters,
+        broadcasts the descalecommand to downstream workers,
+        and reinitializes the DP group for fault tolerance.
+        """
+        # Validate required keyword arguments
+        # Extract and type-cast parameters from kwargs
+        timeout = ft_request.params["timeout"]
+        original_to_new: dict[str, int] = ft_request.params["original_to_new"]
+        exclude_dp_ranks: list[int] = ft_request.params["exclude_dp_ranks"]
+        new_stateless_dp_group_port: int = ft_request.params["new_stateless_dp_group_port"]
+
+        deadline = time.monotonic() + timeout
+
+        self.engine_index = original_to_new[str(self.engine_index)]
+        exclude_ep_ranks = self._calculate_exclude_ep_ranks(
+            exclude_dp_ranks, self.engine_core.vllm_config
+        )
+
+        new_ep_size, data_parallel_size, rank_mapping = self.parse_exclude_ep_ranks(
+            self.engine_core.vllm_config, exclude_ep_ranks
+        )
+        with set_current_vllm_config(self.engine_core.vllm_config):
+            parallel_config = self.engine_core.vllm_config.parallel_config
+            self.engine_core.update_parallel_config(data_parallel_size, rank_mapping)
+            vllm_config_update_dict = self._build_vllm_config_update_dict(
+                parallel_config, new_ep_size, data_parallel_size, rank_mapping
+            )
+            descale_request = FaultToleranceRequest.builder(
+                request_id=str(uuid.uuid4()),
+                instruction="descale",
+                params={"timeout": timeout,
+                        "exclude_ep_ranks": exclude_ep_ranks,
+                        "vllm_config_update_dict": vllm_config_update_dict},
+            )
+
+            self._execute_command_on_workers(
+                FaultToleranceRequest(str(uuid.uuid4()), "descale", descale_request.params),
+                self.worker_identities,
+                timeout=timeout,
+            )
+
+        reinit_request = FaultToleranceRequest(
+            instruction="reinit_dp_group_on_fault_tolerance",
+            request_id=str(uuid.uuid4()),
+            params={"new_stateless_dp_group_port": new_stateless_dp_group_port},
+        )
+        self.cmd_q.put(reinit_request)
+
+        remaining_timeout = max(0, deadline - time.monotonic())
+        success = self.busy_loop_paused.wait(remaining_timeout)
+        self.stop_busy_loop.clear()
+        return FaultToleranceResult(
+            request_id=ft_request.request_id,
+            success=success,
+            reason=None if success else "Busy loop did not pause within timeout.",
+        )
+
     def _execute_command_on_workers(
         self,
         ft_request: FaultToleranceRequest,
@@ -231,7 +367,24 @@ class EngineCoreSentinel(BaseSentinel):
             or None,
         )
 
+    def shutdown_engine_core(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        shutdown_request = FaultToleranceRequest(
+            instruction="shutdown",
+            request_id=str(uuid.uuid4()),
+            params={},
+        )
+
+        self.cmd_q.put(shutdown_request)
+
+        return FaultToleranceResult(
+            request_id=ft_request.request_id,
+            success=True,
+            reason=None,
+        )
+
     def shutdown(self):
+
+        self.engine_core.shutdown()
         close_sockets([self.engine_fault_socket, self.worker_cmd_socket])
         super().shutdown()
 
@@ -281,6 +434,8 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                                 ft_request.instruction,
                             )
                             method, params = (ft_request.instruction, ft_request.params)
+                            if method == "shutdown":
+                                sys.exit()
                             run_method(self, method, args=(), kwargs=params)
                         # recovery succeeded; restart the busy loop
                         continue
