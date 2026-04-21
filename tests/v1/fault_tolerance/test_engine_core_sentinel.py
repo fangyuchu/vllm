@@ -4,7 +4,7 @@ import queue
 import socket
 import time
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import zmq
@@ -13,7 +13,10 @@ from msgspec import msgpack
 from vllm.config import FaultToleranceConfig, ParallelConfig
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.fault_tolerance import EngineCoreSentinel
-from vllm.v1.fault_tolerance.utils import FaultInfo
+from vllm.v1.fault_tolerance.utils import (
+    FaultInfo,
+    FaultToleranceRequest,
+)
 from vllm.v1.utils import get_engine_client_zmq_addr
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -110,3 +113,28 @@ def test_busy_loop_exception_forwarded_to_client(addr_dict, mock_parallel_config
         engine_fault_receiver.close(linger=0)
         sentinel.shutdown()
         ctx.term()
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_retry(mock_parallel_config, addr_dict, dp_size):
+    mock_parallel_config.data_parallel_size = dp_size
+    sentinel_identity = b"engine_sentinel_0"
+    engine_core_sentinel = create_engine_core_sentinel(
+        mock_parallel_config, addr_dict, sentinel_identity=sentinel_identity
+    )
+    engine_core_sentinel.busy_loop_paused.set()
+    patch.object(engine_core_sentinel, "_execute_command_on_workers")
+    ft_req = FaultToleranceRequest(
+        "1", "retry", {"timeout": 2, "coord_store_port": 54321}
+    )
+
+    engine_core_sentinel.retry(ft_req)
+
+    assert mock_parallel_config._coord_store_port == 54321
+    if dp_size > 1:
+        assert not engine_core_sentinel.cmd_q.empty()
+        cmd = engine_core_sentinel.cmd_q.get()
+        assert cmd.instruction == "reinit_dp_group_on_fault_tolerance"
+        assert not engine_core_sentinel.stop_busy_loop.is_set()
+    else:
+        assert engine_core_sentinel.cmd_q.get() is None
