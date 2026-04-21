@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 
 import zmq
 
+from vllm.config import ParallelConfig
 from vllm.logger import init_logger
 from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
@@ -26,9 +27,11 @@ class BaseSentinel(ABC):
 
     def __init__(
         self,
+        parallel_config: ParallelConfig,
         sentinel_tag: str | None,
         identity: bytes,
     ):
+        self.parallel_config = parallel_config
         self.sentinel_dead = False
         if not hasattr(self, "ctx"):
             self.ctx = zmq.Context()
@@ -69,6 +72,13 @@ class BaseSentinel(ABC):
         This method should be called when a fault is detected. It pauses the
         execution, allowing the system to wait for fault-tolerance instructions
         (e.g., retry, scale-down, or other control commands).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        """
+        Retry execution after a transient recoverable fault.
         """
         raise NotImplementedError
 
