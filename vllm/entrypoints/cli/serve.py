@@ -221,7 +221,7 @@ def run_headless(args: argparse.Namespace):
     )
 
     try:
-        engine_manager.monitor_engine_liveness(run_headless=True)
+        engine_manager.monitor_engine_liveness(engine_identity=None,run_headless=True)
     finally:
         timeout = None
         if shutdown_requested:

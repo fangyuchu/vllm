@@ -5,7 +5,6 @@ import contextlib
 import os
 import threading
 import weakref
-import msgpack
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -14,6 +13,7 @@ from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import msgpack
 import msgspec
 import zmq
 
@@ -157,10 +157,7 @@ class CoreEngineProcManager:
                         proc.start()
                 else:
                     proc.start()
-            if (
-                    not local_client
-                    and vllm_config.parallel_config.enable_fault_tolerance
-            ):
+            if not local_client and vllm_config.parallel_config.enable_fault_tolerance:
                 self.recv_engine_identity(start_index, local_engine_count)
         finally:
             # Kill other procs if not all are running.
@@ -185,7 +182,7 @@ class CoreEngineProcManager:
         """Wait for any process to exit."""
         connection.wait(proc.sentinel for proc in self.processes)
 
-    def monitor_engine_liveness(self,engine_identity,run_headless=False) -> None:
+    def monitor_engine_liveness(self, engine_identity, run_headless=False) -> None:
         """Monitor engine core process liveness."""
         if run_headless and self.enable_fault_tolerance:
             engine_identity = msgpack.loads(

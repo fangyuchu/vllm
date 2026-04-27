@@ -175,6 +175,6 @@ def notify_engine_down(engine_down_socket, engine_id, engine_identity):
     )
     # During normal shutdown, the DEALER socket may already be closed.
     # Sending the final fault report can then raise ZMQError, which is safe to ignore.
-    print(f'notify_engine_down fault_info is {fault_info}')
+    print(f"notify_engine_down fault_info is {fault_info}")
     with contextlib.suppress(zmq.ZMQError):
         engine_down_socket.send_multipart([b"", msgspec.msgpack.encode(fault_info)])
