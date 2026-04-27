@@ -270,7 +270,6 @@ class DPCoordinatorProc:
                 min_timeout = 50 if last_step_counts is None else 0
 
                 events = poller.poll(timeout=max(min_timeout, wait_for - elapsed))
-                logger.info(f'events: {events}')
                 if not events:
                     # Poller timeout - publish current stats to front-ends.
                     if last_step_counts is not None:

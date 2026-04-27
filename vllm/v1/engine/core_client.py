@@ -578,7 +578,9 @@ class MPClient(EngineCoreClient):
                     self.resources.engine_manager = engine_manager
 
                 self.addresses = addresses
-                self.engine_registry = addresses.fault_tolerance_addresses.engine_core_sentinel_identities
+                self.engine_registry = (
+                    addresses.fault_tolerance_addresses.engine_core_sentinel_identities
+                )
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if self.enable_fault_tolerance:
                     assert client_addresses is not None
