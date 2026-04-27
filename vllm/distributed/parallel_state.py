@@ -48,7 +48,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.utils import (
     StatelessProcessGroup,
-    stateless_destroy_torch_distributed_process_group
+    stateless_destroy_torch_distributed_process_group,
 )
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname

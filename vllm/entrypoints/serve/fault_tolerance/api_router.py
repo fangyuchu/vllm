@@ -41,7 +41,7 @@ INSTRUCTION_PARAMS: dict[str, dict[str, dict[str, ParamType]]] = {
             "exclude_dp_ranks": list,
         },
         "optional": {},
-    }
+    },
 }
 
 
