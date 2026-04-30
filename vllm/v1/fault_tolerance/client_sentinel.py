@@ -127,10 +127,10 @@ class ClientSentinel(BaseSentinel):
         self._utility_encoder = MsgpackEncoder()
 
         self.start_rank = parallel_config.data_parallel_index
-        dp_size = parallel_config.data_parallel_size
-        dp_local_size = parallel_config.data_parallel_size_local
+        self.dp_size = parallel_config.data_parallel_size
+        self.dp_local_size = parallel_config.data_parallel_size_local
         num_dp_managed = (
-            dp_local_size if parallel_config.local_engines_only else dp_size
+            self.dp_local_size if parallel_config.local_engines_only else self.dp_size
         )
         self.engine_status_dict: dict[int, dict[str, str]] = {
             engine_index: {"status": "healthy"}
@@ -152,10 +152,7 @@ class ClientSentinel(BaseSentinel):
                 self.engine_identities,
             )
         }
-        asyncio.create_task(self.send_engine_registry(dp_size, dp_local_size))
         self._coord_store = None
-        import time
-        time.sleep(5)
         asyncio.create_task(self.run())
         asyncio.create_task(self.poll_and_execute_cmd())
 
@@ -264,7 +261,7 @@ class ClientSentinel(BaseSentinel):
             {
                 identity
                 for identity, index in self.engine_identity_to_index.items()
-                if index in exclude_dp_ranks
+                if index in exclude_dp_ranks and identity not in self.killed_engine_identity
             }
         )
 
@@ -441,6 +438,7 @@ class ClientSentinel(BaseSentinel):
 
     async def run(self):
         """Receive fault info from engine and pause engines if happened."""
+        await self.send_engine_registry(self.dp_size,self.dp_local_size)
         try:
             while not self.sentinel_dead:
                 _, _, message = await self.fault_receiver_socket.recv_multipart()
@@ -450,8 +448,10 @@ class ClientSentinel(BaseSentinel):
                     fault_info.engine_identity
                     and fault_info.engine_identity not in self.engine_registry.values()
                 ):
-                    self.killed_engine_identity.append(fault_info.engine_identity)
                     continue
+                if fault_info.type == "EngineDeadError":
+                    engine_identity = next(k for k, v in self.engine_identity_to_index.items() if v == int(fault_info.engine_id))
+                    self.killed_engine_identity.append(engine_identity)
                 status_enum = EngineStatusType(fault_info.engine_status)
                 self.engine_status_dict[int(fault_info.engine_id)] = {
                     "status": status_enum.name.lower()
