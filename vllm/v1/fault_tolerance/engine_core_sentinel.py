@@ -282,6 +282,13 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                             )
                             method, params = (ft_request.instruction, ft_request.params)
                             run_method(self, method, args=(), kwargs=params)
+
+                        # Drain stale futures and their corresponding
+                        # responses to prevent request-response mismatch
+                        # after the busy loop restarts. By this point the
+                        # worker has finished all in-flight commands (the
+                        # retry handshake with workers completed above).
+                        self.model_executor.drain_stale_responses()
                         # recovery succeeded; restart the busy loop
                         continue
                     except queue.Empty:
