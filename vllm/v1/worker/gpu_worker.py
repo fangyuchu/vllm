@@ -314,12 +314,20 @@ class Worker(WorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
-    def create_worker_sentinel(self, worker_cmd_addr: str):
+    def create_worker_sentinel(
+        self,
+        worker_cmd_addr: str,
+        restart_async_output_thread_callback: "Callable | None" = None,
+    ):
         def clear_input_batch_callback():
             input_batch = self.model_runner.input_batch
             cached_req_ids = input_batch.req_id_to_index.keys()
             for req_id in list(cached_req_ids):
                 input_batch.remove_request(req_id)
+
+        def reset_async_stream_callback():
+            if hasattr(self.model_runner, 'async_output_copy_stream'):
+                self.model_runner.async_output_copy_stream = torch.cuda.Stream()
 
         with set_current_vllm_config(self.vllm_config):
             self.worker_sentinel = WorkerSentinel(
@@ -327,6 +335,9 @@ class Worker(WorkerBase):
                 self.device,
                 worker_cmd_addr,
                 clear_input_batch_callback,
+                reset_async_stream_callback=reset_async_stream_callback,
+                restart_async_output_thread_callback=(
+                    restart_async_output_thread_callback),
             )
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool

@@ -71,11 +71,11 @@ from vllm.v1.engine.utils import (
     get_device_indices,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.fault_tolerance.engine_core_sentinel import (
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+from vllm.v1.fault_tolerance.wrapper import (
     EngineCoreSentinel,
     fault_tolerant_wrapper,
 )
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -865,20 +865,11 @@ class EngineCoreProc(EngineCore):
                 vllm_config.parallel_config.enable_fault_tolerance
             )
             if self.enable_fault_tolerance:
-                assert addresses.fault_tolerance_addresses is not None
-                ft_addresses = addresses.fault_tolerance_addresses
-                engine_core_sentinel_ids = ft_addresses.engine_core_sentinel_identities
-                ft_config = vllm_config.parallel_config.fault_tolerance_config
-                self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
-                # The ZMQ address between engine_core_sentinel and worker_sentinel.
                 worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
-                self.engine_core_sentinel = EngineCoreSentinel(
-                    parallel_config=vllm_config.parallel_config,
+                self.ft_sentinel = EngineCoreSentinel(
                     engine_index=self.engine_index,
-                    engine_input_q=self.input_queue,
-                    engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
-                    sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     worker_cmd_addr=worker_cmd_addr,
+                    parallel_config=vllm_config.parallel_config,
                 )
                 self.model_executor.collective_rpc(
                     method="create_worker_sentinel",
@@ -977,9 +968,6 @@ class EngineCoreProc(EngineCore):
             with handshake as addresses, local_handshake as client_addresses:
                 addresses.inputs = client_addresses.inputs
                 addresses.outputs = client_addresses.outputs
-                addresses.fault_tolerance_addresses = (
-                    client_addresses.fault_tolerance_addresses
-                )
                 yield addresses
 
         # Update config which may have changed from the handshake
@@ -1185,7 +1173,7 @@ class EngineCoreProc(EngineCore):
     def _ensure_busy_loop_running(self):
         if (
             self.enable_fault_tolerance
-            and self.engine_core_sentinel.stop_busy_loop.is_set()
+            and self.ft_sentinel.paused.is_set()
         ):
             raise EngineLoopPausedError("Engine busy loop is paused.")
         return True
@@ -1555,19 +1543,16 @@ class EngineCoreProc(EngineCore):
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
 
-    def handle_fault(self, call_id: int, client_index: int, args: dict):
-        """Call engine_core_sentinel to perform fault tolerance."""
-        uo = UtilityOutput(call_id=call_id)
-        try:
-            ft_result = self.engine_core_sentinel.handle_fault(
-                FaultToleranceRequest(**args)
-            )
-            uo.result = UtilityResult(ft_result)
-        except Exception as e:
-            logger.exception("Call to handle_fault method failed")
-            uo.failure_message = f"Call to handle_fault method failed: {e}"
-        outputs = EngineCoreOutputs(utility_output=uo)
-        self.output_queue.put_nowait((client_index, outputs))
+    def handle_fault_tolerance(self, ft_request: FaultToleranceRequest):
+        """Handle FT command when engine is running (not paused).
+
+        When the engine is paused due to a fault, the wrapper intercepts
+        this from the input queue directly. This method handles the case
+        where the engine is still running (e.g., explicit pause request).
+        Setting paused causes _ensure_busy_loop_running to raise
+        EngineLoopPausedError on the next loop iteration.
+        """
+        return self.ft_sentinel.handle_running_command(ft_request)
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised
@@ -1652,7 +1637,7 @@ class EngineCoreProc(EngineCore):
     def shutdown(self):
         super().shutdown()
         if self.enable_fault_tolerance:
-            self.engine_core_sentinel.shutdown()
+            self.ft_sentinel.shutdown()
 
 
 class DPEngineCoreProc(EngineCoreProc):

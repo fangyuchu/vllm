@@ -28,7 +28,6 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import (
-    FaultToleranceZmqAddresses,
     make_engine_down_report_socket,
     notify_engine_down,
 )
@@ -72,8 +71,6 @@ class EngineZmqAddresses:
     # Not used by engine, just relayed to front-end in handshake response.
     # Only required for external DP LB case.
     frontend_stats_publish_address: str | None = None
-    # ZMQ socket addresses for fault tolerance if applicable
-    fault_tolerance_addresses: FaultToleranceZmqAddresses | None = None
 
 
 @dataclass
@@ -1044,15 +1041,6 @@ def launch_core_engines(
         logger.info("Started DP Coordinator process (PID: %d)", coordinator.proc.pid)
     else:
         coordinator = None
-
-    if vllm_config.parallel_config.enable_fault_tolerance:
-        addresses.fault_tolerance_addresses = FaultToleranceZmqAddresses.build(
-            host,
-            dp_size,
-            addresses.inputs,
-            addresses.outputs,
-            vllm_config.parallel_config.fault_tolerance_config,
-        )
 
     if parallel_config.data_parallel_backend == "ray":
         logger.info("Starting ray-based data parallel backend")

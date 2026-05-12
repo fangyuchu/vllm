@@ -655,6 +655,7 @@ class WorkerProc:
         self.use_async_scheduling = scheduler_config.async_scheduling
         if self.use_async_scheduling:
             self.async_output_queue: queue.Queue = queue.Queue()
+            self._async_output_generation = 0
             self.async_output_copy_thread = Thread(
                 target=self.async_output_busy_loop,
                 daemon=True,
@@ -937,10 +938,13 @@ class WorkerProc:
         converted to a FAILURE response.
         """
         if isinstance(output, AsyncModelRunnerOutput):
+            gen = self._async_output_generation
             try:
                 output = output.get_output()
             except Exception as e:
                 output = e
+            if self._async_output_generation != gen:
+                return
 
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
@@ -973,9 +977,28 @@ class WorkerProc:
         if hasattr(self.worker, "device"):
             current_platform.set_device(self.worker.device)
 
+        my_queue = self.async_output_queue
         while True:
-            output = self.async_output_queue.get()
+            output = my_queue.get()
+            if output is None:
+                break
             self.enqueue_output(output)
+
+    def restart_async_output_thread(self):
+        """Restart the async output thread after fault tolerance retry.
+        The old thread may be stuck in event.synchronize() inside
+        enqueue_output — we can't unblock it, so we abandon it (daemon)
+        and start a fresh thread with a new queue. The generation counter
+        prevents the old thread from writing stale responses if it
+        eventually unblocks."""
+        self._async_output_generation += 1
+        self.async_output_queue = queue.Queue()
+        self.async_output_copy_thread = Thread(
+            target=self.async_output_busy_loop,
+            daemon=True,
+            name="WorkerAsyncOutputCopy",
+        )
+        self.async_output_copy_thread.start()
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
@@ -986,6 +1009,11 @@ class WorkerProc:
             )
             try:
                 if isinstance(method, str):
+                    if (method == "create_worker_sentinel"
+                            and self.use_async_scheduling):
+                        kwargs = dict(kwargs) if kwargs else {}
+                        kwargs["restart_async_output_thread_callback"] = (
+                            self.restart_async_output_thread)
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
