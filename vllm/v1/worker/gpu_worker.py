@@ -315,11 +315,12 @@ class Worker(WorkerBase):
             report_usage_stats(self.vllm_config)
 
     def create_worker_sentinel(self, worker_cmd_addr: str):
-        self.worker_sentinel = WorkerSentinel(
-            worker=self,
-            device=self.device,
-            worker_cmd_addr=worker_cmd_addr,
-        )
+        with set_current_vllm_config(self.vllm_config):
+            self.worker_sentinel = WorkerSentinel(
+                worker=self,
+                device=self.device,
+                worker_cmd_addr=worker_cmd_addr,
+            )
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.

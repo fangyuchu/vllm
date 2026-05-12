@@ -3,18 +3,19 @@
 import threading
 import time
 import traceback
-import uuid
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import msgspec.msgpack
 import zmq
 
 from vllm.config import ParallelConfig
+from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.logger import init_logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.engine import EngineCoreRequestType, EngineStatusType
 from vllm.v1.engine.exceptions import EngineLoopPausedError
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
 from vllm.v1.fault_tolerance.utils import (
     FaultInfo,
@@ -23,7 +24,7 @@ from vllm.v1.fault_tolerance.utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 
 logger = init_logger(__name__)
 
@@ -51,10 +52,14 @@ class EngineCoreSentinel(BaseSentinel):
             engine,
         )
 
+        self.data_parallel_size = parallel_config.data_parallel_size
         self.engine_recovery_timeout_sec = (
             parallel_config.fault_tolerance_config.engine_recovery_timeout_sec
         )
-        self.stop_busy_loop = threading.Event()
+        # flag to indicate if busy_loop should run.
+        self.run_busy_loop = threading.Event()
+        self.run_busy_loop.set()
+        # flag to indicate the status of busy loop.
         self.busy_loop_paused = threading.Event()
         self.worker_responsive = threading.Event()
         self.worker_responsive.set()
@@ -86,6 +91,7 @@ class EngineCoreSentinel(BaseSentinel):
         return self.host
 
     def report_fault_events(self, engine_exception, engine_status: EngineStatusType):
+        self.run_busy_loop.clear()
         msg = FaultInfo.from_exception(
             engine_exception, self.engine_index, engine_status
         )
@@ -111,12 +117,12 @@ class EngineCoreSentinel(BaseSentinel):
         timeout = ft_request.params["timeout"]
         deadline = time.monotonic() + timeout
         # set the flag to signal busy loop should pause
-        self.stop_busy_loop.set()
+        self.run_busy_loop.clear()
         # Put a wakeup request to unblock the busy loop
         # if it's blocked on input_queue.get()
         self.engine.input_queue.put((EngineCoreRequestType.WAKEUP, None))
         self._execute_command_on_workers(
-            FaultToleranceRequest(str(uuid.uuid4()), "pause", ft_request.params),
+            FaultToleranceRequest(ft_request.request_id, "pause", ft_request.params),
             self.worker_identities,
             timeout=timeout,
         )
@@ -131,6 +137,76 @@ class EngineCoreSentinel(BaseSentinel):
             success=success,
             reason=None if success else "The engine did not pause within timeout.",
         )
+
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        """
+        Handle the retry instruction from the ClientSentinel.
+        This instruction tells the EngineCore to continue its busy loop
+        after being suspended due to an exception.
+        """
+        timeout = ft_request.params["timeout"]
+        if not self.worker_responsive.wait(timeout=timeout):
+            return FaultToleranceResult(
+                request_id=ft_request.request_id,
+                success=False,
+                reason="Worker is not responsive yet.",
+            )
+        if not self.busy_loop_paused.is_set():
+            return FaultToleranceResult(ft_request.request_id, True)
+
+        parallel_config = self.engine.vllm_config.parallel_config
+        parallel_config._coord_store_port = ft_request.params["coord_store_port"]
+        worker_result = self._execute_command_on_workers(
+            FaultToleranceRequest(ft_request.request_id, "retry", ft_request.params),
+            self.worker_identities,
+            timeout=timeout,
+        )
+        if worker_result.success:
+            self.clean_engine_state()
+            self.run_busy_loop.set()
+            return FaultToleranceResult(request_id=ft_request.request_id, success=True)
+        else:
+            return worker_result
+
+    def clean_engine_state(self):
+        # Put running requests into waiting list.
+        scheduler = self.engine.scheduler
+        timestamp = time.monotonic()
+        while scheduler.running:  # type: ignore[attr-defined]
+            request = scheduler.running.pop()  # type: ignore[attr-defined]
+            scheduler.preempt_request(request, timestamp)  # type: ignore[attr-defined]
+        scheduler.prev_step_scheduled_req_ids.clear()  # type: ignore[attr-defined]
+        if self.engine.batch_queue is not None:
+            self.engine.batch_queue.clear()
+
+        if self.data_parallel_size > 1:
+            # If the Gloo communication times out,
+            # the data parallel group (dp_group) needs to be reinitialized
+            dp_engine = cast("DPEngineCoreProc", self.engine)
+            stateless_destroy_torch_distributed_process_group(dp_engine.dp_group)
+            dp_engine.dp_group = (
+                self.engine.vllm_config.parallel_config.stateless_init_dp_group()
+            )
+            dp_engine.step_counter = 0
+
+        executor = self.engine.model_executor
+        # Drain all stale futures and their pending responses
+        if isinstance(executor, MultiprocExecutor):
+            num_stale = len(executor.futures_queue)
+            executor.futures_queue.clear()
+            if num_stale == 0:
+                return
+            logger.info("Draining %d stale response(s) from response queue", num_stale)
+            if executor.kv_output_aggregator is not None:
+                mqs = executor.response_mqs
+            else:
+                mqs = [executor.response_mqs[executor.output_rank]]
+            for mq in mqs:
+                for _ in range(num_stale):
+                    try:
+                        mq.dequeue(timeout=0.1)
+                    except Exception:
+                        break
 
     def _execute_command_on_workers(
         self,
@@ -220,14 +296,16 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         "[BusyLoopWrapper] Busy loop Suspended and "
                         "waiting for fault tolerance instructions.",
                     )
-                    # todo: Currently only wait a certain time before shutting
-                    #  down the engine. Will implement fault tolerance methods
-                    #  in the upcoming PRs.
-                    time.sleep(self.sentinel.engine_recovery_timeout_sec)
+                    recovered = self.sentinel.run_busy_loop.wait(
+                        timeout=self.engine_recovery_timeout_sec
+                    )
+                    if recovered:
+                        continue
+                    else:
+                        logger.error(
+                            "[BusyLoopWrapper] EngineCore did not recover in time."
+                        )
 
-                # Fault tolerance not enabled OR no instruction received
-                # before timeout. Re-raise the original exception
-                # for upper level handling.
                 raise
 
     return run_with_fault_tolerance

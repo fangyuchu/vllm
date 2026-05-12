@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 import threading
 from typing import TYPE_CHECKING
 
@@ -8,7 +7,13 @@ import msgspec
 import torch
 import zmq
 
-from vllm.distributed import get_ep_group, get_pp_group, get_tp_group
+from vllm.distributed import (
+    get_dp_group,
+    get_ep_group,
+    get_pp_group,
+    get_tp_group,
+    stateless_init_torch_distributed_process_group,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
 from vllm.v1.fault_tolerance import BaseSentinel
@@ -20,6 +25,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _GLOBAL_PAUSE_EVENT = threading.Event()
+
+# Currently, only deepep_ll and nixl_ep backends support fault tolerance.
+_FT_BACKEND_SET = {"deepep_low_latency", "nixl_ep"}
 
 
 def get_pause_event() -> threading.Event:
@@ -34,13 +42,17 @@ class WorkerSentinel(BaseSentinel):
         device: torch.device,
         worker_cmd_addr: str,
     ):
-        dp_rank = worker.parallel_config.data_parallel_rank
+        self.dp_rank = worker.parallel_config.data_parallel_rank
         tp_rank = get_tp_group().rank_in_group
         pp_rank = get_pp_group().rank_in_group
         identity_str = f"PP{pp_rank}_TP{tp_rank}"
-        super().__init__(f"{dp_rank}_{identity_str}", identity_str.encode(), worker)
+        super().__init__(
+            f"{self.dp_rank}_{identity_str}", identity_str.encode(), worker
+        )
+        parallel_config = worker.parallel_config
         self.device = device
-        torch.accelerator.set_device_index(self.device)
+        self.data_parallel_master_ip = parallel_config.data_parallel_master_ip
+        self.dp_size = parallel_config.data_parallel_size
 
         self.engine_core_cmd_socket = make_zmq_socket(
             self.ctx,
@@ -50,11 +62,8 @@ class WorkerSentinel(BaseSentinel):
             identity=self.identity,
         )
 
-        # Currently, only deepep_ll and nixl_ep backends support fault tolerance.
-        ft_backend_set = {"deepep_low_latency", "nixl_ep"}
-        parallel_config = worker.parallel_config
         self.use_ft_backend = (
-            parallel_config.all2all_backend in ft_backend_set
+            parallel_config.all2all_backend in _FT_BACKEND_SET
             and parallel_config.data_parallel_size > 1
         )
         if self.use_ft_backend:
@@ -76,6 +85,7 @@ class WorkerSentinel(BaseSentinel):
         Receive and execute a command from upstream sentinel and send back
         the execution result.
         """
+        torch.accelerator.set_device_index(self.device)
         while not self.sentinel_dead:
             try:
                 _, msg = self.engine_core_cmd_socket.recv_multipart()
@@ -90,6 +100,42 @@ class WorkerSentinel(BaseSentinel):
     def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         get_pause_event().set()
         return FaultToleranceResult(ft_request.request_id, True)
+
+    def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        self.clean_worker_state()
+        get_pause_event().clear()
+        if self.dp_size > 1:
+            get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
+                self.data_parallel_master_ip,
+                ft_request.params["new_stateless_dp_group_port"],
+                self.dp_rank,
+                self.dp_size,
+                backend="gloo",
+                gloo_timeout_seconds=self.worker.parallel_config.gloo_timeout_seconds,
+            )
+            if self.worker.vllm_config.model_config.is_moe:
+                comm = get_ep_group().device_communicator
+                assert comm and comm.all2all_manager
+                if self.worker.parallel_config.all2all_backend not in _FT_BACKEND_SET:
+                    return FaultToleranceResult(
+                        ft_request.request_id,
+                        False,
+                        "Only support {} backends".format(_FT_BACKEND_SET),
+                    )
+                comm.all2all_manager.clean_mask()
+        return FaultToleranceResult(ft_request.request_id, True)
+
+    def clean_worker_state(self):
+        self.worker.model_runner.execute_model_state = None
+        self.worker.model_runner.kv_connector_output = None
+        input_batch = self.worker.model_runner.input_batch
+        cached_req_ids = input_batch.req_id_to_index.keys()
+        for req_id in list(cached_req_ids):
+            input_batch.remove_request(req_id)
+        input_batch.condense()
+        input_batch.refresh_metadata()
+        # remove_request() does not drop prompt embeds for removed indices
+        input_batch.req_prompt_embeds.clear()
 
     def shutdown(self):
         close_sockets([self.engine_core_cmd_socket])

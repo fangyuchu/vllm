@@ -890,6 +890,8 @@ class EngineCoreProc(EngineCore):
                 assert addresses.fault_tolerance_addresses is not None
                 ft_addresses = addresses.fault_tolerance_addresses
                 engine_core_sentinel_ids = ft_addresses.engine_core_sentinel_identities
+                ft_config = vllm_config.parallel_config.fault_tolerance_config
+                self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
                 # The ZMQ address between engine_core_sentinel and worker_sentinel.
                 worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
                 self.sentinel = EngineCoreSentinel(
@@ -1200,7 +1202,7 @@ class EngineCoreProc(EngineCore):
         raise SystemExit
 
     def _ensure_busy_loop_running(self):
-        if self.enable_fault_tolerance and self.sentinel.stop_busy_loop.is_set():
+        if self.enable_fault_tolerance and not self.sentinel.run_busy_loop.is_set():
             raise EngineLoopPausedError("Engine busy loop is paused.")
         return True
 

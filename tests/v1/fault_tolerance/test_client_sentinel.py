@@ -99,10 +99,10 @@ async def test_client_sentinel_initialization(client_sentinel: ClientSentinel):
 
 
 @pytest.mark.asyncio
-async def test_pause_operation(
-    client_sentinel: ClientSentinel, mock_call_utility_async
+@pytest.mark.parametrize("ft_operation", ["pause", "retry"])
+async def test_ft_operation(
+    client_sentinel: ClientSentinel, mock_call_utility_async, ft_operation: str
 ):
-    """Test pause method"""
     # Mock all engines to pause successfully
     mock_call_utility_async.return_value = {
         "request_id": "request_id",
@@ -112,7 +112,7 @@ async def test_pause_operation(
 
     request = FaultToleranceRequest.builder(
         request_id="request_id",
-        instruction="pause",
+        instruction=ft_operation,
         params={"timeout": 3},
     )
 
@@ -133,8 +133,9 @@ async def test_pause_operation(
 
 
 @pytest.mark.asyncio
-async def test_pause_operation_timeout(
-    client_sentinel: ClientSentinel, mock_call_utility_async
+@pytest.mark.parametrize("ft_operation", ["pause", "retry"])
+async def test_ft_operation_timeout(
+    client_sentinel: ClientSentinel, mock_call_utility_async, ft_operation: str
 ):
     """Pause should fail if engine responses exceed request timeout."""
 
@@ -146,7 +147,7 @@ async def test_pause_operation_timeout(
 
     request = FaultToleranceRequest.builder(
         request_id="request_id",
-        instruction="pause",
+        instruction=ft_operation,
         params={"timeout": 0.01},
     )
 
