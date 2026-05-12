@@ -1229,7 +1229,7 @@ class EngineCoreProc(EngineCore):
         raise SystemExit
 
     def _ensure_busy_loop_running(self):
-        if self.enable_fault_tolerance and self.sentinel.stop_busy_loop.is_set():
+        if self.enable_fault_tolerance and not self.sentinel.run_busy_loop.is_set():
             raise EngineLoopPausedError("Engine busy loop is paused.")
         return True
 
@@ -1954,11 +1954,6 @@ class DPEngineCoreProc(EngineCoreProc):
             logger.debug("DP pause consensus reached, ignoring START_DP_WAVE.")
 
         return has_unfinished
-
-    def reinit_dp_group_on_fault_tolerance(self):
-        stateless_destroy_torch_distributed_process_group(self.dp_group)
-        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group()
-        self.step_counter = 0
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
