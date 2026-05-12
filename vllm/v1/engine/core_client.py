@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import queue
 import sys
-import threading
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -39,6 +38,7 @@ from vllm.v1.engine import (
     EngineCoreReadyResponse,
     EngineCoreRequest,
     EngineCoreRequestType,
+    EngineStatusType,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -55,13 +55,11 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.fault_tolerance import ClientSentinel
 from vllm.v1.fault_tolerance.utils import (
-    FAULT_STATE_PUB_TOPIC,
     FaultToleranceRequest,
     FaultToleranceResult,
-    FaultToleranceZmqAddresses,
 )
+from vllm.v1.fault_tolerance.wrapper import FT_UTILITY_METHOD
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -398,8 +396,6 @@ class BackgroundResources:
     output_queue_task: asyncio.Task | None = None
     stats_update_task: asyncio.Task | None = None
     shutdown_path: str | None = None
-    client_sentinel: ClientSentinel | None = None
-    fault_state_sub_socket: zmq.Socket | None = None
 
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
@@ -409,8 +405,6 @@ class BackgroundResources:
         """Clean up background resources."""
 
         self.engine_dead = True
-        if self.client_sentinel is not None:
-            self.client_sentinel.shutdown()
         if self.engine_manager is not None:
             self.engine_manager.shutdown()
         if self.coordinator is not None:
@@ -426,7 +420,6 @@ class BackgroundResources:
                 self.first_req_send_socket,
                 self.first_req_rcv_socket,
                 self.stats_update_socket,
-                self.fault_state_sub_socket,
             )
 
             tasks = (self.output_queue_task, self.stats_update_task)
@@ -563,12 +556,6 @@ class MPClient(EngineCoreClient):
 
                 self.addresses = addresses
                 self.stats_update_address = addresses.frontend_stats_publish_address
-                if self.enable_fault_tolerance:
-                    assert client_addresses is not None
-                    assert addresses.fault_tolerance_addresses is not None
-                    client_addresses["fault_tolerance_addresses"] = (
-                        addresses.fault_tolerance_addresses.to_str()
-                    )
 
                 if coordinator is not None:
                     assert self.stats_update_address == (
@@ -928,11 +915,6 @@ class AsyncMPClient(MPClient):
         client_count: int = 1,
         client_index: int = 0,
     ):
-        if (
-            vllm_config.parallel_config.enable_fault_tolerance
-            and client_addresses is None
-        ):
-            client_addresses = {}
         super().__init__(
             asyncio_mode=True,
             vllm_config=vllm_config,
@@ -946,17 +928,7 @@ class AsyncMPClient(MPClient):
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
 
         if self.enable_fault_tolerance:
-            assert client_addresses is not None
-            ft_addr = FaultToleranceZmqAddresses.from_str(
-                client_addresses["fault_tolerance_addresses"]
-            )
-            if self.client_index == 0:
-                self.client_sentinel = ClientSentinel(
-                    fault_tolerance_addresses=ft_addr,
-                    client=self,
-                )
-                self.resources.client_sentinel = self.client_sentinel
-            self.engine_status = {
+            self._engine_status: dict = {
                 "schema_version": 1,
                 "total_engines": len(self.engine_ranks_managed),
                 "engines": [
@@ -964,23 +936,8 @@ class AsyncMPClient(MPClient):
                     for rank in self.engine_ranks_managed
                 ],
             }
-            self.engine_status_lock = threading.Lock()
-            self.fault_state_sub_socket = make_zmq_socket(
-                self.resources.ctx,
-                ft_addr.fault_state_pub_socket_addr,
-                zmq.SUB,
-                bind=False,
-            )
-            self.fault_state_sub_socket.setsockopt(
-                zmq.SUBSCRIBE,
-                FAULT_STATE_PUB_TOPIC.encode(),
-            )
-            self.resources.fault_state_sub_socket = self.fault_state_sub_socket
-            threading.Thread(
-                target=self._engine_status_listener,
-                daemon=True,
-                name="EngineStatusListenerThread",
-            ).start()
+        else:
+            self._engine_status = None
 
         try:
             # If we are running in an asyncio event loop, start the queue task.
@@ -1013,6 +970,8 @@ class AsyncMPClient(MPClient):
             Callable[[AsyncMPClient, Sequence[Any]], Any] | None
         ) = getattr(self.__class__, "eep_process_engine_core_notification", None)
 
+        engine_status = self._engine_status
+
         async def process_outputs_socket():
             try:
                 while True:
@@ -1041,6 +1000,15 @@ class AsyncMPClient(MPClient):
                                 outputs.utility_output, utility_results
                             )
                         continue
+
+                    if engine_status is not None and outputs.health_status is not None:
+                        status_name = EngineStatusType(
+                            outputs.health_status
+                        ).name.lower()
+                        for entry in engine_status["engines"]:
+                            if entry["id"] == outputs.engine_index:
+                                entry["status"] = status_name
+                                break
 
                     if output_handler is not None:
                         assert _self_ref is not None
@@ -1210,24 +1178,13 @@ class AsyncMPClient(MPClient):
     async def handle_fault(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
-        res = await self._call_utility_async(
-            ft_request.instruction, ft_request, engine=b"client_sentinel"
+        res = await self.call_utility_async(
+            FT_UTILITY_METHOD, ft_request
         )
         return FaultToleranceResult(**res)
 
-    def _engine_status_listener(self):
-        decoder = msgspec.msgpack.Decoder()
-        while True:
-            try:
-                frames = self.fault_state_sub_socket.recv_multipart()
-                with self.engine_status_lock:
-                    self.engine_status = decoder.decode(frames[-1])
-            except zmq.ZMQError:
-                break
-
     async def fault_reporter(self):
-        with self.engine_status_lock:
-            return self.engine_status
+        return self._engine_status
 
 
 class DPAsyncMPClient(AsyncMPClient):
@@ -1598,8 +1555,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             await self._scale_down_elastic_ep(
                 cur_data_parallel_size, new_data_parallel_size
             )
-        if self.enable_fault_tolerance:
-            await self.client_sentinel.refresh_engine_status(new_data_parallel_size)
 
     async def _eep_wait_for_setup_switch_complete(self) -> None:
         """

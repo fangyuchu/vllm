@@ -236,6 +236,10 @@ class EngineCoreOutputs(
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
 
+    # Fault tolerance: engine health status update
+    health_status: int | None = None
+    health_message: str | None = None
+
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()

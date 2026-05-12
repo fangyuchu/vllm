@@ -405,6 +405,27 @@ class MultiprocExecutor(Executor):
 
         return future if non_block else future.result()
 
+    def drain_stale_responses(self):
+        """Drain all stale futures and their pending responses from the
+        response message queues. Called during fault tolerance recovery to
+        reset the request-response pipeline before restarting the busy loop.
+        """
+        num_stale = len(self.futures_queue)
+        self.futures_queue.clear()
+        if num_stale == 0:
+            return
+        logger.info("Draining %d stale response(s) from response queue", num_stale)
+        if self.kv_output_aggregator is not None:
+            mqs = self.response_mqs
+        else:
+            mqs = (self.response_mqs[self.output_rank],)
+        for mq in mqs:
+            for _ in range(num_stale):
+                try:
+                    mq.dequeue(timeout=30)
+                except Exception:
+                    break
+
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):
         """Ensure that all worker processes are terminated. Assumes workers have
