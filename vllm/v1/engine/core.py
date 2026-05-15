@@ -1862,11 +1862,9 @@ class DPEngineCoreProc(EngineCoreProc):
 
         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
 
-    def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port: int):
+    def reinit_dp_group_on_fault_tolerance(self):
         stateless_destroy_torch_distributed_process_group(self.dp_group)
-        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group(
-            dp_init_port=new_stateless_dp_group_port,
-        )
+        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group()
         self.step_counter = 0
 
     def reinitialize_distributed(
