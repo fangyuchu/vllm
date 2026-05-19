@@ -102,21 +102,18 @@ class WorkerSentinel:
         self.clean_worker_state()
         get_pause_event().clear()
         if self.dp_size > 1:
+            port = params["new_stateless_dp_group_port"]
             get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
                 self.data_parallel_master_ip,
-                params["new_stateless_dp_group_port"],
+                port,
                 self.dp_rank,
                 self.dp_size,
                 backend="gloo",
                 gloo_timeout_seconds=self.worker.parallel_config.gloo_timeout_seconds,
             )
-            if self.worker.vllm_config.model_config.is_moe:
+            if self.use_ft_backend:
                 comm = get_ep_group().device_communicator
                 assert comm and comm.all2all_manager
-                if self.worker.parallel_config.all2all_backend not in _FT_BACKEND_SET:
-                    raise RuntimeError(
-                        "Only support {} backends".format(_FT_BACKEND_SET)
-                    )
                 comm.all2all_manager.clean_mask()
 
     def clean_worker_state(self):

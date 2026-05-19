@@ -96,12 +96,33 @@ class EngineCoreSentinel:
         """
         instruction = ft_request.instruction
         if instruction == "pause":
+            exclude = ft_request.params.get("exclude_engine_index", [])
+            if self.engine_index in exclude:
+                return {
+                    "request_id": ft_request.request_id,
+                    "success": True,
+                    "reason": f"Engine {self.engine_index} excluded from pause.",
+                }
             self.send_cmd_to_workers("pause")
             self.paused.set()
+            return {
+                "request_id": ft_request.request_id,
+                "success": True,
+                "reason": None,
+            }
+        if instruction == "inject_fault":
+            self._injected_fault = ft_request.params.get(
+                "message", "Injected fault for testing"
+            )
+            return {
+                "request_id": ft_request.request_id,
+                "success": True,
+                "reason": None,
+            }
         return {
             "request_id": ft_request.request_id,
-            "success": True,
-            "reason": None,
+            "success": False,
+            "reason": f"Instruction '{instruction}' not applicable while running.",
         }
 
     def recover(self, engine: "EngineCoreProc", original_exc: Exception):
@@ -129,7 +150,8 @@ class EngineCoreSentinel:
 
             if result.success:
                 self._publish_healthy(engine)
-                engine.model_executor.drain_stale_responses()
+                if hasattr(engine.model_executor, 'drain_stale_responses'):
+                    engine.model_executor.drain_stale_responses()
                 return True
             else:
                 logger.error("[FT] Command failed: %s", result.reason)
@@ -259,37 +281,49 @@ class EngineCoreSentinel:
     def _do_retry(self, engine: "EngineCoreProc", params: dict):
         """Execute retry: reinit workers and engine DP group."""
         from vllm.distributed.utils import (
-            get_cached_tcp_store_client,
             stateless_destroy_torch_distributed_process_group,
+            stateless_init_torch_distributed_process_group,
         )
         from vllm.utils.network_utils import get_open_port
 
         parallel_config = engine.vllm_config.parallel_config
         worker_params: dict = {}
+        engine_dp_port: int | None = None
 
-        if parallel_config.data_parallel_size > 1:
-            # Coordinate worker DP group port via coord store.
-            # dp_rank=0 picks a port and publishes; others read the same port.
-            store = get_cached_tcp_store_client(
-                parallel_config.data_parallel_master_ip,
-                parallel_config._coord_store_port,
-            )
-            key = "ft_worker_dp_port"
+        if parallel_config.data_parallel_size > 1 and hasattr(engine, "dp_store"):
+            # Use the existing dp_store to coordinate ports for both
+            # worker Gloo group and engine Gloo group rebuild.
             if parallel_config.data_parallel_rank == 0:
-                port = get_open_port()
-                store.set(key, str(port).encode())
+                worker_port = get_open_port()
+                engine_port = get_open_port()
+                engine.dp_store.set("ft_worker_dp_port", str(worker_port).encode())
+                engine.dp_store.set("ft_engine_dp_port", str(engine_port).encode())
             else:
-                port = int(store.get(key).decode())
-            worker_params["new_stateless_dp_group_port"] = port
+                worker_port = int(engine.dp_store.get("ft_worker_dp_port").decode())
+                engine_port = int(engine.dp_store.get("ft_engine_dp_port").decode())
+            worker_params["new_stateless_dp_group_port"] = worker_port
+            engine_dp_port = engine_port
 
         self.send_cmd_to_workers("retry", worker_params)
 
         # Reinit the engine-side DP group (only for DPEngineCoreProc).
         if hasattr(engine, "dp_group"):
             stateless_destroy_torch_distributed_process_group(engine.dp_group)
-            engine.dp_group, engine.dp_store = (
-                parallel_config.stateless_init_dp_group(return_store=True)
-            )
+            if engine_dp_port is not None:
+                result = stateless_init_torch_distributed_process_group(
+                    parallel_config.data_parallel_master_ip,
+                    engine_dp_port,
+                    parallel_config.data_parallel_rank,
+                    parallel_config.data_parallel_size,
+                    backend="gloo",
+                    return_store=True,
+                    gloo_timeout_seconds=parallel_config.gloo_timeout_seconds,
+                )
+                engine.dp_group, engine.dp_store = result
+            else:
+                engine.dp_group, engine.dp_store = (
+                    parallel_config.stateless_init_dp_group(return_store=True)
+                )
             engine.step_counter = 0
 
 

@@ -1224,6 +1224,11 @@ class EngineCoreProc(EngineCore):
             and self.ft_sentinel.paused.is_set()
         ):
             raise EngineLoopPausedError("Engine busy loop is paused.")
+        if self.enable_fault_tolerance:
+            fault_msg = getattr(self.ft_sentinel, "_injected_fault", None)
+            if fault_msg:
+                self.ft_sentinel._injected_fault = None
+                raise RuntimeError(fault_msg)
         return True
 
     def _process_input_queue(self):
@@ -1231,6 +1236,9 @@ class EngineCoreProc(EngineCore):
 
         waited = False
         while not self.has_work() and self.is_running():
+            if (self.enable_fault_tolerance
+                    and self.ft_sentinel.paused.is_set()):
+                break
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
