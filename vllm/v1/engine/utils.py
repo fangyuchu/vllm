@@ -182,7 +182,7 @@ class CoreEngineProcManager:
         """Wait for any process to exit."""
         connection.wait(proc.sentinel for proc in self.processes)
 
-    def monitor_engine_liveness(self, engine_identity, run_headless=False) -> None:
+    def monitor_engine_liveness(self, engine_identity=None, run_headless=False) -> None:
         """Monitor engine core process liveness."""
         if run_headless and self.enable_fault_tolerance:
             engine_identity = msgpack.loads(

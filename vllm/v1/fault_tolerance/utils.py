@@ -165,7 +165,7 @@ def make_engine_down_report_socket(vllm_config):
     return zmq_ctx, engine_down_socket
 
 
-def notify_engine_down(engine_down_socket, engine_id, engine_identity):
+def notify_engine_down(engine_down_socket, engine_id, engine_identity=None):
     fault_info = FaultInfo(
         type="EngineDeadError",
         message="Engine died unexpectedly.",

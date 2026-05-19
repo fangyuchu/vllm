@@ -610,16 +610,14 @@ class MPClient(EngineCoreClient):
                     self.resources.engine_manager = engine_manager
 
                 self.addresses = addresses
-                self.engine_registry = (
-                    addresses.fault_tolerance_addresses.engine_core_sentinel_identities
-                )
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if self.enable_fault_tolerance:
                     assert client_addresses is not None
                     assert addresses.fault_tolerance_addresses is not None
-                    client_addresses["fault_tolerance_addresses"] = (
-                        addresses.fault_tolerance_addresses.to_str()
-                    )
+                    ft_addrs = addresses.fault_tolerance_addresses
+
+                    self.engine_registry = ft_addrs.engine_core_sentinel_identities
+                    client_addresses["fault_tolerance_addresses"] = ft_addrs.to_str()
 
                 if coordinator is not None:
                     assert self.stats_update_address == (
@@ -726,7 +724,11 @@ class MPClient(EngineCoreClient):
         # logs an error, shuts down the client and invokes the failure
         # callback to inform the engine.
         def monitor_engine_cores():
-            engine_manager.monitor_engine_liveness(self.engine_registry)
+            if isinstance(engine_manager, CoreEngineProcManager):
+                engine_manager.monitor_engine_liveness(self.engine_registry)
+            else:
+                engine_manager.monitor_engine_liveness()
+
             _self = self_ref()
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
