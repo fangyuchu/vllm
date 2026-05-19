@@ -87,7 +87,7 @@ class ClientSentinel(BaseSentinel):
         self.sentinel_dead = False
         self._shutdown_task: asyncio.Task | None = None
         self.core_client = core_client
-        self.killed_engine_identity = []
+        self.killed_engine_identity: list[bytes] = []
 
         # Port for receiving fault signals:
         # 1. Exceptions caught by fault_tolerant_wrapper in EngineCore
@@ -261,7 +261,8 @@ class ClientSentinel(BaseSentinel):
             {
                 identity
                 for identity, index in self.engine_identity_to_index.items()
-                if index in exclude_dp_ranks and identity not in self.killed_engine_identity
+                if index in exclude_dp_ranks
+                and identity not in self.killed_engine_identity
             }
         )
 
@@ -343,9 +344,11 @@ class ClientSentinel(BaseSentinel):
             ):
                 del self.core_client.lb_engines[local_rank]
 
-    async def descale(self, ft_request: FaultToleranceRequest) -> bool:
+    async def descale(self, ft_request: FaultToleranceRequest) -> bool:  # type: ignore[override]
         exclude_dp_ranks = ft_request.params.get("exclude_dp_ranks")
         timeout = ft_request.params.get("timeout")
+        assert timeout is not None, "timeout is required"
+        assert exclude_dp_ranks is not None, "exclude_dp_ranks is required"
         for faulty_rank in exclude_dp_ranks:
             if self.engine_status_dict[faulty_rank]["status"] != "dead":
                 self.engine_status_dict[faulty_rank]["status"] = "dead"
@@ -367,7 +370,6 @@ class ClientSentinel(BaseSentinel):
             }
         )
 
-        new_stateless_dp_group_port = get_open_port()
         descale_request = FaultToleranceRequest.builder(
             request_id=str(uuid.uuid4()),
             instruction="descale",
@@ -375,8 +377,7 @@ class ClientSentinel(BaseSentinel):
                 "timeout": timeout,
                 "exclude_dp_ranks": exclude_dp_ranks,
                 "original_to_new": original_to_new,
-                "new_stateless_dp_group_port": new_stateless_dp_group_port,
-                "coord_store_port": self.parallel_config._coord_store_port
+                "coord_store_port": self.parallel_config._coord_store_port,
             },
         )
         res = await self._execute_cmd_on_engines(descale_request, target_engines)
@@ -443,7 +444,7 @@ class ClientSentinel(BaseSentinel):
 
     async def run(self):
         """Receive fault info from engine and pause engines if happened."""
-        await self.send_engine_registry(self.dp_size,self.dp_local_size)
+        await self.send_engine_registry(self.dp_size, self.dp_local_size)
         try:
             while not self.sentinel_dead:
                 _, _, message = await self.fault_receiver_socket.recv_multipart()
@@ -455,7 +456,11 @@ class ClientSentinel(BaseSentinel):
                 ):
                     continue
                 if fault_info.type == "EngineDeadError":
-                    engine_identity = next(k for k, v in self.engine_identity_to_index.items() if v == int(fault_info.engine_id))
+                    engine_identity = next(
+                        k
+                        for k, v in self.engine_identity_to_index.items()
+                        if v == int(fault_info.engine_id)
+                    )
                     self.killed_engine_identity.append(engine_identity)
                 status_enum = EngineStatusType(fault_info.engine_status)
                 self.engine_status_dict[int(fault_info.engine_id)] = {

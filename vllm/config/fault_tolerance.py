@@ -33,3 +33,6 @@ class FaultToleranceConfig:
     """
 
     gloo_comm_timeout: int = 30
+    """
+    Gloo communication timeout duration in seconds
+    """
