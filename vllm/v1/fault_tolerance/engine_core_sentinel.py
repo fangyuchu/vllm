@@ -27,7 +27,7 @@ from vllm.v1.fault_tolerance.utils import (
 from vllm.v1.serial_utils import run_method
 
 if TYPE_CHECKING:
-    from vllm.v1.engine.core import DPEngineCoreProc
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 
 logger = init_logger(__name__)
 
@@ -48,7 +48,7 @@ class EngineCoreSentinel(BaseSentinel):
         engine_fault_socket_addr: str,
         sentinel_identity: bytes,
         worker_cmd_addr: str,
-        engine_core: "DPEngineCoreProc",
+        engine_core: "EngineCoreProc",
     ):
         self.engine_index = engine_index
         super().__init__(
@@ -246,12 +246,12 @@ class EngineCoreSentinel(BaseSentinel):
             "data_parallel_master_port": parallel_config.data_parallel_master_port,
         }
 
-    def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port):
+    def reinit_dp_group_on_fault_tolerance(self):
+        if not isinstance(self.engine_core, DPEngineCoreProc):
+            return
         stateless_destroy_torch_distributed_process_group(self.engine_core.dp_group)
         self.engine_core.dp_group = (
-            self.engine_core.vllm_config.parallel_config.stateless_init_dp_group(
-                dp_init_port=new_stateless_dp_group_port
-            )
+            self.engine_core.vllm_config.parallel_config.stateless_init_dp_group()
         )
         self.engine_core.step_counter = 0
 
@@ -268,9 +268,8 @@ class EngineCoreSentinel(BaseSentinel):
         original_to_new = ft_request.params["original_to_new"]
         exclude_dp_ranks = ft_request.params["exclude_dp_ranks"]
         self.parallel_config._coord_store_port = ft_request.params["coord_store_port"]
-        logger.info(f'original_to_new is {original_to_new}')
         deadline = time.monotonic() + timeout
-        original_to_new = {int(k): v for k,v in original_to_new.items()}
+        original_to_new = {int(k): v for k, v in original_to_new.items()}
         self.engine_index = original_to_new[self.engine_index]
         exclude_ep_ranks = self._calculate_exclude_ep_ranks(
             exclude_dp_ranks, self.engine_core.vllm_config
@@ -292,7 +291,7 @@ class EngineCoreSentinel(BaseSentinel):
                     "timeout": timeout,
                     "exclude_ep_ranks": exclude_ep_ranks,
                     "vllm_config_update_dict": vllm_config_update_dict,
-                    "coord_store_port": self.parallel_config._coord_store_port
+                    "coord_store_port": self.parallel_config._coord_store_port,
                 },
             )
 

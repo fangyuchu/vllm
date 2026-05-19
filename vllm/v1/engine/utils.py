@@ -205,7 +205,7 @@ class CoreEngineProcManager:
         if self._finalizer.detach() is not None:
             shutdown(self.processes, timeout=timeout)
 
-    def monitor_engine_liveness(self, engine_identity, run_headless=False) -> None:
+    def monitor_engine_liveness(self, engine_identity=None, run_headless=False) -> None:
         """Monitor engine core process liveness."""
         if run_headless and self.enable_fault_tolerance:
             engine_identity = msgpack.loads(
