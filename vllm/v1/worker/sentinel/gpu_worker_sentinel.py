@@ -16,7 +16,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
-from vllm.v1.fault_tolerance.utils import FaultToleranceCommand
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -30,77 +30,66 @@ _FT_BACKEND_SET = {"deepep_low_latency", "nixl_ep"}
 
 
 def get_pause_event() -> threading.Event:
-    global _GLOBAL_PAUSE_EVENT
     return _GLOBAL_PAUSE_EVENT
 
 
 class WorkerSentinel:
-    def __init__(
-        self,
-        worker: "Worker",
-        device: torch.device,
-        worker_cmd_addr: str,
-    ):
+    """Daemon thread that receives FT commands from EngineCoreSentinel."""
+
+    def __init__(self, worker: "Worker", device: torch.device,
+                 worker_cmd_addr: str):
         self.worker = worker
-        self.sentinel_dead = False
+        self.dead = False
+        self.device = device
         self.dp_rank = worker.parallel_config.data_parallel_rank
+        self.dp_size = worker.parallel_config.data_parallel_size
+        self.data_parallel_master_ip = (
+            worker.parallel_config.data_parallel_master_ip
+        )
+
         tp_rank = get_tp_group().rank_in_group
         pp_rank = get_pp_group().rank_in_group
-        identity = f"PP{pp_rank}_TP{tp_rank}".encode()
-        self.device = device
-        self.data_parallel_master_ip = worker.parallel_config.data_parallel_master_ip
-        self.dp_size = worker.parallel_config.data_parallel_size
-
         self.ctx = zmq.Context()
-        self.engine_core_cmd_socket = make_zmq_socket(
-            self.ctx,
-            worker_cmd_addr,
-            zmq.DEALER,
-            bind=False,
-            identity=identity,
+        self.cmd_socket = make_zmq_socket(
+            self.ctx, worker_cmd_addr, zmq.DEALER, bind=False,
+            identity=f"PP{pp_rank}_TP{tp_rank}".encode(),
         )
 
         self.use_ft_backend = (
             worker.parallel_config.all2all_backend in _FT_BACKEND_SET
-            and worker.parallel_config.data_parallel_size > 1
+            and self.dp_size > 1
         )
         if self.use_ft_backend:
             world_size = get_ep_group().world_size
-            self.mask = torch.zeros((world_size,), device=self.device, dtype=torch.int)
+            self.mask = torch.zeros(world_size, device=device, dtype=torch.int)
             self.last_mask = torch.zeros_like(self.mask)
 
         threading.Thread(
-            target=self.run, daemon=True, name="WorkerSentinelThread"
+            target=self._run, daemon=True, name="WorkerSentinel"
         ).start()
 
-    def run(self):
-        """Receive and execute commands from EngineCoreSentinel."""
+    def _run(self):
         torch.accelerator.set_device_index(self.device)
-        while not self.sentinel_dead:
+        while not self.dead:
             try:
-                _, msg = self.engine_core_cmd_socket.recv_multipart()
-                cmd = msgspec.msgpack.decode(msg, type=FaultToleranceCommand)
-                self._execute_cmd(cmd)
-                self.engine_core_cmd_socket.send_multipart([b"", b"ok"])
+                _, msg = self.cmd_socket.recv_multipart()
+                cmd = msgspec.msgpack.decode(msg, type=FaultToleranceRequest)
+                self._handle(cmd)
+                self.cmd_socket.send_multipart([b"", b"ok"])
             except zmq.ZMQError:
-                logger.info("Socket closed, terminating.")
-                self.sentinel_dead = True
+                self.dead = True
 
-    def _execute_cmd(self, cmd: FaultToleranceCommand):
-        instruction = cmd.instruction
-        if instruction == "pause":
-            self.pause()
-        elif instruction == "retry":
-            self.retry(cmd.params or {})
+    def _handle(self, cmd: FaultToleranceRequest):
+        if cmd.instruction == "pause":
+            _GLOBAL_PAUSE_EVENT.set()
+        elif cmd.instruction == "retry":
+            self._retry(cmd.params or {})
         else:
-            logger.warning("Unknown FT command: %s", instruction)
+            logger.warning("Unknown FT command: %s", cmd.instruction)
 
-    def pause(self):
-        get_pause_event().set()
-
-    def retry(self, params: dict):
-        self.clean_worker_state()
-        get_pause_event().clear()
+    def _retry(self, params: dict):
+        self._clean_worker_state()
+        _GLOBAL_PAUSE_EVENT.clear()
         if self.dp_size > 1:
             port = params["new_stateless_dp_group_port"]
             get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
@@ -116,7 +105,7 @@ class WorkerSentinel:
                 assert comm and comm.all2all_manager
                 comm.all2all_manager.clean_mask()
 
-    def clean_worker_state(self):
+    def _clean_worker_state(self):
         self.worker.model_runner.execute_model_state = None
         self.worker.model_runner.kv_connector_output = None
         input_batch = self.worker.model_runner.input_batch
@@ -128,6 +117,6 @@ class WorkerSentinel:
         input_batch.req_prompt_embeds.clear()
 
     def shutdown(self):
-        self.sentinel_dead = True
-        close_sockets([self.engine_core_cmd_socket])
+        self.dead = True
+        close_sockets([self.cmd_socket])
         self.ctx.term()

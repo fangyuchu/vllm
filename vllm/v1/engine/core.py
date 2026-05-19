@@ -73,9 +73,9 @@ from vllm.v1.engine.utils import (
     get_device_indices,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.fault_tolerance.wrapper import (
     EngineCoreSentinel,
+    FT_UTILITY_METHOD,
     fault_tolerant_wrapper,
 )
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
@@ -917,7 +917,7 @@ class EngineCoreProc(EngineCore):
             if self.enable_fault_tolerance:
                 worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
                 self.ft_sentinel = EngineCoreSentinel(
-                    engine_index=self.engine_index,
+                    engine=self,
                     worker_cmd_addr=worker_cmd_addr,
                     parallel_config=vllm_config.parallel_config,
                 )
@@ -1219,26 +1219,15 @@ class EngineCoreProc(EngineCore):
         raise SystemExit
 
     def _ensure_busy_loop_running(self):
-        if (
-            self.enable_fault_tolerance
-            and self.ft_sentinel.paused.is_set()
-        ):
+        if (self.enable_fault_tolerance
+                and self.ft_sentinel.paused.is_set()):
             raise EngineLoopPausedError("Engine busy loop is paused.")
-        if self.enable_fault_tolerance:
-            fault_msg = getattr(self.ft_sentinel, "_injected_fault", None)
-            if fault_msg:
-                self.ft_sentinel._injected_fault = None
-                raise RuntimeError(fault_msg)
-        return True
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
         waited = False
         while not self.has_work() and self.is_running():
-            if (self.enable_fault_tolerance
-                    and self.ft_sentinel.paused.is_set()):
-                break
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
@@ -1518,6 +1507,11 @@ class EngineCoreProc(EngineCore):
                             continue
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
+                        client_idx, call_id, method, args = request
+                        if method == FT_UTILITY_METHOD:
+                            self._handle_ft_command(
+                                client_idx, call_id, args[0])
+                            continue
                     else:
                         request = generic_decoder.decode(data_frames)
 
@@ -1598,16 +1592,20 @@ class EngineCoreProc(EngineCore):
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
 
-    def handle_fault_tolerance(self, ft_request: FaultToleranceRequest):
-        """Handle FT command when engine is running (not paused).
+    def _handle_ft_command(self, client_idx: int, call_id: int,
+                           ft_args):
+        """Handle FT command directly from process_input_sockets thread."""
+        from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 
-        When the engine is paused due to a fault, the wrapper intercepts
-        this from the input queue directly. This method handles the case
-        where the engine is still running (e.g., explicit pause request).
-        Setting paused causes _ensure_busy_loop_running to raise
-        EngineLoopPausedError on the next loop iteration.
-        """
-        return self.ft_sentinel.handle_running_command(ft_request)
+        if isinstance(ft_args, dict):
+            ft_request = FaultToleranceRequest(**ft_args)
+        else:
+            ft_request = ft_args
+        result = self.ft_sentinel.execute(ft_request)
+        uo = UtilityOutput(call_id)
+        uo.result = UtilityResult(result)
+        self.output_queue.put_nowait((
+            client_idx, EngineCoreOutputs(utility_output=uo)))
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised

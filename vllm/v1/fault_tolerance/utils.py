@@ -19,20 +19,9 @@ class FaultToleranceResult(msgspec.Struct):
 
 
 class FaultToleranceRequest(msgspec.Struct):
-    request_id: str
     instruction: str
     params: dict[str, Any]
-
-    @classmethod
-    def builder(
-        cls, request_id: str, instruction: str, params: dict[str, Any]
-    ) -> "FaultToleranceRequest":
-        return cls(request_id=request_id, instruction=instruction, params=params)
-
-
-class FaultToleranceCommand(msgspec.Struct):
-    instruction: str
-    params: dict[str, Any] | None = None
+    request_id: str = ""
 
 
 class FaultInfo(msgspec.Struct):
@@ -40,8 +29,6 @@ class FaultInfo(msgspec.Struct):
     message: str
     engine_id: str
     engine_status: EngineStatusType
-    timestamp: str | None = None
-    additional_info: dict | None = None
 
 
 def make_engine_down_report_socket(vllm_config):

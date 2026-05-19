@@ -1181,7 +1181,15 @@ class AsyncMPClient(MPClient):
         res = await self.call_utility_async(
             FT_UTILITY_METHOD, ft_request
         )
-        return FaultToleranceResult(**res)
+        result = FaultToleranceResult(**res)
+        # After a successful retry, reset engines_running so the
+        # coordinator wakeup mechanism ("FIRST_REQ" in add_request_async)
+        # properly notifies all engines on the first post-recovery request.
+        if (result.success
+                and ft_request.instruction == "retry"
+                and hasattr(self, "engines_running")):
+            self.engines_running = False
+        return result
 
     async def fault_reporter(self):
         return self._engine_status
