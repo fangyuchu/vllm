@@ -98,7 +98,6 @@ class WorkerSentinel:
                 self.dp_rank,
                 self.dp_size,
                 backend="gloo",
-                gloo_timeout_seconds=self.worker.parallel_config.gloo_timeout_seconds,
             )
             if self.use_ft_backend:
                 comm = get_ep_group().device_communicator

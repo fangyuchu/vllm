@@ -20,13 +20,8 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineStatusType,
-    UtilityOutput,
 )
-from vllm.v1.fault_tolerance.utils import (
-    FaultToleranceRequest,
-    FaultToleranceResult,
-)
-from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 
 if TYPE_CHECKING:
     from vllm.v1.engine.core import EngineCoreProc
@@ -68,6 +63,7 @@ class EngineCoreSentinel:
         self.paused = threading.Event()
         self.resumed = threading.Event()
         self.resumed.set()
+        self.status = EngineStatusType.HEALTHY
 
     # ------------------------------------------------------------------
     # Worker communication
@@ -122,6 +118,13 @@ class EngineCoreSentinel:
                 self._do_pause(ft_request)
             elif instruction == "retry":
                 self._do_retry(ft_request)
+            elif instruction == "status":
+                return {
+                    "request_id": ft_request.request_id,
+                    "success": True,
+                    "engine_id": self.engine_index,
+                    "status": self.status.name.lower(),
+                }
             else:
                 return {"request_id": ft_request.request_id, "success": False,
                         "reason": f"Unknown instruction: {instruction}"}
@@ -140,6 +143,7 @@ class EngineCoreSentinel:
         self.send_cmd_to_workers("pause")
         self.paused.set()
         self.resumed.clear()
+        self._publish_status(EngineStatusType.PAUSED)
         # Unblock the busy loop so it sees the paused state.
         self.engine.input_queue.put(
             (EngineCoreRequestType.WAKEUP, None))
@@ -186,8 +190,6 @@ class EngineCoreSentinel:
                         parallel_config.data_parallel_size,
                         backend="gloo",
                         return_store=True,
-                        gloo_timeout_seconds=(
-                            parallel_config.gloo_timeout_seconds),
                     )
                 )
             else:
@@ -310,14 +312,13 @@ class EngineCoreSentinel:
 
     def _publish_status(self, status: EngineStatusType,
                         message: str | None = None):
-        self.engine.output_queue.put_nowait((
-            0,
-            EngineCoreOutputs(
-                engine_index=self.engine_index,
-                health_status=status,
-                health_message=message,
-            ),
-        ))
+        self.status = status
+        if message:
+            logger.info("[FT] Engine %d status -> %s: %s",
+                        self.engine_index, status.name, message)
+        else:
+            logger.info("[FT] Engine %d status -> %s",
+                        self.engine_index, status.name)
 
     def shutdown(self):
         self.worker_cmd_socket.close()

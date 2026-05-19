@@ -38,7 +38,6 @@ from vllm.v1.engine import (
     EngineCoreReadyResponse,
     EngineCoreRequest,
     EngineCoreRequestType,
-    EngineStatusType,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -927,18 +926,6 @@ class AsyncMPClient(MPClient):
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
 
-        if self.enable_fault_tolerance:
-            self._engine_status: dict = {
-                "schema_version": 1,
-                "total_engines": len(self.engine_ranks_managed),
-                "engines": [
-                    {"id": rank, "status": "healthy"}
-                    for rank in self.engine_ranks_managed
-                ],
-            }
-        else:
-            self._engine_status = None
-
         try:
             # If we are running in an asyncio event loop, start the queue task.
             # Otherwise, it will be started lazily. If it is not started here,
@@ -970,8 +957,6 @@ class AsyncMPClient(MPClient):
             Callable[[AsyncMPClient, Sequence[Any]], Any] | None
         ) = getattr(self.__class__, "eep_process_engine_core_notification", None)
 
-        engine_status = self._engine_status
-
         async def process_outputs_socket():
             try:
                 while True:
@@ -1000,15 +985,6 @@ class AsyncMPClient(MPClient):
                                 outputs.utility_output, utility_results
                             )
                         continue
-
-                    if engine_status is not None and outputs.health_status is not None:
-                        status_name = EngineStatusType(
-                            outputs.health_status
-                        ).name.lower()
-                        for entry in engine_status["engines"]:
-                            if entry["id"] == outputs.engine_index:
-                                entry["status"] = status_name
-                                break
 
                     if output_handler is not None:
                         assert _self_ref is not None
@@ -1192,7 +1168,17 @@ class AsyncMPClient(MPClient):
         return result
 
     async def fault_reporter(self):
-        return self._engine_status
+        ft_request = FaultToleranceRequest(
+            instruction="status", params={})
+        res = await self.call_utility_async(
+            FT_UTILITY_METHOD, ft_request)
+        return {
+            "schema_version": 1,
+            "total_engines": len(self.engine_ranks_managed),
+            "engines": [
+                {"id": res["engine_id"], "status": res["status"]},
+            ],
+        }
 
 
 class DPAsyncMPClient(AsyncMPClient):

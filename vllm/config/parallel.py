@@ -604,7 +604,6 @@ class ParallelConfig:
                     backend="gloo",
                     return_store=return_store,
                     listen_socket=listen_socket,
-                    gloo_timeout_seconds=self.gloo_timeout_seconds,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.
