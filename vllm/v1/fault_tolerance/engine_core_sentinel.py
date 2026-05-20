@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fault-tolerant wrapper and EngineCoreSentinel for the engine core.
+"""EngineCoreSentinel and fault_tolerant_wrapper for the engine core.
 
 The EngineCoreSentinel manages worker communication (ZMQ ROUTER), tracks
 pause state, and executes recovery logic. The wrapper decorates the busy loop
-to catch faults and delegate recovery to the sentinel.
+to catch faults and delegate recovery to the sentinel. All FT state and logic
+lives here — EngineCore and Worker hold only a reference to their sentinel.
 """
 import queue
-import time
 import threading
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -19,9 +20,14 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.engine import (
     EngineCoreOutputs,
+    EngineCoreRequestType,
     EngineStatusType,
+    UtilityOutput,
 )
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.utils import get_engine_client_zmq_addr
 
 if TYPE_CHECKING:
     from vllm.v1.engine.core import EngineCoreProc
@@ -65,6 +71,26 @@ class EngineCoreSentinel:
         self.resumed.set()
         self.status = EngineStatusType.HEALTHY
 
+    @classmethod
+    def create(cls, engine: "EngineCoreProc",
+               parallel_config) -> "EngineCoreSentinel":
+        """Create sentinel and initialize worker sentinels via collective RPC.
+
+        Call this from EngineCoreProc.__init__ when FT is enabled.
+        """
+        worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
+        sentinel = cls(
+            engine=engine,
+            worker_cmd_addr=worker_cmd_addr,
+            parallel_config=parallel_config,
+        )
+        engine.model_executor.collective_rpc(
+            method="create_worker_sentinel",
+            args=(worker_cmd_addr,),
+            non_block=False,
+        )
+        return sentinel
+
     # ------------------------------------------------------------------
     # Worker communication
     # ------------------------------------------------------------------
@@ -81,6 +107,31 @@ class EngineCoreSentinel:
             self.worker_cmd_socket.recv_multipart()
 
     # ------------------------------------------------------------------
+    # Busy-loop guard
+    # ------------------------------------------------------------------
+
+    def check_paused(self):
+        """Raise if the engine has been paused for FT recovery."""
+        if self.paused.is_set():
+            raise EngineLoopPausedError("Engine busy loop is paused.")
+
+    # ------------------------------------------------------------------
+    # Command dispatch (called from process_input_sockets thread)
+    # ------------------------------------------------------------------
+
+    def handle_command(self, client_idx: int, call_id: int, ft_args):
+        """Parse, execute an FT command and enqueue the result."""
+        if isinstance(ft_args, dict):
+            ft_request = FaultToleranceRequest(**ft_args)
+        else:
+            ft_request = ft_args
+        result = self.execute(ft_request)
+        uo = UtilityOutput(call_id)
+        uo.result = UtilityResult(result)
+        self.engine.output_queue.put_nowait(
+            (client_idx, EngineCoreOutputs(utility_output=uo)))
+
+    # ------------------------------------------------------------------
     # Fault handling (called by wrapper, runs in busy-loop thread)
     # ------------------------------------------------------------------
 
@@ -93,13 +144,11 @@ class EngineCoreSentinel:
         logger.warning("[FT] Busy loop raised %s. Pausing for recovery.",
                        type(exc).__name__)
 
-        self._preempt_running_requests()
+        self._preempt_running()
 
         if was_already_paused:
-            # Orchestrator already sent pause — workers are paused.
             self._publish_status(EngineStatusType.PAUSED)
         else:
-            # Self-detected fault — need to pause workers ourselves.
             try:
                 self.send_cmd_to_workers("pause")
             except Exception:
@@ -135,8 +184,6 @@ class EngineCoreSentinel:
                     "reason": str(e)}
 
     def _do_pause(self, ft_request: FaultToleranceRequest):
-        from vllm.v1.engine import EngineCoreRequestType
-
         exclude = ft_request.params.get("exclude_engine_index", [])
         if self.engine_index in exclude:
             return
@@ -144,132 +191,100 @@ class EngineCoreSentinel:
         self.paused.set()
         self.resumed.clear()
         self._publish_status(EngineStatusType.PAUSED)
-        # Unblock the busy loop so it sees the paused state.
         self.engine.input_queue.put(
             (EngineCoreRequestType.WAKEUP, None))
 
     def _do_retry(self, ft_request: FaultToleranceRequest):
-        from vllm.distributed.utils import (
+        worker_params = self._prepare_retry()
+        self.send_cmd_to_workers("retry", worker_params)
+        self._on_retry()
+        self.drain_stale_requests()
+        time.sleep(0.5)
+        self.drain_stale_requests()
+        if hasattr(self.engine.model_executor, 'drain_stale_responses'):
+            self.engine.model_executor.drain_stale_responses()
+
+        self._publish_status(EngineStatusType.HEALTHY)
+        self.paused.clear()
+        self.resumed.set()
+
+    def _prepare_retry(self) -> dict:
+        """Reinit DP process group if in DP mode. Returns worker params."""
+        engine = self.engine
+        if not hasattr(engine, 'dp_group'):
+            return {}
+
+        from vllm.distributed import (
             stateless_destroy_torch_distributed_process_group,
+        )
+        from vllm.distributed.utils import (
             stateless_init_torch_distributed_process_group,
         )
         from vllm.utils.network_utils import get_open_port
 
-        engine = self.engine
         parallel_config = engine.vllm_config.parallel_config
-        worker_params: dict = {}
-        engine_dp_port: int | None = None
 
-        if parallel_config.data_parallel_size > 1 and hasattr(
-                engine, "dp_store"):
-            if parallel_config.data_parallel_rank == 0:
-                worker_port = get_open_port()
-                engine_port = get_open_port()
-                engine.dp_store.set("ft_worker_dp_port",
-                                    str(worker_port).encode())
-                engine.dp_store.set("ft_engine_dp_port",
-                                    str(engine_port).encode())
-            else:
-                worker_port = int(
-                    engine.dp_store.get("ft_worker_dp_port").decode())
-                engine_port = int(
-                    engine.dp_store.get("ft_engine_dp_port").decode())
-            worker_params["new_stateless_dp_group_port"] = worker_port
-            engine_dp_port = engine_port
+        if engine.dp_rank == 0:
+            worker_port = get_open_port()
+            engine_port = get_open_port()
+            engine.dp_store.set("ft_worker_dp_port",
+                                str(worker_port).encode())
+            engine.dp_store.set("ft_engine_dp_port",
+                                str(engine_port).encode())
+        else:
+            worker_port = int(
+                engine.dp_store.get("ft_worker_dp_port").decode())
+            engine_port = int(
+                engine.dp_store.get("ft_engine_dp_port").decode())
 
-        self.send_cmd_to_workers("retry", worker_params)
+        stateless_destroy_torch_distributed_process_group(engine.dp_group)
+        engine.dp_group, engine.dp_store = (
+            stateless_init_torch_distributed_process_group(
+                parallel_config.data_parallel_master_ip,
+                engine_port,
+                parallel_config.data_parallel_rank,
+                parallel_config.data_parallel_size,
+                backend="gloo",
+                return_store=True,
+            )
+        )
+        return {"new_stateless_dp_group_port": worker_port}
 
-        if hasattr(engine, "dp_group"):
-            stateless_destroy_torch_distributed_process_group(engine.dp_group)
-            if engine_dp_port is not None:
-                engine.dp_group, engine.dp_store = (
-                    stateless_init_torch_distributed_process_group(
-                        parallel_config.data_parallel_master_ip,
-                        engine_dp_port,
-                        parallel_config.data_parallel_rank,
-                        parallel_config.data_parallel_size,
-                        backend="gloo",
-                        return_store=True,
-                    )
-                )
-            else:
-                engine.dp_group, engine.dp_store = (
-                    parallel_config.stateless_init_dp_group(return_store=True)
-                )
-            engine.step_counter = 0
-
-        # Reset engines_running so that the coordinator wakeup mechanism
-        # ("FIRST_REQ") properly notifies all engines on the first
-        # post-recovery request. Without this, the stale True value
-        # causes only one engine to get the request, deadlocking the
-        # DP allreduce in _run_ar.
-        if hasattr(engine, 'engines_running'):
-            engine.engines_running = False
-
-        # Reset the DP coordinator's wave state. During the fault, the
-        # coordinator never received a wave_complete so it still thinks
-        # engines_running=True. If we don't reset it, the coordinator
-        # will ignore the next FIRST_REQ from the client, preventing
-        # it from sending START_DP_WAVE to idle engines. This causes
-        # the first post-recovery request to hang in _run_ar allreduce
-        # because only one engine participates.
-        # Rank 0 sends wave_complete for the current wave; the
-        # coordinator will set engines_running=False and advance the
-        # wave. We also increment current_wave locally to stay in sync.
-        if (hasattr(engine, 'has_coordinator') and engine.has_coordinator
-                and hasattr(engine, 'current_wave')):
-            if hasattr(engine, 'dp_rank') and engine.dp_rank == 0:
-                engine.output_queue.put_nowait((
-                    -1,
-                    EngineCoreOutputs(
-                        wave_complete=engine.current_wave),
-                ))
-            engine.current_wave += 1
-
-        # Drain stale requests from the input queue that arrived during
-        # the fault/recovery window.  These requests were dispatched to
-        # this engine but the other DP engine never received them, so
-        # executing them unilaterally would cause a Gloo allreduce hang.
-        # We also re-preempt any requests that slipped into the scheduler
-        # while the retry was being processed (from the input_sockets
-        # thread running concurrently).
-        # Two passes with a small gap to catch stragglers from the ZMQ
-        # socket buffer (process_input_sockets runs concurrently and may
-        # enqueue a request between passes).
-        self._drain_stale_requests()
-        time.sleep(0.5)
-        self._drain_stale_requests()
-
-        self._publish_status(EngineStatusType.HEALTHY)
-        if hasattr(engine.model_executor, 'drain_stale_responses'):
-            engine.model_executor.drain_stale_responses()
-
-        # Signal the wrapper to resume the busy loop.
-        self.paused.clear()
-        self.resumed.set()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _drain_stale_requests(self):
-        """Drain stale ADD requests from both the input queue and scheduler.
-
-        During the fault/recovery window, the API server may have routed
-        new requests to this engine.  These arrive via the ZMQ input
-        socket thread and land in the input_queue.  Since the peer DP
-        engine(s) did NOT receive these requests, executing them would
-        cause a unilateral allreduce in _run_ar, hanging for a Gloo
-        timeout and triggering another fault cycle.
-
-        We discard ADD requests from the queue and re-preempt anything
-        that reached the scheduler.  Non-ADD items (WAKEUP, ABORT, etc.)
-        are kept.
-        """
+    def _on_retry(self):
+        """Reset DP-specific state if in DP mode."""
         engine = self.engine
-        from vllm.v1.engine import EngineCoreRequestType
+        if not hasattr(engine, 'dp_group'):
+            return
 
-        kept = []
+        engine.engines_running = False
+        engine.step_counter = 0
+        if engine.has_coordinator and engine.dp_rank == 0:
+            engine.output_queue.put_nowait((
+                -1,
+                EngineCoreOutputs(wave_complete=engine.current_wave),
+            ))
+        engine.current_wave += 1
+
+    # ------------------------------------------------------------------
+    # Recovery helpers
+    # ------------------------------------------------------------------
+
+    def _preempt_running(self):
+        """Preempt running requests and clear batch state."""
+        engine = self.engine
+        timestamp = time.monotonic()
+        while engine.scheduler.running:
+            request = engine.scheduler.running.pop()
+            engine.scheduler.preempt_request(request, timestamp)
+        engine.scheduler.prev_step_scheduled_req_ids.clear()
+        if engine.batch_queue is not None:
+            engine.batch_queue.clear()
+
+    def drain_stale_requests(self):
+        """Drain stale ADD requests from the input queue and preempt
+        all scheduler requests (running + waiting)."""
+        engine = self.engine
+        kept: list[tuple] = []
         drained = 0
         while not engine.input_queue.empty():
             try:
@@ -284,12 +299,10 @@ class EngineCoreSentinel:
         for item in kept:
             engine.input_queue.put_nowait(item)
 
-        # Re-preempt any requests that slipped into the scheduler.
         timestamp = time.monotonic()
         while engine.scheduler.running:
             request = engine.scheduler.running.pop()
             engine.scheduler.preempt_request(request, timestamp)
-        # Also preempt waiting requests.
         while engine.scheduler.waiting:
             request = engine.scheduler.waiting.pop()
             engine.scheduler.preempt_request(request, timestamp)
@@ -298,17 +311,11 @@ class EngineCoreSentinel:
             engine.batch_queue.clear()
 
         if drained > 0:
-            logger.info("[FT] Drained %d stale ADD request(s) from input queue.", drained)
+            logger.info("[FT] Drained %d stale ADD request(s).", drained)
 
-    def _preempt_running_requests(self):
-        engine = self.engine
-        timestamp = time.monotonic()
-        while engine.scheduler.running:
-            request = engine.scheduler.running.pop()
-            engine.scheduler.preempt_request(request, timestamp)
-        engine.scheduler.prev_step_scheduled_req_ids.clear()
-        if engine.batch_queue is not None:
-            engine.batch_queue.clear()
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _publish_status(self, status: EngineStatusType,
                         message: str | None = None):

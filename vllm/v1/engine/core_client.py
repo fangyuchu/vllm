@@ -58,7 +58,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
-from vllm.v1.fault_tolerance.wrapper import FT_UTILITY_METHOD
+from vllm.v1.fault_tolerance.engine_core_sentinel import FT_UTILITY_METHOD
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -1158,12 +1158,7 @@ class AsyncMPClient(MPClient):
             FT_UTILITY_METHOD, ft_request
         )
         result = FaultToleranceResult(**res)
-        # After a successful retry, reset engines_running so the
-        # coordinator wakeup mechanism ("FIRST_REQ" in add_request_async)
-        # properly notifies all engines on the first post-recovery request.
-        if (result.success
-                and ft_request.instruction == "retry"
-                and hasattr(self, "engines_running")):
+        if result.success and ft_request.instruction == "retry":
             self.engines_running = False
         return result
 
