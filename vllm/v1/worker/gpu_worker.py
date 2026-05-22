@@ -49,6 +49,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.serial_utils import run_method
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -334,13 +335,17 @@ class Worker(WorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
-    def create_worker_sentinel(self, worker_cmd_addr: str):
+    def create_worker_sentinel(self):
         with set_current_vllm_config(self.vllm_config):
             self.worker_sentinel = WorkerSentinel(
                 worker=self,
                 device=self.device,
-                worker_cmd_addr=worker_cmd_addr,
             )
+
+    def handle_ft_command(self, ft_request):
+        assert self.worker_sentinel is not None
+        run_method(self.worker_sentinel, ft_request.instruction,
+                   (ft_request,), {})
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -1114,8 +1119,6 @@ class Worker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
-        if self.worker_sentinel is not None:
-            self.worker_sentinel.shutdown()
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()

@@ -59,7 +59,6 @@ from vllm.utils.system_utils import (
     set_process_title,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -388,8 +387,6 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
-                    if EngineLoopPausedError.PREFIX in result:
-                        raise EngineLoopPausedError(result)
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"
                         " stack trace above for the root cause"
@@ -404,27 +401,6 @@ class MultiprocExecutor(Executor):
         )
 
         return future if non_block else future.result()
-
-    def drain_stale_responses(self):
-        """Drain all stale futures and their pending responses from the
-        response message queues. Called during fault tolerance recovery to
-        reset the request-response pipeline before restarting the busy loop.
-        """
-        num_stale = len(self.futures_queue)
-        self.futures_queue.clear()
-        if num_stale == 0:
-            return
-        logger.info("Draining %d stale response(s) from response queue", num_stale)
-        if self.kv_output_aggregator is not None:
-            mqs = self.response_mqs
-        else:
-            mqs = (self.response_mqs[self.output_rank],)
-        for mq in mqs:
-            for _ in range(num_stale):
-                try:
-                    mq.dequeue(timeout=30)
-                except Exception:
-                    break
 
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):

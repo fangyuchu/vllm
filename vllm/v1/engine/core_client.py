@@ -555,7 +555,6 @@ class MPClient(EngineCoreClient):
 
                 self.addresses = addresses
                 self.stats_update_address = addresses.frontend_stats_publish_address
-
                 if coordinator is not None:
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
@@ -925,7 +924,6 @@ class AsyncMPClient(MPClient):
         self.client_count = client_count
         self.client_index = client_index
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
-
         try:
             # If we are running in an asyncio event loop, start the queue task.
             # Otherwise, it will be started lazily. If it is not started here,
@@ -1560,10 +1558,24 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         await future
 
     def _setup_elastic_ep_reconfig_bootstrap(self) -> tuple[str, int]:
-        from vllm.distributed.utils import init_distributed_coordination
+        from vllm.distributed.utils import create_tcp_store
+        from vllm.utils.network_utils import get_open_ports_list
 
         parallel_config = self.vllm_config.parallel_config
-        ip, store = init_distributed_coordination(parallel_config)
+        parallel_config._data_parallel_master_port_list = get_open_ports_list(5)
+        parallel_config.data_parallel_master_port = (
+            parallel_config._data_parallel_master_port_list.pop()
+        )
+
+        ip = parallel_config.data_parallel_master_ip
+        store = create_tcp_store(
+            ip,
+            0,
+            is_master=True,
+            world_size=-1,
+            wait_for_workers=False,
+        )
+        parallel_config._coord_store_port = store.port
         self._coord_store = store
         return ip, store.port
 

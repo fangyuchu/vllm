@@ -1641,10 +1641,7 @@ def initialize_model_parallel(
         )
         group_ranks = [x.tolist() for x in group_ranks]
     _PCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        group_name="pcp",
+        group_ranks, get_world_group().local_rank, backend, group_name="pcp"
     )
 
     # Build the pipeline model-parallel groups.
@@ -1662,10 +1659,7 @@ def initialize_model_parallel(
         )
         group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        group_name="pp",
+        group_ranks, get_world_group().local_rank, backend, group_name="pp"
     )
 
     global _DP
@@ -1682,10 +1676,7 @@ def initialize_model_parallel(
         )
     else:
         _DP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            group_name="dp",
+            group_ranks, get_world_group().local_rank, backend, group_name="dp"
         )
 
     global _EP
@@ -1713,10 +1704,7 @@ def initialize_model_parallel(
             )
         else:
             _EP = init_model_parallel_group(
-                group_ranks,
-                get_world_group().local_rank,
-                backend,
-                group_name="ep",
+                group_ranks, get_world_group().local_rank, backend, group_name="ep"
             )
 
         # Create EPLB group with the same ranks as EP if EPLB is enabled.

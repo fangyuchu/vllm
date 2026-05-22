@@ -901,6 +901,7 @@ class EngineCoreProc(EngineCore):
                     vllm_config=vllm_config,
                 )
             self._init_data_parallel(vllm_config)
+
             super().__init__(
                 vllm_config,
                 executor_class,
@@ -1210,10 +1211,6 @@ class EngineCoreProc(EngineCore):
 
         raise SystemExit
 
-    def _ensure_busy_loop_running(self):
-        if self.enable_fault_tolerance:
-            self.ft_sentinel.check_paused()
-
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
@@ -1247,10 +1244,9 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
-        self._ensure_busy_loop_running()
+
         # Step the engine core.
         outputs, model_executed = self.step_fn()
-        self._ensure_busy_loop_running()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -1313,7 +1309,6 @@ class EngineCoreProc(EngineCore):
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.WAKEUP:
-            self._ensure_busy_loop_running()
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
@@ -1671,11 +1666,6 @@ class EngineCoreProc(EngineCore):
             for client_index, req_ids in by_client.items():
                 self._send_abort_outputs_to_client(list(req_ids), client_index)
 
-    def shutdown(self):
-        super().shutdown()
-        if self.enable_fault_tolerance:
-            self.ft_sentinel.shutdown()
-
 
 class DPEngineCoreProc(EngineCoreProc):
     """ZMQ-wrapper for running EngineCore in background process
@@ -1875,9 +1865,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                self._ensure_busy_loop_running()
                 self.execute_dummy_batch()
-                self._ensure_busy_loop_running()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(

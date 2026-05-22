@@ -277,13 +277,6 @@ class ReconfigureRankType(enum.IntEnum):
 
 
 class EngineStatusType(enum.IntEnum):
-    # Cases where EngineCoreProc runs normally
     HEALTHY = 0
-    # Cases where the EngineCoreProc process exits
     DEAD = 1
-    # Cases where EngineCoreProc throws exceptions but does not exit
     UNHEALTHY = 2
-    # Cases where EngineCoreProc is actively paused to handle faults of other engines
-    PAUSED = 3
-    # Cases where the workers of EngineCore are not responsive
-    HUNG = 4
