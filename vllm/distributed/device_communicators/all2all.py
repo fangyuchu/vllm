@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -259,6 +260,10 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
     All2All communication based on DeepEP Low-Latency kernels.
     """
 
+    _active_buffer: Any = None
+    _mask: torch.Tensor | None = None
+    _last_mask: torch.Tensor | None = None
+
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
 
@@ -302,6 +307,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             allow_nvlink_for_low_latency_mode=True,
             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
             explicitly_destroy=True,
+            enable_shrink=False,  # TODO: set to True when fault tolerance is supported.
         )
         return kwargs
 
@@ -317,11 +323,49 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
             buffer_kwargs, deep_ep.Buffer
         )
+        DeepEPLLAll2AllManager._active_buffer = handle
         return handle
 
     # DeepEP LL uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
+
+    @property
+    def support_fault_tolerance(self) -> bool:
+        buf = DeepEPLLAll2AllManager._active_buffer
+        return buf is not None and getattr(buf, "enable_shrink", False)
+
+    def query_active_mask(self) -> torch.Tensor:
+        buf = DeepEPLLAll2AllManager._active_buffer
+        assert buf is not None
+        if DeepEPLLAll2AllManager._mask is None:
+            DeepEPLLAll2AllManager._mask = torch.zeros(
+                self.world_size, device="cuda", dtype=torch.int32
+            )
+        buf.low_latency_query_mask_buffer(DeepEPLLAll2AllManager._mask)
+        return DeepEPLLAll2AllManager._mask
+
+    def clean_mask(self) -> None:
+        buf = DeepEPLLAll2AllManager._active_buffer
+        assert buf is not None
+        buf.low_latency_clean_mask_buffer()
+        if DeepEPLLAll2AllManager._last_mask is not None:
+            DeepEPLLAll2AllManager._last_mask.zero_()
+
+    def query_fault(self) -> tuple[torch.Tensor, torch.Tensor]:
+        current = self.query_active_mask()
+        if DeepEPLLAll2AllManager._last_mask is None:
+            DeepEPLLAll2AllManager._last_mask = torch.zeros_like(current)
+        has_fault = (current != DeepEPLLAll2AllManager._last_mask).any()
+        DeepEPLLAll2AllManager._last_mask.copy_(current)
+        return has_fault, current
+
+
+@dataclass
+class _NixlEPBufferState:
+    buffer: Any
+    connected_ep_size: int
+    active_ep_size: int
 
 
 class NixlEPAll2AllManager(All2AllManagerBase):
@@ -330,9 +374,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
     This backend supports elastic EP with dynamic rank connection/disconnection.
     """
 
-    # (nixl_ep_buffer, ep_size)
-    _buffer: tuple[Any, int] | None = None
-    _lock = threading.Lock()
+    _buffer: _NixlEPBufferState | None = None
+    _lock = threading.RLock()
+    _full_mask: torch.Tensor | None = None
+    _last_active_mask: torch.Tensor | None = None
 
     def __init__(self, cpu_group, tcp_store_group=None):
         assert tcp_store_group is not None
@@ -367,48 +412,111 @@ class NixlEPAll2AllManager(All2AllManagerBase):
             num_experts_per_rank=num_experts_per_rank,
             num_rdma_bytes=num_rdma_bytes,
         )
-        ranks_to_connect = list(range(self.cpu_group.size()))
+        ranks_to_connect = list(range(self.world_size))
         buffer.connect_ranks(ranks_to_connect)
-        NixlEPAll2AllManager._buffer = (buffer, self.cpu_group.size())
+        NixlEPAll2AllManager._buffer = _NixlEPBufferState(
+            buffer=buffer,
+            connected_ep_size=self.world_size,
+            active_ep_size=self.world_size,
+        )
 
-    def _update_buffer(self):
+    def _connect_to_ep_size(self, ep_size: int, *, make_active: bool) -> None:
         assert NixlEPAll2AllManager._buffer is not None
-        buffer, current_ep_size = NixlEPAll2AllManager._buffer
-        current_ranks = list(range(current_ep_size))
-        new_ep_size = self.cpu_group.size()
-        buffer.set_tcp_store_group(self.tcp_store_group.store)
-        if new_ep_size > len(current_ranks):
-            ranks_to_connect = list(range(len(current_ranks), new_ep_size))
-            buffer.connect_ranks(ranks_to_connect)
+        state = NixlEPAll2AllManager._buffer
+        if ep_size <= state.connected_ep_size:
+            return
+
+        state.buffer.set_tcp_store_group(self.tcp_store_group.store)
+        ranks_to_connect = list(range(state.connected_ep_size, ep_size))
+        state.buffer.connect_ranks(ranks_to_connect, activate=make_active)
+        state.connected_ep_size = ep_size
+        if make_active:
+            state.active_ep_size = ep_size
+
+    def _disconnect_to_ep_size(self, ep_size: int) -> None:
+        assert NixlEPAll2AllManager._buffer is not None
+        state = NixlEPAll2AllManager._buffer
+        if ep_size >= state.connected_ep_size:
+            return
+
+        state.buffer.set_tcp_store_group(self.tcp_store_group.store)
+        ranks_to_disconnect = list(range(ep_size, state.connected_ep_size))
+        state.buffer.disconnect_ranks(ranks_to_disconnect)
+        state.connected_ep_size = ep_size
+        state.active_ep_size = min(state.active_ep_size, ep_size)
+
+    def _unmask_connected_ranks(self, target_ep_size: int) -> None:
+        assert NixlEPAll2AllManager._buffer is not None
+        state = NixlEPAll2AllManager._buffer
+        state.buffer.set_tcp_store_group(self.tcp_store_group.store)
+        if target_ep_size <= state.active_ep_size:
+            return
+        assert state.connected_ep_size >= target_ep_size
+
+        for rank in range(state.active_ep_size, target_ep_size):
+            state.buffer.update_mask_buffer(rank, mask=False)
+        state.active_ep_size = target_ep_size
+
+    def _stage_ep_size(self) -> None:
+        assert NixlEPAll2AllManager._buffer is not None
+        state = NixlEPAll2AllManager._buffer
+        target_ep_size = self.world_size
+
+        # Scale-up can safely connect standby ranks while leaving them masked.
+        # Scale-down must not disconnect active ranks until commit.
+        if target_ep_size > state.connected_ep_size:
+            self._connect_to_ep_size(target_ep_size, make_active=False)
+
+    def commit_staged_state(self) -> None:
+        """Commit staged NIXL EP state to the active communication set."""
+        with NixlEPAll2AllManager._lock:
+            assert NixlEPAll2AllManager._buffer is not None
+            state = NixlEPAll2AllManager._buffer
+            target_ep_size = self.world_size
+
+            if target_ep_size < state.connected_ep_size:
+                self._disconnect_to_ep_size(target_ep_size)
+            elif target_ep_size > state.connected_ep_size:
+                self._connect_to_ep_size(target_ep_size, make_active=True)
+
+            self._unmask_connected_ranks(target_ep_size)
+
+    def _ensure_ep_size(self, *, stage: bool) -> None:
+        if stage:
+            self._stage_ep_size()
         else:
-            ranks_to_disconnect = current_ranks[new_ep_size:]
-            buffer.disconnect_ranks(ranks_to_disconnect)
-        NixlEPAll2AllManager._buffer = (buffer, new_ep_size)
+            self.commit_staged_state()
 
     def get_handle(self, kwargs):
         with NixlEPAll2AllManager._lock:
-            if (
-                NixlEPAll2AllManager._buffer is not None
-                and NixlEPAll2AllManager._buffer[1] == self.cpu_group.size()
-            ):
-                return NixlEPAll2AllManager._buffer[0]
-
-            num_experts_per_rank = (
-                kwargs["num_global_experts"] // kwargs["num_ep_ranks"]
-            )
-            nixl_kwargs = dict(
-                max_num_tokens_per_dp_rank=kwargs["max_num_tokens_per_dp_rank"],
-                token_hidden_size=kwargs["token_hidden_size"],
-                num_experts_per_rank=num_experts_per_rank,
-            )
-            if NixlEPAll2AllManager._buffer is None:
-                self._init_buffer(**nixl_kwargs)
+            stage = bool(kwargs.get("stage", False))
+            state = NixlEPAll2AllManager._buffer
+            if state is None:
+                assert not stage, (
+                    "NIXL EP staged initialization requires an existing buffer"
+                )
+                max_num_tokens_per_dp_rank = kwargs["max_num_tokens_per_dp_rank"]
+                num_experts_per_rank = (
+                    kwargs["num_global_experts"] // kwargs["num_ep_ranks"]
+                )
+                num_ep_ranks = kwargs["num_ep_ranks"]
+                self._init_buffer(
+                    max_num_tokens_per_dp_rank,
+                    kwargs["token_hidden_size"],
+                    num_experts_per_rank,
+                )
+                state = NixlEPAll2AllManager._buffer
+                assert state is not None
             else:
-                self._update_buffer()
-
-            assert NixlEPAll2AllManager._buffer is not None
-            handle = NixlEPAll2AllManager._buffer[0]
-            return handle
+                if not stage:
+                    self._ensure_ep_size(stage=False)
+            state = NixlEPAll2AllManager._buffer
+            assert state is not None
+            if stage:
+                self._stage_ep_size()
+                state = NixlEPAll2AllManager._buffer
+                assert state is not None
+            return state.buffer
 
     def dispatch(
         self,
@@ -432,12 +540,42 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         # NOTE(yongji): NIXLEPAll2AllManager instance is recreated during
         # scale-up/down, so we cannot destroy the persistent buffer here.
         assert NixlEPAll2AllManager._buffer is not None
-        buffer = NixlEPAll2AllManager._buffer[0]
-        buffer.set_tcp_store_group(None)
+        NixlEPAll2AllManager._buffer.buffer.set_tcp_store_group(None)
 
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
+
+    @property
+    def support_fault_tolerance(self) -> bool:
+        return True
+
+    def query_active_mask(self) -> torch.Tensor:
+        state = NixlEPAll2AllManager._buffer
+        assert state is not None
+        if NixlEPAll2AllManager._full_mask is None:
+            NixlEPAll2AllManager._full_mask = torch.zeros(
+                self.max_num_ep_ranks, device="cuda", dtype=torch.int32
+            )
+        state.buffer.query_mask_buffer(NixlEPAll2AllManager._full_mask)
+        return NixlEPAll2AllManager._full_mask[: state.active_ep_size]
+
+    def clean_mask(self) -> None:
+        state = NixlEPAll2AllManager._buffer
+        assert state is not None
+        state.buffer.clean_mask_buffer()
+        NixlEPAll2AllManager._last_active_mask = None
+
+    def query_fault(self) -> tuple[torch.Tensor, torch.Tensor]:
+        current = self.query_active_mask()
+        last = NixlEPAll2AllManager._last_active_mask
+        if last is None or last.shape != current.shape:
+            NixlEPAll2AllManager._last_active_mask = torch.zeros_like(current)
+            last = NixlEPAll2AllManager._last_active_mask
+        has_fault = (current != last).any()
+        assert last is not None
+        last.copy_(current)
+        return has_fault, current
 
 
 class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
