@@ -971,6 +971,14 @@ class AsyncLLM(EngineClient):
             method, timeout, args, kwargs
         )
 
+    async def handle_fault(self, ft_request: Any) -> Any:
+        """Trigger fault tolerance recovery for all managed engines."""
+        return await self.engine_core.handle_fault(ft_request)
+
+    async def get_ft_status_async(self) -> str:
+        """Get current fault tolerance status."""
+        return await self.engine_core.get_ft_status_async()
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()

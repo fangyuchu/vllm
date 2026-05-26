@@ -238,6 +238,14 @@ class EngineClient(ABC):
         """Get supported tasks"""
         raise NotImplementedError
 
+    async def handle_fault(self, ft_request: Any) -> Any:
+        """Trigger fault tolerance recovery for the engine."""
+        raise NotImplementedError
+
+    async def get_ft_status_async(self) -> str:
+        """Get current fault tolerance status of the engine."""
+        raise NotImplementedError
+
     async def init_weight_transfer_engine(
         self, init_request: WeightTransferInitRequest
     ) -> None:
