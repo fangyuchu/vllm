@@ -17,6 +17,7 @@ from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_ports_list
+from vllm.v1.fault_tolerance.config import FaultToleranceConfig
 
 if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
@@ -194,6 +195,11 @@ class ParallelConfig:
 
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
+
+    fault_tolerance_config: FaultToleranceConfig = Field(
+        default_factory=FaultToleranceConfig
+    )
+    """Fault tolerance configuration for DPEngineCoreProc."""
 
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""
@@ -741,6 +747,7 @@ class ParallelConfig:
             "max_parallel_loading_workers",
             "disable_custom_all_reduce",
             "ray_workers_use_nsight",
+            "fault_tolerance_config",
             "ray_runtime_env",
             "placement_group",
             "distributed_executor_backend",

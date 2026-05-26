@@ -75,6 +75,7 @@ from vllm.v1.engine.utils import (
     get_device_indices,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.fault_tolerance import fault_tolerance_wrapper
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -1492,9 +1493,43 @@ class EngineCoreProc(EngineCore):
                         continue
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
-                    # Deserialize the request data.
+                    # FT: handle UTILITY methods directly in IO thread,
+                    # bypassing the busy loop. The IO thread is alive even
+                    # when the busy loop has crashed (retry scenario).
+                    if request_type == EngineCoreRequestType.UTILITY:
+                        client_idx, call_id, method_name, args = (
+                            generic_decoder.decode(data_frames)
+                        )
+                        if (hasattr(self, '_ft_sentinel')
+                                and method_name in self._ft_sentinel.FT_METHODS):
+                            result = self._ft_sentinel.handle_ft_method(
+                                method_name, args
+                            )
+                            output = UtilityOutput(
+                                call_id, result=UtilityResult(result)
+                            )
+                            self.output_queue.put_nowait(
+                                (client_idx, EngineCoreOutputs(
+                                    utility_output=output))
+                            )
+                            continue
+                        # Non-FT UTILITY: re-encode and push to input_queue
+                        request = (client_idx, call_id, method_name, args)
+                        self.input_queue.put_nowait(
+                            (request_type, request))
+                        continue
+
+                    # When UNHEALTHY (busy loop crashed), skip ADD processing to
+                    # keep the IO thread responsive for FT UTILITY messages.
+                    is_unhealthy = (
+                        hasattr(self, '_ft_sentinel')
+                        and self._ft_sentinel.ft_status.value == "unhealthy"
+                    )
+
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
+                        if is_unhealthy:
+                            continue
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
                             request = self.preprocess_add_request(req)
@@ -1719,6 +1754,11 @@ class DPEngineCoreProc(EngineCoreProc):
             tensor_queue=tensor_queue,
         )
 
+        # Initialize FT sentinel if fault tolerance is enabled (DP mode).
+        from vllm.v1.fault_tolerance import DPEngineCoreSentinel
+
+        self._ft_sentinel = DPEngineCoreSentinel(self)
+
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
         parallel_config = vllm_config.parallel_config
@@ -1838,6 +1878,7 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    @fault_tolerance_wrapper(enabled=True)
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
 
