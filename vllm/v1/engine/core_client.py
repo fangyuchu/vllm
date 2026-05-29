@@ -55,6 +55,11 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.fault_tolerance.utils import (
+    FaultToleranceRequest,
+    FaultToleranceResult,
+)
+from vllm.v1.fault_tolerance.engine_core_sentinel import FT_UTILITY_METHOD
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -269,6 +274,14 @@ class EngineCoreClient(ABC):
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
+        raise NotImplementedError
+
+    async def handle_fault(
+        self, fault_tolerance_request: FaultToleranceRequest
+    ) -> FaultToleranceResult:
+        raise NotImplementedError
+
+    async def fault_reporter(self):
         raise NotImplementedError
 
 
@@ -499,9 +512,11 @@ class MPClient(EngineCoreClient):
             # identity. The client input ROUTER needs handover to allow the new
             # engine to replace the dead connection.
             enable_input_socket_handover = parallel_config.enable_elastic_ep
+            self.enable_fault_tolerance = parallel_config.enable_fault_tolerance
 
             self.stats_update_address: str | None = None
             tensor_queue: Queue | None = None
+            self.addresses = None
             if client_addresses:
                 # Engines are managed externally to this client.
                 input_address = client_addresses["input_address"]
@@ -570,6 +585,7 @@ class MPClient(EngineCoreClient):
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
 
+                self.addresses = addresses
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if coordinator is not None:
                     assert self.stats_update_address == (
@@ -1164,6 +1180,30 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+
+    async def handle_fault(
+        self, ft_request: FaultToleranceRequest
+    ) -> FaultToleranceResult:
+        res = await self.call_utility_async(
+            FT_UTILITY_METHOD, ft_request
+        )
+        result = FaultToleranceResult(**res)
+        if result.success and ft_request.instruction == "retry":
+            self.engines_running = False
+        return result
+
+    async def fault_reporter(self):
+        ft_request = FaultToleranceRequest(
+            instruction="status", params={})
+        res = await self.call_utility_async(
+            FT_UTILITY_METHOD, ft_request)
+        return {
+            "schema_version": 1,
+            "total_engines": len(self.engine_ranks_managed),
+            "engines": [
+                {"id": res["engine_id"], "status": res["status"]},
+            ],
+        }
 
 
 class DPAsyncMPClient(AsyncMPClient):

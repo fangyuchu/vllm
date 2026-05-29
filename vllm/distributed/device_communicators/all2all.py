@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -262,6 +263,10 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
+        self.enable_ft = (
+            get_current_vllm_config().parallel_config.enable_fault_tolerance
+        )
+        self.buffer = None
 
     def _make_all2all_kwargs(
         self,
@@ -303,6 +308,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             allow_nvlink_for_low_latency_mode=True,
             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
             explicitly_destroy=True,
+            enable_shrink=self.enable_ft,
         )
         return kwargs
 
@@ -318,11 +324,26 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
             buffer_kwargs, deep_ep.Buffer
         )
+        self.buffer = handle
         return handle
 
     # DeepEP LL uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
+
+    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        import deep_ep  # type: ignore[import-not-found]
+
+        assert self.enable_ft, "Fault tolerance must be enabled to use query mask"
+        assert isinstance(self.buffer, deep_ep.Buffer)
+        return self.buffer.low_latency_query_mask_buffer(mask)
+
+    def clean_mask(self):
+        import deep_ep  # type: ignore[import-not-found]
+
+        assert self.enable_ft, "Fault tolerance must be enabled to use clean_mask"
+        assert isinstance(self.buffer, deep_ep.Buffer)
+        self.buffer.low_latency_clean_mask_buffer()
 
 
 @dataclass
@@ -501,6 +522,14 @@ class NixlEPAll2AllManager(All2AllManagerBase):
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
+
+    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        assert self._buffer is not None
+        return self._buffer[0].query_mask_buffer(mask)
+
+    def clean_mask(self):
+        assert self._buffer is not None
+        self._buffer[0].clean_mask_buffer()
 
 
 class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
