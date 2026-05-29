@@ -9,8 +9,10 @@ from vllm.distributed import (
     get_tp_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.config import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+from vllm.v1.serial_utils import run_method
 
 from typing import TYPE_CHECKING
 
@@ -45,6 +47,11 @@ class WorkerSentinel:
             world_size = get_ep_group().world_size
             self.mask = torch.zeros(world_size, device=device, dtype=torch.int)
             self.last_mask = torch.zeros_like(self.mask)
+
+    def handle_command(self, ft_request: FaultToleranceRequest):
+        """Dispatch an FT command by instruction name."""
+        with set_current_vllm_config(self.worker.vllm_config):
+            return run_method(self, ft_request.instruction, (ft_request,), {})
 
     def retry(self, ft_request: FaultToleranceRequest):
         params = ft_request.params

@@ -49,7 +49,6 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.serial_utils import run_method
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -344,8 +343,7 @@ class Worker(WorkerBase):
 
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
-        run_method(self.worker_sentinel, ft_request.instruction,
-                   (ft_request,), {})
+        return self.worker_sentinel.handle_command(ft_request)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.

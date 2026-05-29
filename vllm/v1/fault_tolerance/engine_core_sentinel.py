@@ -12,6 +12,7 @@ import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from vllm.config import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EngineCoreOutputs,
@@ -115,7 +116,8 @@ class EngineCoreSentinel:
         executor = engine.model_executor
 
         # 1) Reinit DP process group (engine side) if in DP mode.
-        ft_request.params.update(self._reinit_dp_group())
+        with set_current_vllm_config(engine.vllm_config):
+            ft_request.params.update(self._reinit_dp_group())
 
         # 2) Drain stale futures/responses so the MQ channel is clean.
         self._drain_stale_responses(executor)
