@@ -271,6 +271,14 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    async def handle_fault(self, ft_request: Any) -> Any:
+        """Trigger fault tolerance recovery."""
+        raise NotImplementedError
+
+    async def get_ft_status_async(self) -> str:
+        """Get current fault tolerance status."""
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -360,6 +368,12 @@ class InprocClient(EngineCoreClient):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+
+    async def handle_fault(self, ft_request: Any) -> Any:
+        return None  # InprocClient is not targeted for FT
+
+    async def get_ft_status_async(self) -> str:
+        return "healthy"
 
     def dp_engines_running(self) -> bool:
         return False
@@ -1164,6 +1178,44 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
         )
+
+    # --- Fault Tolerance methods ---
+
+    async def handle_fault(self, ft_request: Any) -> Any:
+        """Trigger fault tolerance recovery via UTILITY.
+
+        Bypasses ensure_alive() because the engine process is alive
+        (only the busy loop crashed), so ZMQ communication still works.
+        """
+        call_id = uuid.uuid1().int >> 64
+        future = asyncio.get_running_loop().create_future()
+        self.utility_results[call_id] = future
+        message = (
+            EngineCoreRequestType.UTILITY.value,
+            *self.encoder.encode(
+                (self.client_index, call_id, "handle_fault", (ft_request,))
+            ),
+        )
+        msg = (self.core_engine,) + message
+        await self.input_socket.send_multipart(msg, copy=False)
+        self._ensure_output_queue_task()
+        return await future
+
+    async def get_ft_status_async(self) -> str:
+        """Get current fault tolerance status via UTILITY."""
+        call_id = uuid.uuid1().int >> 64
+        future = asyncio.get_running_loop().create_future()
+        self.utility_results[call_id] = future
+        message = (
+            EngineCoreRequestType.UTILITY.value,
+            *self.encoder.encode(
+                (self.client_index, call_id, "get_ft_status", ())
+            ),
+        )
+        msg = (self.core_engine,) + message
+        await self.input_socket.send_multipart(msg, copy=False)
+        self._ensure_output_queue_task()
+        return await future
 
 
 class DPAsyncMPClient(AsyncMPClient):
