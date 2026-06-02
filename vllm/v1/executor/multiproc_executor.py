@@ -908,7 +908,10 @@ class WorkerProc:
         converted to a FAILURE response.
         """
         if isinstance(output, AsyncModelRunnerOutput):
-            output = output.get_output()
+            try:
+                output = output.get_output()
+            except Exception as e:
+                output = e
 
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
@@ -945,6 +948,29 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
+    def _drain_rpc_broadcast_mq(self):
+        """Drain all pending RPCs from broadcast MQ to clear stale requests.
+
+        Called when a fault tolerance error occurs, to ensure the MQ is clean
+        for subsequent FT recovery commands.
+        """
+        mq = self.rpc_broadcast_mq
+        if mq is None:
+            return
+        num_drained = 0
+        while True:
+            try:
+                mq.dequeue(timeout=0)
+                num_drained += 1
+            except Exception:
+                break
+        if num_drained > 0:
+            logger.info(
+                "[FT] Drained %d stale RPC(s) from worker %d broadcast MQ",
+                num_drained,
+                self.rank,
+            )
+
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
@@ -964,6 +990,15 @@ class WorkerProc:
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())
                 logger.exception("WorkerProc hit an exception.")
+                # FT: drain stale RPCs so that subsequent recovery
+                # commands are not blocked by a full MQ.
+                # Only drain if fault tolerance is enabled (detected
+                # via worker_sentinel presence).
+                if (
+                    hasattr(self.worker, "worker_sentinel")
+                    and self.worker.worker_sentinel is not None
+                ):
+                    self._drain_rpc_broadcast_mq()
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:

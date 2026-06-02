@@ -16,7 +16,7 @@ async def apply_fault_tolerance(request: Request):
     ft_request = FaultToleranceRequest(
         request_id=body.get("request_id", "ft-manual"),
         instruction=body.get("instruction", "retry"),
-        params=body.get("params"),
+        params=body.get("params") or {},
     )
     try:
         result = await client.handle_fault(ft_request)
@@ -31,6 +31,9 @@ async def get_fault_tolerance_status(request: Request):
     client = request.app.state.engine_client
     try:
         status = await client.get_ft_status_async()
+        # Normalize: if status is a dict with an inner "status" key, extract it
+        if isinstance(status, dict) and "status" in status:
+            return {"status": status["status"]}
         return {"status": status}
     except Exception as e:
         return {"status": "unhealthy", "detail": str(e)}

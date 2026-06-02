@@ -1,20 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-from __future__ import annotations
-
-import enum
-from dataclasses import dataclass
 from typing import Any
 
-
-class EngineStatus(enum.Enum):
-    HEALTHY = "healthy"
-    UNHEALTHY = "unhealthy"
+import msgspec
 
 
-@dataclass
-class FaultToleranceRequest:
+class FaultToleranceResult(msgspec.Struct):
     request_id: str
-    instruction: str  # "retry" | "scale_down"
-    params: dict[str, Any] | None = None
+    success: bool
+    reason: str | None = None
+
+
+class FaultToleranceRequest(msgspec.Struct):
+    instruction: str
+    params: dict[str, Any] = {}
+    request_id: str = ""

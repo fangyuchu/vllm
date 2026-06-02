@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -12,5 +12,7 @@ class FaultToleranceConfig:
 
     enabled: bool = False
     """Enable fault tolerance for DPEngineCoreProc."""
-    engine_recovery_timeout_sec: int = 120
-    """Maximum time to wait for engine recovery before giving up."""
+    engine_recovery_timeout_sec: int = 600
+    """Maximum time to wait for engine recovery before giving up.
+    Must be longer than DeepEP dispatch timeout (~100s) + time for all
+    ranks to detect the fault."""

@@ -201,6 +201,9 @@ class ParallelConfig:
     )
     """Fault tolerance configuration for DPEngineCoreProc."""
 
+    enable_fault_tolerance: bool = False
+    """Enable fault tolerance for DPEngineCoreProc."""
+
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""
     ubatch_size: int = 0

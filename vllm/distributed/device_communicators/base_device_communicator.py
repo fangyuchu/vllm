@@ -125,13 +125,11 @@ class All2AllManagerBase:
     def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False):
         raise NotImplementedError
 
-    def clear_mask(self):
-        """Reset the all2all participation mask.
-
-        Called during fault tolerance recovery to unblock a previously
-        failed rank from MoE communication. No-op by default.
+    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        """Query the active mask into the given output tensor.
+        No-op by default.
         """
-        pass
+        return mask
 
     def destroy(self):
         pass

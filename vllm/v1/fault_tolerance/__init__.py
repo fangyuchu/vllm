@@ -1,22 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.v1.fault_tolerance.config import FaultToleranceConfig
-from vllm.v1.fault_tolerance.dp_engine_core_sentinel import (
-    DPEngineCoreSentinel,
-)
-from vllm.v1.fault_tolerance.utils import (
-    EngineStatus,
-    FaultToleranceRequest,
-)
-from vllm.v1.fault_tolerance.worker_sentinel import WorkerSentinel
-from vllm.v1.fault_tolerance.wrapper import fault_tolerance_wrapper
+# Lazily import engine_core_sentinel to break circular import chain:
+#   vllm.config -> vllm.config.parallel -> vllm.v1.fault_tolerance.config (OK)
+#   -> vllm.v1.fault_tolerance.__init__ -> engine_core_sentinel -> vllm.v1.engine
+#   -> vllm.pooling_params -> vllm.config (CIRCULAR)
+# By deferring engine_core_sentinel load, vllm.config finishes initializing first.
+
+from .utils import FaultToleranceRequest  # noqa: F401 — used by engine/core.py
+from .config import FaultToleranceConfig  # noqa: F401 — used by parallel.py
+
+
+def __getattr__(name: str):
+    import importlib
+
+    if name in ("EngineCoreSentinel", "fault_tolerant_wrapper"):
+        mod = importlib.import_module(
+            "vllm.v1.fault_tolerance.engine_core_sentinel")
+        return getattr(mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
-    "DPEngineCoreSentinel",
-    "EngineStatus",
-    "FaultToleranceConfig",
+    "EngineCoreSentinel",
     "FaultToleranceRequest",
-    "WorkerSentinel",
-    "fault_tolerance_wrapper",
+    "FaultToleranceConfig",
+    "fault_tolerant_wrapper",
 ]

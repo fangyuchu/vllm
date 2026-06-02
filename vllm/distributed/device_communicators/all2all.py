@@ -307,7 +307,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             allow_nvlink_for_low_latency_mode=True,
             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
             explicitly_destroy=True,
-            enable_shrink=False,  # TODO: set to True when fault tolerance is supported.
+            enable_shrink=True,  # Enable mask-based fault detection
         )
         return kwargs
 
@@ -332,12 +332,18 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
 
     @property
     def support_fault_tolerance(self) -> bool:
-        buf = DeepEPLLAll2AllManager._active_buffer
-        return buf is not None and getattr(buf, "enable_shrink", False)
+        return True  # enable_shrink=True in kwargs
 
     def query_active_mask(self) -> torch.Tensor:
         buf = DeepEPLLAll2AllManager._active_buffer
-        assert buf is not None
+        if buf is None:
+            # No active buffer (e.g. after retry destroyed it) — return
+            # zero mask so query_fault() reports no fault.
+            if DeepEPLLAll2AllManager._mask is None:
+                DeepEPLLAll2AllManager._mask = torch.zeros(
+                    self.world_size, device="cuda", dtype=torch.int32
+                )
+            return DeepEPLLAll2AllManager._mask
         if DeepEPLLAll2AllManager._mask is None:
             DeepEPLLAll2AllManager._mask = torch.zeros(
                 self.world_size, device="cuda", dtype=torch.int32
@@ -347,10 +353,19 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
 
     def clean_mask(self) -> None:
         buf = DeepEPLLAll2AllManager._active_buffer
-        assert buf is not None
-        buf.low_latency_clean_mask_buffer()
-        if DeepEPLLAll2AllManager._last_mask is not None:
-            DeepEPLLAll2AllManager._last_mask.zero_()
+        if buf is None:
+            # No active buffer — nothing to clean.
+            DeepEPLLAll2AllManager._mask = None
+            DeepEPLLAll2AllManager._last_mask = None
+            return
+        # Ignore CUDA errors during clean — the context may be in an
+        # error state after dispatch/combine timeout.
+        from contextlib import suppress
+        with suppress(Exception):
+            buf.low_latency_clean_mask_buffer()
+        # _last_mask is a GPU tensor; zero_() would fail if the CUDA
+        # context is corrupted, so just drop it instead.
+        DeepEPLLAll2AllManager._last_mask = None
 
     def query_fault(self) -> tuple[torch.Tensor, torch.Tensor]:
         current = self.query_active_mask()
@@ -359,6 +374,20 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         has_fault = (current != DeepEPLLAll2AllManager._last_mask).any()
         DeepEPLLAll2AllManager._last_mask.copy_(current)
         return has_fault, current
+
+    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        """Query the mask buffer into a given output tensor.
+
+        Used by the FT flow in AsyncGPUModelRunnerOutput to detect
+        dispatch/combine timeouts.
+        """
+        buf = DeepEPLLAll2AllManager._active_buffer
+        if buf is None:
+            mask.zero_()
+            return mask
+        return buf.low_latency_query_mask_buffer(mask)
+
+
 
 
 @dataclass
@@ -506,7 +535,6 @@ class NixlEPAll2AllManager(All2AllManagerBase):
                 num_experts_per_rank = (
                     kwargs["num_global_experts"] // kwargs["num_ep_ranks"]
                 )
-                num_ep_ranks = kwargs["num_ep_ranks"]
                 self._init_buffer(
                     max_num_tokens_per_dp_rank,
                     kwargs["token_hidden_size"],

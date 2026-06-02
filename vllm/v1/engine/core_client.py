@@ -1190,10 +1190,21 @@ class AsyncMPClient(MPClient):
         call_id = uuid.uuid1().int >> 64
         future = asyncio.get_running_loop().create_future()
         self.utility_results[call_id] = future
+        from vllm.v1.fault_tolerance.engine_core_sentinel import (
+            FT_UTILITY_METHOD,
+        )
+        if isinstance(ft_request, dict):
+            ft_args = ft_request
+        else:
+            ft_args = {
+                "request_id": ft_request.request_id,
+                "instruction": ft_request.instruction,
+                "params": ft_request.params,
+            }
         message = (
             EngineCoreRequestType.UTILITY.value,
             *self.encoder.encode(
-                (self.client_index, call_id, "handle_fault", (ft_request,))
+                (self.client_index, call_id, FT_UTILITY_METHOD, (ft_args,))
             ),
         )
         msg = (self.core_engine,) + message
@@ -1203,13 +1214,21 @@ class AsyncMPClient(MPClient):
 
     async def get_ft_status_async(self) -> str:
         """Get current fault tolerance status via UTILITY."""
+        from vllm.v1.fault_tolerance.engine_core_sentinel import (
+            FT_UTILITY_METHOD,
+        )
         call_id = uuid.uuid1().int >> 64
         future = asyncio.get_running_loop().create_future()
         self.utility_results[call_id] = future
+        ft_args = {
+            "request_id": "ft-status",
+            "instruction": "status",
+            "params": {},
+        }
         message = (
             EngineCoreRequestType.UTILITY.value,
             *self.encoder.encode(
-                (self.client_index, call_id, "get_ft_status", ())
+                (self.client_index, call_id, FT_UTILITY_METHOD, (ft_args,))
             ),
         )
         msg = (self.core_engine,) + message

@@ -95,10 +95,7 @@ class WorkerBase:
             vllm_config.compilation_config.ir_enable_torch_wrap
         )
 
-        # Initialize WorkerSentinel for fault tolerance.
-        from vllm.v1.fault_tolerance import WorkerSentinel
-
-        self.worker_sentinel = WorkerSentinel(self)
+        self.worker_sentinel = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
@@ -330,12 +327,10 @@ class WorkerWrapperBase:
             self.worker.init_device()  # type: ignore
 
     def retry(self, params: dict | None = None) -> str:
-        """FT recovery for worker runtime state.
-
-        Delegates to WorkerSentinel which resets model runner state,
-        rebuilds the DP cpu_group, and cleans MoE all2all masks.
+        """FT recovery is handled by Worker.create_worker_sentinel()
+        and Worker.handle_ft_command().
         """
-        return self.worker.worker_sentinel.retry(params)
+        pass
 
     def __getattr__(self, attr: str):
         """Fallback: delegate all other attributes to self.worker."""
