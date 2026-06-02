@@ -136,7 +136,7 @@ class ClientSentinel(BaseSentinel):
             engine_index: {"status": "healthy"}
             for engine_index in range(self.start_rank, self.start_rank + num_dp_managed)
         }
-        self.descaled_core_engines_dict = {
+        self.scaled_down_core_engines_dict = {
             engine_identity: engine_index
             for engine_index, engine_identity in enumerate(
                 self.core_client.core_engines
@@ -310,10 +310,10 @@ class ClientSentinel(BaseSentinel):
                 if idx == old_idx:
                     self.engine_identity_to_index[identity] = new_idx
 
-        self.descaled_core_engines_dict = {
+        self.scaled_down_core_engines_dict = {
             engine_identity: original_to_new[str(engine_index)]
             for engine_identity, engine_index in (
-                self.descaled_core_engines_dict.items()
+                self.scaled_down_core_engines_dict.items()
             )
             if str(engine_index) in original_to_new
         }
@@ -321,7 +321,7 @@ class ClientSentinel(BaseSentinel):
         self.core_client.core_engines = [
             engine_identity
             for engine_identity in self.core_client.core_engines
-            if engine_identity in self.descaled_core_engines_dict
+            if engine_identity in self.scaled_down_core_engines_dict
         ]
 
         _, self.core_client.engine_ranks_managed = self.get_mapping(
@@ -344,7 +344,7 @@ class ClientSentinel(BaseSentinel):
             ):
                 del self.core_client.lb_engines[local_rank]
 
-    async def descale(self, ft_request: FaultToleranceRequest) -> bool:  # type: ignore[override]
+    async def scale_down(self, ft_request: FaultToleranceRequest) -> bool:  # type: ignore[override]
         exclude_dp_ranks = ft_request.params.get("exclude_dp_ranks")
         timeout = ft_request.params.get("timeout")
         assert timeout is not None, "timeout is required"
@@ -370,9 +370,9 @@ class ClientSentinel(BaseSentinel):
             }
         )
 
-        descale_request = FaultToleranceRequest.builder(
+        scale_down_request = FaultToleranceRequest.builder(
             request_id=str(uuid.uuid4()),
-            instruction="descale",
+            instruction="scale_down",
             params={
                 "timeout": timeout,
                 "exclude_dp_ranks": exclude_dp_ranks,
@@ -380,7 +380,7 @@ class ClientSentinel(BaseSentinel):
                 "coord_store_port": self.parallel_config._coord_store_port,
             },
         )
-        res = await self._execute_cmd_on_engines(descale_request, target_engines)
+        res = await self._execute_cmd_on_engines(scale_down_request, target_engines)
 
         if res.success:
             await self.terminate_scaledown_cores(
