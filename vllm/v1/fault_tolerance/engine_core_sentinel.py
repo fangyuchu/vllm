@@ -255,11 +255,11 @@ class EngineCoreSentinel(BaseSentinel):
         )
         self.engine_core.step_counter = 0
 
-    def descale(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+    def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         """Scale down the engine cluster by removing specified DP ranks.
 
         This method adjusts parallel configuration parameters,
-        broadcasts the descalecommand to downstream workers,
+        broadcasts the scale_down command to downstream workers,
         and reinitializes the DP group for fault tolerance.
         """
         # Validate required keyword arguments
@@ -284,9 +284,9 @@ class EngineCoreSentinel(BaseSentinel):
             vllm_config_update_dict = self._build_vllm_config_update_dict(
                 parallel_config, new_ep_size, data_parallel_size, original_to_new
             )
-            descale_request = FaultToleranceRequest.builder(
+            scale_down_request = FaultToleranceRequest.builder(
                 request_id=str(uuid.uuid4()),
-                instruction="descale",
+                instruction="scale_down",
                 params={
                     "timeout": timeout,
                     "exclude_ep_ranks": exclude_ep_ranks,
@@ -297,7 +297,7 @@ class EngineCoreSentinel(BaseSentinel):
 
             self._execute_command_on_workers(
                 FaultToleranceRequest(
-                    str(uuid.uuid4()), "descale", descale_request.params
+                    str(uuid.uuid4()), "scale_down", scale_down_request.params
                 ),
                 self.worker_identities,
                 timeout=timeout,

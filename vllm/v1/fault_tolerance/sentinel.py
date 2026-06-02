@@ -82,7 +82,7 @@ class BaseSentinel(ABC):
         """
         raise NotImplementedError
 
-    def descale(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+    def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         raise NotImplementedError
 
     def shutdown(self):
