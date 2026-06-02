@@ -646,12 +646,6 @@ class EngineArgs:
                 **self.fault_tolerance_config
             )
 
-        from vllm.config.quantization import resolve_online_quant_config
-
-        self.quantization_config = resolve_online_quant_config(
-            self.quantization, self.quantization_config
-        )
-
         # Setup plugins
         from vllm.plugins import load_general_plugins
 

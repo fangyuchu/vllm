@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing import Process, connection
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import msgpack
@@ -142,6 +142,8 @@ class CoreEngineProcManager:
             )
 
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self.manager_stopped = threading.Event()
+        self.failed_proc_name: str | None = None
         self.start_index = start_index
 
         try:
@@ -172,6 +174,7 @@ class CoreEngineProcManager:
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
+        self.manager_stopped.set()
         if self.enable_fault_tolerance:
             self.engine_down_socket.close(linger=0)
             self.ctx.term()
@@ -360,6 +363,8 @@ class CoreEngineActorManager:
         self.log_stats = log_stats
         local_engine_count = vllm_config.parallel_config.data_parallel_size_local
         world_size = vllm_config.parallel_config.world_size
+        self.manager_stopped = threading.Event()
+        self.failed_proc_name: str | None = None
 
         if self.enable_fault_tolerance:
             self.ctx, self.engine_down_socket = make_engine_down_report_socket(
@@ -449,8 +454,11 @@ class CoreEngineActorManager:
 
         ray.get(refs)
         self.run_refs = []
+        self.actor_run_ref_dict = dict()
         for actor in self.local_engine_actors + self.remote_engine_actors:
-            self.run_refs.append(actor.run.remote())
+            ref = actor.run.remote()
+            self.run_refs.append(ref)
+            self.actor_run_ref_dict[actor] = ref
 
     @staticmethod
     def create_dp_placement_groups(
@@ -830,7 +838,9 @@ class CoreEngineActorManager:
         ) + self.remote_engine_actors[-(len(placement_groups) - new_local_engines) :]
 
         for actor in actors:
-            self.run_refs.append(actor.run.remote())
+            ref = actor.run.remote()
+            self.run_refs.append(ref)
+            self.actor_run_ref_dict[actor] = ref
 
         cur_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         # Update old_vllm_config with new data_parallel_size_local if any new
@@ -858,6 +868,22 @@ class CoreEngineActorManager:
             else:
                 self.remote_engine_actors.pop()
             ray.util.remove_placement_group(pg)
+
+    def remove_run_refs_for_scale_down(self, removed_dp_size: int) -> None:
+        if removed_dp_size <= 0:
+            return
+        flags = self.placement_group_is_local[-removed_dp_size:]
+        li = len(self.local_engine_actors) - 1
+        ri = len(self.remote_engine_actors) - 1
+        for is_local in reversed(flags):
+            if is_local:
+                actor = self.local_engine_actors[li]
+                li -= 1
+            else:
+                actor = self.remote_engine_actors[ri]
+                ri -= 1
+            ref = self.actor_run_ref_dict.pop(actor)
+            self.run_refs.remove(ref)
 
     def get_run_refs(self):
         return self.run_refs
@@ -902,6 +928,7 @@ class CoreEngineActorManager:
     def shutdown(self, timeout: float | None = None) -> None:
         import ray
 
+        self.manager_stopped.set()
         if self.enable_fault_tolerance:
             self.engine_down_socket.close(linger=0)
             self.ctx.term()

@@ -6,6 +6,7 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
+import functools
 import os
 import pickle
 import socket
@@ -137,6 +138,29 @@ def get_pp_indices(
     end_layer = start_layer + partitions[pp_rank]
 
     return (start_layer, end_layer)
+
+
+def create_tcp_store(
+    host: str,
+    port: int,
+    listen_socket: socket.socket | None = None,
+    **kwargs: Any,
+) -> TCPStore:
+    """Create a TCPStore, optionally taking ownership of ``listen_socket``."""
+    if listen_socket is None:
+        return TCPStore(host_name=host, port=port, **kwargs)
+
+    listen_fd = listen_socket.detach()
+    try:
+        return TCPStore(
+            host_name=host,
+            port=port,
+            master_listen_fd=listen_fd,
+            **kwargs,
+        )
+    except Exception:
+        socket.close(listen_fd)
+        raise
 
 
 @dataclasses.dataclass
@@ -464,6 +488,16 @@ class StatelessProcessGroup:
             socket=listen_socket,
             data_expiration_seconds=data_expiration_seconds,
         )
+
+
+@functools.lru_cache(maxsize=1)
+def get_cached_tcp_store_client(host: str, port: int) -> TCPStore:
+    """Return a cached TCPStore client.
+
+    Cached so that every call with the same ``(host, port)`` reuses the
+    same connection.  A new ``(host, port)`` evicts the old entry.
+    """
+    return TCPStore(host, port, is_master=False, wait_for_workers=False)
 
 
 def init_gloo_process_group(
