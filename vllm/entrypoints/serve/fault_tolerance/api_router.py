@@ -35,7 +35,7 @@ INSTRUCTION_PARAMS: dict[str, dict[str, dict[str, ParamType]]] = {
         "required": {"timeout": (int, float)},
         "optional": {},
     },
-    "descale": {
+    "scale_down": {
         "required": {
             "timeout": (int, float),
             "exclude_dp_ranks": list,
