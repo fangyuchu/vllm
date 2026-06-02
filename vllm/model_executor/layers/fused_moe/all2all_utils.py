@@ -48,6 +48,7 @@ if current_platform.is_cuda_alike():
             NixlEPPrepareAndFinalize,
         )
 
+
 def get_ep_all2all_manager(eep_stage: bool = False) -> Any:
     if eep_stage:
         from vllm.distributed.elastic_ep.standby_state import get_standby_ep_group

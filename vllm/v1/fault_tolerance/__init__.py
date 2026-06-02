@@ -7,16 +7,15 @@
 #   -> vllm.pooling_params -> vllm.config (CIRCULAR)
 # By deferring engine_core_sentinel load, vllm.config finishes initializing first.
 
-from .utils import FaultToleranceRequest  # noqa: F401 — used by engine/core.py
 from .config import FaultToleranceConfig  # noqa: F401 — used by parallel.py
+from .utils import FaultToleranceRequest  # noqa: F401 — used by engine/core.py
 
 
 def __getattr__(name: str):
     import importlib
 
     if name in ("EngineCoreSentinel", "fault_tolerant_wrapper"):
-        mod = importlib.import_module(
-            "vllm.v1.fault_tolerance.engine_core_sentinel")
+        mod = importlib.import_module("vllm.v1.fault_tolerance.engine_core_sentinel")
         return getattr(mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

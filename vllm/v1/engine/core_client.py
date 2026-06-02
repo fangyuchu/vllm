@@ -1193,6 +1193,7 @@ class AsyncMPClient(MPClient):
         from vllm.v1.fault_tolerance.engine_core_sentinel import (
             FT_UTILITY_METHOD,
         )
+
         if isinstance(ft_request, dict):
             ft_args = ft_request
         else:
@@ -1217,6 +1218,7 @@ class AsyncMPClient(MPClient):
         from vllm.v1.fault_tolerance.engine_core_sentinel import (
             FT_UTILITY_METHOD,
         )
+
         call_id = uuid.uuid1().int >> 64
         future = asyncio.get_running_loop().create_future()
         self.utility_results[call_id] = future

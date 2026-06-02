@@ -344,6 +344,7 @@ class Worker(WorkerBase):
                 worker=self,
                 device=self.device,
             )
+
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
         return self.worker_sentinel.handle_command(ft_request)

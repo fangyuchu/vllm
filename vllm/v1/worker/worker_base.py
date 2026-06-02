@@ -330,7 +330,7 @@ class WorkerWrapperBase:
         """FT recovery is handled by Worker.create_worker_sentinel()
         and Worker.handle_ft_command().
         """
-        pass
+        return ""
 
     def __getattr__(self, attr: str):
         """Fallback: delegate all other attributes to self.worker."""

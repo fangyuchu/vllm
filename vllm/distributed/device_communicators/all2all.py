@@ -361,6 +361,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         # Ignore CUDA errors during clean — the context may be in an
         # error state after dispatch/combine timeout.
         from contextlib import suppress
+
         with suppress(Exception):
             buf.low_latency_clean_mask_buffer()
         # _last_mask is a GPU tensor; zero_() would fail if the CUDA
@@ -386,15 +387,6 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             mask.zero_()
             return mask
         return buf.low_latency_query_mask_buffer(mask)
-
-
-
-
-@dataclass
-class _NixlEPBufferState:
-    buffer: Any
-    connected_ep_size: int
-    active_ep_size: int
 
 
 @dataclass
