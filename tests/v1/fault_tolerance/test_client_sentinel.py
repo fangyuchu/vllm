@@ -58,11 +58,8 @@ def client_sentinel(mock_parallel_config, mock_ft_addresses, mock_call_utility_a
             "vllm.v1.fault_tolerance.client_sentinel.make_zmq_socket",
             return_value=fault_receiver_socket,
         ),
-        patch(
-            "vllm.v1.fault_tolerance.client_sentinel.asyncio.create_task"
-        ) as mock_create_task,
+        patch("vllm.v1.fault_tolerance.client_sentinel.asyncio.create_task"),
     ):
-
         core_client = Mock()
         core_client.core_engines = [b"engine_0", b"engine_1"]
         core_client.engine_registry = {0: b"engine_0", 1: b"engine_1"}
