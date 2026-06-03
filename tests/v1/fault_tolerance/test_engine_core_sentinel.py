@@ -64,10 +64,11 @@ def create_engine_core_sentinel(
     return EngineCoreSentinel(
         parallel_config,
         engine_index=0,
+        engine_input_q=input_queue,
         engine_fault_socket_addr=addr_dict["engine_fault_socket_addr"],
         sentinel_identity=sentinel_identity,
         worker_cmd_addr=worker_cmd_addr,
-        engine_input_q=input_queue,
+        engine_core=Mock(),
     )
 
 
