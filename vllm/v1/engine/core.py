@@ -509,6 +509,14 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        # If the executor has detected a worker failure (via a previous
+        # future.result() reading FAILURE from response_mq), re-raise
+        # immediately so @fault_tolerant_wrapper can catch it without
+        # blocking on shm_broadcast for minutes.
+        if self.model_executor.is_failed:
+            raise RuntimeError(
+                "Executor is in failed state — a worker process reported an error"
+            )
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):

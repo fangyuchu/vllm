@@ -117,6 +117,11 @@ class EngineCoreSentinel:
         engine = self.engine
         executor = engine.model_executor
 
+        # Reset the executor's failure flag so that subsequent steps
+        # can proceed. (It was set when get_response() read FAILURE
+        # from the worker.)
+        executor.is_failed = False
+
         # 1) Reinit DP process group (engine side) if in DP mode.
         from vllm.config import set_current_vllm_config
 
