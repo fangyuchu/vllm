@@ -717,12 +717,10 @@ class MPClient(EngineCoreClient):
             # No engine processes to monitor
             return
 
-        engine_processes = engine_manager.processes
         self_ref = weakref.ref(self)
 
         # Monitor engine core process liveness. If any die unexpectedly,
-        # logs an error, shuts down the client and invokes the failure
-        # callback to inform the engine.
+        # marks the engine as dead, and shuts down the client.
         def monitor_engine_cores():
             if isinstance(engine_manager, CoreEngineProcManager):
                 engine_manager.monitor_engine_liveness(self.engine_registry)
@@ -733,13 +731,6 @@ class MPClient(EngineCoreClient):
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
-            proc_name = next(
-                proc.name for proc in engine_processes if proc.sentinel == died[0]
-            )
-            logger.error(
-                "Engine core proc %s died unexpectedly, shutting down client.",
-                proc_name,
-            )
             _self.shutdown()
             # Note: For MPClient, we don't have a failure callback mechanism
             # like MultiprocExecutor, but we set engine_dead flag which will
