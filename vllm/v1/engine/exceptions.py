@@ -16,14 +16,3 @@ class EngineDeadError(Exception):
         # Make stack trace clearer when using with LLMEngine by
         # silencing irrelevant ZMQError.
         self.__suppress_context__ = suppress_context
-
-
-class EngineLoopPausedError(Exception):
-    PREFIX = "[EnginePaused]"
-
-    def __init__(self, message=""):
-        if message.startswith(self.PREFIX):
-            full_message = message
-        else:
-            full_message = f"{self.PREFIX} {message}"
-        super().__init__(full_message)

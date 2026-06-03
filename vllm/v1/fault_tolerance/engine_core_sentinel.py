@@ -1,24 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""EngineCoreSentinel and fault_tolerant_wrapper for the engine core.
-
-The EngineCoreSentinel executes recovery logic via collective_rpc to workers.
-The wrapper decorates the busy loop to catch faults and delegate recovery to
-the sentinel. All FT state and logic lives here — EngineCore and Worker hold
-only a reference to their sentinel.
-"""
+"""EngineCoreSentinel and fault_tolerant_wrapper for the engine core."""
 
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from vllm.config import set_current_vllm_config
+from vllm.distributed import stateless_destroy_torch_distributed_process_group
+from vllm.distributed.utils import stateless_init_torch_distributed_process_group
 from vllm.logger import init_logger
-from vllm.v1.engine import (
-    EngineCoreOutputs,
-    EngineStatusType,
-    UtilityOutput,
-)
+from vllm.utils.network_utils import get_open_port
+from vllm.v1.engine import EngineCoreOutputs, EngineStatusType, UtilityOutput
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.request import RequestStatus
 from vllm.v1.serial_utils import UtilityResult, run_method
@@ -32,45 +25,26 @@ FT_UTILITY_METHOD = "handle_fault_tolerance"
 
 
 class EngineCoreSentinel:
-    """Manages fault tolerance state for a single engine core.
-
-    Sends commands to workers via collective_rpc, tracks resume state,
-    and executes FT instructions (retry).
-    """
+    """Manages fault tolerance state for a single engine core."""
 
     def __init__(self, engine: "EngineCoreProc", parallel_config):
         self.engine = engine
         self.engine_index = engine.engine_index
         self.parallel_config = parallel_config
-        self.engine_recovery_timeout_sec = (
-            parallel_config.fault_tolerance_config.engine_recovery_timeout_sec
-        )
+        ft_config = parallel_config.fault_tolerance_config
+        self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
 
         self.resumed = threading.Event()
         self.resumed.set()
         self.status_type = EngineStatusType.HEALTHY
-
-    @classmethod
-    def create(cls, engine: "EngineCoreProc", parallel_config) -> "EngineCoreSentinel":
-        """Create sentinel and initialize worker sentinels via collective RPC.
-
-        Call this from EngineCoreProc.__init__ when FT is enabled.
-        """
-        sentinel = cls(engine=engine, parallel_config=parallel_config)
-        engine.model_executor.collective_rpc(
-            method="create_worker_sentinel",
-            non_block=False,
-        )
-        return sentinel
 
     # ------------------------------------------------------------------
     # Command dispatch (called from process_input_sockets thread)
     # ------------------------------------------------------------------
 
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
-        """Dispatch an FT command by instruction name and enqueue the result."""
+        """Dispatch an FT command by instruction name and enqueue result."""
         ft_request = FaultToleranceRequest(**ft_args)
-
         try:
             result = run_method(self, ft_request.instruction, (ft_request,), {})
         except Exception as e:
@@ -92,15 +66,20 @@ class EngineCoreSentinel:
     # ------------------------------------------------------------------
 
     def on_fault(self, exc: Exception):
-        """Non-blocking fault initialization. Called by the wrapper when
-        the busy loop raises an exception."""
+        """Called by the wrapper when the busy loop raises an exception."""
         self.resumed.clear()
         logger.warning(
             "[FT] Busy loop raised %s. Waiting for recovery.", type(exc).__name__
         )
 
-        self._abort_all_requests()
-        self._publish_status(EngineStatusType.UNHEALTHY, str(exc))
+        engine = self.engine
+        aborted = engine.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+        engine._send_abort_outputs(aborted)
+        if engine.batch_queue is not None:
+            engine.batch_queue.clear()
+
+        self.status_type = EngineStatusType.UNHEALTHY
+        logger.info("[FT] Engine %d status -> UNHEALTHY: %s", self.engine_index, exc)
 
     # ------------------------------------------------------------------
     # Instruction handlers (method name == instruction string)
@@ -118,34 +97,14 @@ class EngineCoreSentinel:
         engine = self.engine
         executor = engine.model_executor
 
-        # 1) Reinit DP process group (engine side) if in DP mode.
         with set_current_vllm_config(engine.vllm_config):
             ft_request.params.update(self._reinit_dp_group())
 
-        # 2) Drain stale futures/responses so the MQ channel is clean.
         self._drain_stale_responses(executor)
+        executor.collective_rpc("handle_ft_command", args=(ft_request,))
 
-        # 3) Tell workers to clean state and reinit their DP group.
-        executor.collective_rpc(
-            method="handle_ft_command",
-            args=(ft_request,),
-            non_block=False,
-        )
-
-        # 4) Reset DP-specific engine state if in DP mode.
-        if hasattr(engine, "dp_group"):
-            engine.engines_running = False
-            engine.step_counter = 0
-            if engine.has_coordinator and engine.dp_rank == 0:
-                engine.output_queue.put_nowait(
-                    (
-                        -1,
-                        EngineCoreOutputs(wave_complete=engine.current_wave),
-                    )
-                )
-            engine.current_wave += 1
-
-        self._publish_status(EngineStatusType.HEALTHY)
+        self.status_type = EngineStatusType.HEALTHY
+        logger.info("[FT] Engine %d status -> HEALTHY", self.engine_index)
         self.resumed.set()
         return {"request_id": ft_request.request_id, "success": True}
 
@@ -158,14 +117,6 @@ class EngineCoreSentinel:
         engine = self.engine
         if not hasattr(engine, "dp_group"):
             return {}
-
-        from vllm.distributed import (
-            stateless_destroy_torch_distributed_process_group,
-        )
-        from vllm.distributed.utils import (
-            stateless_init_torch_distributed_process_group,
-        )
-        from vllm.utils.network_utils import get_open_port
 
         parallel_config = engine.vllm_config.parallel_config
 
@@ -193,15 +144,14 @@ class EngineCoreSentinel:
 
     @staticmethod
     def _drain_stale_responses(executor):
-        """Drain stale futures and pending responses from the executor's
-        message queues before issuing a new collective_rpc."""
+        """Drain stale futures/responses before issuing a new collective_rpc."""
         if not hasattr(executor, "futures_queue"):
             return
         num_stale = len(executor.futures_queue)
         executor.futures_queue.clear()
         if num_stale == 0:
             return
-        logger.info("[FT] Draining %d stale response(s) from response queue", num_stale)
+        logger.info("[FT] Draining %d stale response(s)", num_stale)
         if executor.kv_output_aggregator is not None:
             mqs = executor.response_mqs
         else:
@@ -213,49 +163,13 @@ class EngineCoreSentinel:
                 except Exception:
                     break
 
-    def _abort_all_requests(self):
-        """Abort all in-flight requests — no request-level recovery."""
-        engine = self.engine
-        aborted = engine.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
-        engine._send_abort_outputs(aborted)
-        engine.scheduler.prev_step_scheduled_req_ids.clear()
-        engine.scheduler.finished_req_ids.clear()
-        if engine.scheduler.finished_req_ids_dict is not None:
-            engine.scheduler.finished_req_ids_dict.clear()
-        if engine.batch_queue is not None:
-            engine.batch_queue.clear()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _publish_status(self, status: EngineStatusType, message: str | None = None):
-        self.status_type = status
-        if message:
-            logger.info(
-                "[FT] Engine %d status -> %s: %s",
-                self.engine_index,
-                status.name,
-                message,
-            )
-        else:
-            logger.info("[FT] Engine %d status -> %s", self.engine_index, status.name)
-
 
 def fault_tolerant_wrapper(busy_loop_func: Callable):
-    """Wrap the busy loop to catch faults and delegate recovery.
-
-    On exception: on_fault() initializes paused state, then the wrapper
-    waits on the `resumed` Event. The retry command arrives via
-    process_input_sockets (separate thread), executes recovery, and
-    signals `resumed` — no queue polling needed.
-    """
+    """Wrap the busy loop to catch faults and delegate recovery."""
 
     def run_with_fault_tolerance(self: "EngineCoreProc"):
         while True:
             try:
-                if self.enable_fault_tolerance:
-                    self.ft_sentinel.resumed.set()
                 busy_loop_func(self)
             except SystemExit:
                 raise

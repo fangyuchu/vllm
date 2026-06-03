@@ -73,11 +73,10 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.engine_core_sentinel import (
-    EngineCoreSentinel,
     FT_UTILITY_METHOD,
+    EngineCoreSentinel,
     fault_tolerant_wrapper,
 )
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -915,7 +914,7 @@ class EngineCoreProc(EngineCore):
                 vllm_config.parallel_config.enable_fault_tolerance
             )
             if self.enable_fault_tolerance:
-                self.ft_sentinel = EngineCoreSentinel.create(
+                self.ft_sentinel = EngineCoreSentinel(
                     engine=self,
                     parallel_config=vllm_config.parallel_config,
                 )
@@ -1496,7 +1495,8 @@ class EngineCoreProc(EngineCore):
                         client_idx, call_id, method, args = request
                         if method == FT_UTILITY_METHOD:
                             self.ft_sentinel.handle_command(
-                                client_idx, call_id, args[0])
+                                client_idx, call_id, args[0]
+                            )
                             continue
                     else:
                         request = generic_decoder.decode(data_frames)

@@ -16,13 +16,3 @@ class FaultToleranceConfig:
     to handle the error. If no instructions are received within this
     time, the original error is raised.
     """
-
-    internal_fault_report_port: int = 22866
-    """
-    The port to use for engines to report fault to client sentinel.
-    """
-
-    external_fault_notify_port: int = 22867
-    """
-    Port used to publish engine fault and status change notifications.
-    """
