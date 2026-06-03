@@ -538,6 +538,7 @@ def stateless_init_torch_distributed_process_group(
     backend: str,
     group_name: str | None = None,
     return_store: bool = False,
+    listen_socket: socket.socket | None = None,
     gloo_timeout_seconds: int | None = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
@@ -570,15 +571,31 @@ def stateless_init_torch_distributed_process_group(
     are the same as process 1 and 5, the main communication channel is
     always formed with process 1, 2, ..., 8, and the additional communication
     channel is formed with process 9 and 10.
+
+    When *listen_socket* is provided, the rendezvous step
+    is skipped and a ``TCPStore`` server is created directly using the
+    pre-bound socket.  This is useful for eliminating TOCTOU races
+    between port allocation and binding.
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
     timeout = _get_default_timeout(backend)
     if gloo_timeout_seconds is not None:
         timeout = timedelta(seconds=gloo_timeout_seconds)
-    store, rank, world_size = next(
-        rendezvous(init_method, rank, world_size, timeout=timeout)
-    )
+    if listen_socket is not None:
+        store = create_tcp_store(
+            host,
+            port,
+            listen_socket=listen_socket,
+            world_size=world_size,
+            is_master=True,
+            timeout=timeout,
+            multi_tenant=True,
+        )
+    else:
+        store, rank, world_size = next(
+            rendezvous(init_method, rank, world_size, timeout=timeout)
+        )
     store.set_timeout(timeout)
 
     group_rank = rank

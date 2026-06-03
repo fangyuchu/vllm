@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import socket
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, overload
 
@@ -267,6 +268,10 @@ class ParallelConfig:
 
     rank: int = 0
     """Global rank in distributed setup."""
+
+    _coord_store_port: int = 0
+    """Port for the TCPStore used to coordinate DP port selection
+    during stateless DP group init (e.g., after fault recovery)."""
 
     _data_parallel_master_port_list: list[int] = Field(default_factory=list)
     """List of open port auto-queried for data parallel messaging.
@@ -542,6 +547,33 @@ class ParallelConfig:
     def get_next_stateless_eplb_group_port(self) -> list[int]:
         return self._stateless_eplb_group_port_list.pop()
 
+    def _pick_stateless_dp_port(self) -> tuple[int, socket.socket | None]:
+        """Return ``(port, listen_socket)`` for DP group init.
+
+        With a coord store, rank 0 binds a socket and publishes the port;
+        others read it.  Without one, pops a pre-allocated port and
+        returns ``listen_socket=None``.
+        """
+        if not self._coord_store_port:
+            return self.get_next_dp_init_port(), None
+
+        from vllm.distributed.utils import get_cached_tcp_store_client
+
+        store = get_cached_tcp_store_client(
+            self.data_parallel_master_ip, self._coord_store_port
+        )
+
+        key = "dp_master_port"
+        if self.data_parallel_rank == 0:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((self.data_parallel_master_ip, 0))
+            s.listen()
+            port = s.getsockname()[1]
+            store.set(key, str(port).encode())
+            return port, s
+        else:
+            return int(store.get(key).decode()), None
+
     @overload
     def stateless_init_dp_group(
         self, return_store: Literal[False] = ...
@@ -570,14 +602,16 @@ class ParallelConfig:
         last_exc: Exception | None = None
         for _ in range(max_retries):
             try:
+                port, listen_socket = self._pick_stateless_dp_port()
                 # use gloo since the engine process might not have cuda device
                 return stateless_init_torch_distributed_process_group(
                     self.data_parallel_master_ip,
-                    self.get_next_dp_init_port(),
+                    port,
                     self.data_parallel_rank,
                     self.data_parallel_size,
                     backend="gloo",
                     return_store=return_store,
+                    listen_socket=listen_socket,
                     gloo_timeout_seconds=self.gloo_timeout_seconds,
                 )
             except DistNetworkError as e:
