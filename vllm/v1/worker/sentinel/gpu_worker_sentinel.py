@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import torch
 
+from vllm.config import set_current_vllm_config
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
-    get_pp_group,
-    get_tp_group,
     stateless_init_torch_distributed_process_group,
 )
-from vllm.config import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.serial_utils import run_method
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -35,18 +33,12 @@ class WorkerSentinel:
         self.device = device
         self.dp_rank = worker.parallel_config.data_parallel_rank
         self.dp_size = worker.parallel_config.data_parallel_size
-        self.data_parallel_master_ip = (
-            worker.parallel_config.data_parallel_master_ip
-        )
+        self.data_parallel_master_ip = worker.parallel_config.data_parallel_master_ip
 
         self.use_ft_backend = (
             worker.parallel_config.all2all_backend in _FT_BACKEND_SET
             and self.dp_size > 1
         )
-        if self.use_ft_backend:
-            world_size = get_ep_group().world_size
-            self.mask = torch.zeros(world_size, device=device, dtype=torch.int)
-            self.last_mask = torch.zeros_like(self.mask)
 
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""
@@ -54,6 +46,7 @@ class WorkerSentinel:
             return run_method(self, ft_request.instruction, (ft_request,), {})
 
     def retry(self, ft_request: FaultToleranceRequest):
+        torch.accelerator.synchronize()
         params = ft_request.params
         self._clean_worker_state()
         if self.dp_size > 1:
@@ -68,7 +61,8 @@ class WorkerSentinel:
             if self.use_ft_backend:
                 comm = get_ep_group().device_communicator
                 assert comm and comm.all2all_manager
-                comm.all2all_manager.clean_mask()
+                mgr = comm.all2all_manager
+                mgr.clean_buffers()
 
     def _clean_worker_state(self):
         self.worker.model_runner.execute_model_state = None

@@ -102,16 +102,19 @@ class All2AllManagerBase:
         # - raise a clear error if extra_tensors is not supported.
         raise NotImplementedError
 
-    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
-        # This is used in the fault tolerance feature. The mask is a 1D tensor with
-        # length equal to the world size of the EP group. Each rank will set its own
-        # index to 1 if it detects a fault, and 0 otherwise
+    @property
+    def support_fault_tolerance(self) -> bool:
+        return False
+
+    def query_active_mask(self) -> torch.Tensor:
         raise NotImplementedError
 
-    def clean_mask(self):
-        # This is used in the fault tolerance feature. The mask is a 1D tensor with
-        # length matching the EP group world size. Each rank marks its index as 1 on
-        # fault; this method clears all faults back to 0.
+    def clean_buffers(self) -> None:
+        """Clean RDMA buffers and mask state during FT retry."""
+        raise NotImplementedError
+
+    def query_fault(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (has_fault scalar, current_active_mask)."""
         raise NotImplementedError
 
     def set_num_sms(self, num_sms: int):

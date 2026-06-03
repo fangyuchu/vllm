@@ -783,12 +783,6 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        if self.worker_sentinel is not None and self.worker_sentinel.use_ft_backend:
-            ep_rank_mask = self.worker_sentinel.mask
-            last_ep_rank_mask = self.worker_sentinel.last_mask
-            return self.model_runner.sample_tokens(
-                grammar_output, ep_rank_mask, last_ep_rank_mask
-            )
         return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
