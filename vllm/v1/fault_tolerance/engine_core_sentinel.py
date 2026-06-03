@@ -159,11 +159,13 @@ class EngineCoreSentinel(BaseSentinel):
             return FaultToleranceResult(ft_request.request_id, True)
         timeout = ft_request.params["timeout"]
         self.parallel_config._coord_store_port = ft_request.params["coord_store_port"]
-        self._execute_command_on_workers(
+        res = self._execute_command_on_workers(
             FaultToleranceRequest(str(uuid.uuid4()), "retry", ft_request.params),
             self.worker_identities,
             timeout=timeout,
         )
+        if not res.success:
+            return res
         if self.data_parallel_size > 1:
             # If the Gloo communication times out,
             # the data parallel group (dp_group) needs to be reinitialized
