@@ -1655,8 +1655,8 @@ class EngineCoreProc(EngineCore):
     def shutdown(self):
         super().shutdown()
         if self.enable_fault_tolerance:
-            sys.exit()
             self.engine_core_sentinel.shutdown()
+            sys.exit()
 
 
 class DPEngineCoreProc(EngineCoreProc):
