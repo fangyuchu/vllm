@@ -63,18 +63,15 @@ def client_sentinel(mock_parallel_config, mock_ft_addresses, mock_call_utility_a
         ) as mock_create_task,
     ):
 
-        def _capture_task(coro):
-            # ClientSentinel starts run() in __init__; close it in tests to avoid
-            # "coroutine was never awaited" warnings when create_task is mocked.
-            coro.close()
-            return Mock()
-
-        mock_create_task.side_effect = _capture_task
+        core_client = Mock()
+        core_client.core_engines = [b"engine_0", b"engine_1"]
+        core_client.engine_registry = {0: b"engine_0", 1: b"engine_1"}
         sentinel = ClientSentinel(
             parallel_config=mock_parallel_config,
             fault_tolerance_addresses=mock_ft_addresses,
             call_utility_async=mock_call_utility_async,
             core_engines=[b"engine_0", b"engine_1"],
+            core_client=core_client,
         )
 
     return sentinel
