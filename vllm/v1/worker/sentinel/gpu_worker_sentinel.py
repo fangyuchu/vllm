@@ -107,14 +107,14 @@ class WorkerSentinel(BaseSentinel):
     def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         self.clear_input_batch_callback()
         get_pause_event().clear()
-        comm = get_ep_group().device_communicator
-        assert comm and comm.all2all_manager
         if self.parallel_config.all2all_backend not in _FT_BACKEND_SET:
             return FaultToleranceResult(
                 ft_request.request_id,
                 False,
                 "all2all_backend not supported, must in {}".format(_FT_BACKEND_SET),
             )
+        comm = get_ep_group().device_communicator
+        assert comm and comm.all2all_manager
         comm.all2all_manager.clean_mask()
 
         get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
