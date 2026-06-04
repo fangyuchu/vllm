@@ -116,7 +116,7 @@ class EngineCoreSentinel(BaseSentinel):
                 else EngineStatusType.UNHEALTHY
             )
             msg = FaultInfo.from_exception(
-                engine_exception, self.engine_index, engine_status
+                engine_exception, self.engine_index, engine_status, self.identity
             )
             msg_bytes = msgspec.msgpack.encode(msg)
             self.engine_fault_socket.send_multipart([b"", msg_bytes])
