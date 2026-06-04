@@ -56,6 +56,7 @@ class EngineCoreSentinel(BaseSentinel):
             f"DP_{engine_index}",
             sentinel_identity,
         )
+        self.engine_identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engine_core = engine_core
         self.data_parallel_size = parallel_config.data_parallel_size
         self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
@@ -116,7 +117,7 @@ class EngineCoreSentinel(BaseSentinel):
                 else EngineStatusType.UNHEALTHY
             )
             msg = FaultInfo.from_exception(
-                engine_exception, self.engine_index, engine_status, self.identity
+                engine_exception, self.engine_index, engine_status, self.engine_identity
             )
             msg_bytes = msgspec.msgpack.encode(msg)
             self.engine_fault_socket.send_multipart([b"", msg_bytes])
