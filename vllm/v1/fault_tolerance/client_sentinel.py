@@ -456,14 +456,11 @@ class ClientSentinel(BaseSentinel):
                 ):
                     continue
                 if fault_info.type == "EngineDeadError":
-                    engine_identity = next(
-                        k
-                        for k, v in self.engine_identity_to_index.items()
-                        if v == int(fault_info.engine_id)
-                    )
-                    self.killed_engine_identity.append(engine_identity)
+                    self.killed_engine_identity.append(fault_info.engine_identity)
+
                 status_enum = EngineStatusType(fault_info.engine_status)
-                self.engine_status_dict[int(fault_info.engine_id)] = {
+                engine_id = self.engine_identity_to_index[fault_info.engine_identity]
+                self.engine_status_dict[engine_id] = {
                     "status": status_enum.name.lower()
                 }
                 await self._pub_engine_status()
