@@ -155,7 +155,7 @@ class ClientSentinel(BaseSentinel):
         asyncio.create_task(self.poll_and_execute_cmd())
 
     async def send_engine_registry(self, dp_size, dp_size_local) -> None:
-        recv_engine_count = dp_size_local
+        recv_engine_count = 0
         while recv_engine_count < dp_size:
             (
                 sender_identity,
