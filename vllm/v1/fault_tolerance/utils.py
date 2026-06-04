@@ -21,8 +21,8 @@ FAULT_STATE_PUB_TOPIC = "vllm_fault"
 class FaultInfo(msgspec.Struct):
     type: str
     message: str
-    engine_id: str
     engine_status: EngineStatusType
+    engine_id: str | None = None
     engine_identity: bytes | None = None
     timestamp: str | None = None
     additional_info: dict | None = None
@@ -165,11 +165,11 @@ def make_engine_down_report_socket(vllm_config):
     return zmq_ctx, engine_down_socket
 
 
-def notify_engine_down(engine_down_socket, engine_id, engine_identity=None):
+def notify_engine_down(engine_down_socket, engine_id=None, engine_identity=None):
     fault_info = FaultInfo(
         type="EngineDeadError",
         message="Engine died unexpectedly.",
-        engine_id=str(engine_id),
+        engine_id=str(engine_id) if engine_id is not None else None,
         engine_identity=engine_identity,
         engine_status=EngineStatusType.DEAD,
     )

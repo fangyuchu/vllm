@@ -213,10 +213,8 @@ class CoreEngineProcManager:
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
                 if self.enable_fault_tolerance:
-                    engine_rank = self.processes.index(proc)
                     notify_engine_down(
                         self.engine_down_socket,
-                        engine_id=str(engine_rank + self.start_index),
                         engine_identity=pid_mapping[died_proc.pid],
                     )
                     sentinels.remove(cast(int, sentinel))
@@ -914,11 +912,7 @@ class CoreEngineActorManager:
                     self.failed_proc_name = f"Actor {actor_ref}"
                     unexpected_failure = True
                     if self.enable_fault_tolerance:
-                        engine_rank = self.get_run_refs().index(actor_ref)
-                        notify_engine_down(
-                            self.engine_down_socket,
-                            str(engine_rank + self.start_rank),
-                        )
+                        notify_engine_down(self.engine_down_socket)
                         failed_ref.add(actor_ref)
 
             if unexpected_failure and not self.enable_fault_tolerance:
