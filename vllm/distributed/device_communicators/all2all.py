@@ -360,6 +360,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         buf.get_local_buffer_tensor(dtype=torch.int8, use_rdma_buffer=True).zero_()
         torch.accelerator.synchronize()
         buf.low_latency_clean_mask_buffer()
+        torch.accelerator.synchronize()
         if DeepEPLLAll2AllManager._last_mask is not None:
             DeepEPLLAll2AllManager._last_mask.zero_()
 
@@ -517,12 +518,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         if NixlEPAll2AllManager._buffer is None:
             return
         buf = NixlEPAll2AllManager._buffer[0]
-        max_tokens = getattr(self, "_ll_max_tokens_per_rank", None)
-        hidden = getattr(self, "_ll_hidden", None)
-        num_experts = getattr(self, "_ll_num_experts", None)
-        if max_tokens is not None and hidden is not None and num_experts is not None:
-            buf.clean_buffer(max_tokens, hidden, num_experts)
+        buf.get_local_buffer_tensor(dtype=torch.int8).zero_()
+        torch.accelerator.synchronize()
         buf.clean_mask_buffer()
+        torch.accelerator.synchronize()
         NixlEPAll2AllManager._last_active_mask = None
 
     def query_fault(self) -> tuple[torch.Tensor, torch.Tensor]:
