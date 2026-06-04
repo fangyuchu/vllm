@@ -75,6 +75,11 @@ from vllm.v1.engine.utils import (
     get_device_indices,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.fault_tolerance import fault_tolerant_wrapper
+from vllm.v1.fault_tolerance.engine_core_sentinel import (
+    FT_UTILITY_METHOD,
+    EngineCoreSentinel,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -504,6 +509,14 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        # If the executor has detected a worker failure (via a previous
+        # future.result() reading FAILURE from response_mq), re-raise
+        # immediately so @fault_tolerant_wrapper can catch it without
+        # blocking on shm_broadcast for minutes.
+        if self.model_executor.is_failed:
+            raise RuntimeError(
+                "Executor is in failed state — a worker process reported an error"
+            )
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
@@ -930,6 +943,16 @@ class EngineCoreProc(EngineCore):
                 executor_fail_callback,
                 internal_dp_balancing,
             )
+
+            # Initialize fault tolerance settings.
+            self.enable_fault_tolerance = (
+                vllm_config.parallel_config.enable_fault_tolerance
+            )
+            if self.enable_fault_tolerance:
+                self.ft_sentinel = EngineCoreSentinel.create(
+                    engine=self,
+                    parallel_config=vllm_config.parallel_config,
+                )
 
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
@@ -1501,6 +1524,18 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                    elif request_type == EngineCoreRequestType.UTILITY:
+                        request = generic_decoder.decode(data_frames)
+                        client_idx, call_id, method, args = request
+                        if method == FT_UTILITY_METHOD and hasattr(self, "ft_sentinel"):
+                            self.ft_sentinel.handle_command(
+                                client_idx, call_id, args[0]
+                            )
+                            continue
+                        # Non-FT UTILITY: re-encode and push to input_queue
+                        request = (client_idx, call_id, method, args)
+                        self.input_queue.put_nowait((request_type, request))
+                        continue
                     else:
                         request = generic_decoder.decode(data_frames)
 
@@ -1838,6 +1873,7 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
 

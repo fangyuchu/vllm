@@ -95,6 +95,8 @@ class WorkerBase:
             vllm_config.compilation_config.ir_enable_torch_wrap
         )
 
+        self.worker_sentinel = None
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
@@ -324,7 +326,14 @@ class WorkerWrapperBase:
             # To make vLLM config available during device initialization
             self.worker.init_device()  # type: ignore
 
+    def retry(self, params: dict | None = None) -> str:
+        """FT recovery is handled by Worker.create_worker_sentinel()
+        and Worker.handle_ft_command().
+        """
+        return ""
+
     def __getattr__(self, attr: str):
+        """Fallback: delegate all other attributes to self.worker."""
         return getattr(self.worker, attr)
 
     def _apply_mm_cache(self, scheduler_output: SchedulerOutput) -> None:

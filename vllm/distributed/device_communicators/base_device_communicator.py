@@ -102,6 +102,20 @@ class All2AllManagerBase:
         # - raise a clear error if extra_tensors is not supported.
         raise NotImplementedError
 
+    @property
+    def support_fault_tolerance(self) -> bool:
+        return False
+
+    def query_active_mask(self) -> torch.Tensor:
+        raise NotImplementedError
+
+    def clean_mask(self) -> None:
+        raise NotImplementedError
+
+    def query_fault(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (has_fault scalar, current_active_mask)."""
+        raise NotImplementedError
+
     def set_num_sms(self, num_sms: int):
         pass
 
@@ -110,6 +124,12 @@ class All2AllManagerBase:
 
     def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False):
         raise NotImplementedError
+
+    def query_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        """Query the active mask into the given output tensor.
+        No-op by default.
+        """
+        return mask
 
     def destroy(self):
         pass

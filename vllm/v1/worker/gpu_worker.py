@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     Handle,
+    get_ep_group,
     get_pp_group,
     get_tp_group,
 )
@@ -55,6 +56,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -62,6 +64,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -133,6 +136,7 @@ class Worker(WorkerBase):
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
         self.elastic_ep_executor = ElasticEPScalingExecutor(self)
+        self.worker_sentinel: WorkerSentinel | None = None  # type: ignore[assignment]
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -332,6 +336,18 @@ class Worker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def create_worker_sentinel(self):
+        logger.info("create_worker_sentinel called")
+        with set_current_vllm_config(self.vllm_config):
+            self.worker_sentinel = WorkerSentinel(
+                worker=self,
+                device=self.device,
+            )
+
+    def handle_ft_command(self, ft_request):
+        assert self.worker_sentinel is not None
+        return self.worker_sentinel.handle_command(ft_request)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
@@ -778,6 +794,12 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if self.worker_sentinel is not None and self.worker_sentinel.use_ft_backend:
+            ep_rank_mask = self.worker_sentinel.mask
+            last_ep_rank_mask = self.worker_sentinel.last_mask
+            return self.model_runner.sample_tokens(
+                grammar_output, ep_rank_mask, last_ep_rank_mask
+            )
         return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
@@ -930,6 +952,29 @@ class Worker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+
+        # FT: detect EP peer fault after dummy model execution
+        if self.worker_sentinel is not None and self.worker_sentinel.use_ft_backend:
+            comm = get_ep_group().device_communicator
+            if comm is not None and comm.all2all_manager is not None:
+                comm.all2all_manager.query_mask(self.worker_sentinel.mask)
+                has_fault = (
+                    self.worker_sentinel.mask - self.worker_sentinel.last_mask
+                ).any()
+                if has_fault.item():
+                    logger.warning(
+                        "[FT] EP fault detected in dummy_batch dp_rank=%d mask=%s",
+                        self.parallel_config.data_parallel_rank,
+                        self.worker_sentinel.mask.cpu().tolist(),
+                    )
+                    self.worker_sentinel.last_mask.copy_(self.worker_sentinel.mask)
+                    raise EngineLoopPausedError(
+                        "Fault detected in EP ranks during "
+                        "dummy model execution. "
+                        f"Current mask: "
+                        f"{self.worker_sentinel.mask.cpu().tolist()}"
+                    )
+                self.worker_sentinel.last_mask.copy_(self.worker_sentinel.mask)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

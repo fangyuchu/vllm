@@ -85,16 +85,37 @@ class FutureWrapper(Future):
             raise RuntimeError("timeout not implemented")
 
         # Drain any futures ahead of us in the queue.
-        while not self.done():
+        # Stuck futures (worker dead) are skipped with a short timeout
+        # so we can reach *our* future without blocking for minutes.
+        max_drain = len(self.futures_queue) * 2
+        drained = 0
+        while not self.done() and drained < max_drain:
             future = self.futures_queue.pop()
-            future._wait_for_response()
+            drain = future is not self
+            future._wait_for_response(drain=drain)
+            if not future.done():
+                # Timed out without completing – re-queue as "newest"
+                # so we can try older futures next.
+                self.futures_queue.appendleft(future)
+            drained += 1
         return super().result()
 
-    def _wait_for_response(self):
+    def _wait_for_response(self, drain: bool = False):
         try:
-            response = self.aggregate(self.get_response())
+            response = self.aggregate(
+                self.get_response(  # type: ignore[call-arg]
+                    timeout_override=10.0 if drain else None
+                )
+            )
             with suppress(InvalidStateError):
                 self.set_result(response)
+        except TimeoutError:
+            # During drain: leave this future incomplete so the
+            # drain loop in result() can re-queue it and move on.
+            # During normal wait: propagate up to the caller.
+            if drain:
+                return
+            raise
         except Exception as e:
             with suppress(InvalidStateError):
                 self.set_exception(e)
@@ -355,7 +376,18 @@ class MultiprocExecutor(Executor):
         if self.is_failed:
             raise RuntimeError("Executor failed.")
 
-        deadline = None if timeout is None else time.monotonic() + timeout
+        # Always compute a deadline so that ``get_response()`` never
+        # blocks without a timeout.  Without a bound, a single stuck
+        # future in the drain loop can stall the entire EngineCore.
+        # Cap non_block deadlines — a healthy Worker responds in
+        # milliseconds, so anything longer means the Worker is dead.
+        ft_config = self.vllm_config.parallel_config.fault_tolerance_config
+        deadline = time.monotonic() + (
+            min(timeout or ft_config.ft_rpc_timeout_sec,
+                ft_config.ft_rpc_timeout_sec)
+            if non_block
+            else (timeout or ft_config.ft_rpc_timeout_sync_sec)
+        )
         kwargs = kwargs or {}
 
         if kv_output_aggregator is not None:
@@ -371,23 +403,43 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        # When the worker is dead, the ring buffer is full because the
+        # crashed worker never consumed its blocks.  Use a bounded
+        # enqueue timeout so the error propagates to
+        # @fault_tolerant_wrapper instead of stalling the EngineCore.
+        #
+        # VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS defaults to 300 s which is
+        # far too long for a fast-fail enqueue; cap non_block sends at
+        # 30 s and sync sends at 120 s.
+        if not non_block:
+            enqueue_timeout = timeout or ft_config.ft_rpc_timeout_sync_sec
+        else:
+            enqueue_timeout = min(
+                timeout or ft_config.ft_rpc_timeout_sec, ft_config.ft_rpc_timeout_sec
+            )
+        self.rpc_broadcast_mq.enqueue(
+            (send_method, args, kwargs, output_rank),
+            timeout=enqueue_timeout,
+        )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
-        def get_response():
+        def get_response(timeout_override: float | None = None):
             responses = []
             for mq in response_mqs:
                 dequeue_timeout = (
-                    None if deadline is None else (deadline - time.monotonic())
+                    timeout_override
+                    if timeout_override is not None
+                    else deadline - time.monotonic()
                 )
                 try:
                     status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
+                    self.is_failed = True
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"
                         " stack trace above for the root cause"
@@ -908,7 +960,10 @@ class WorkerProc:
         converted to a FAILURE response.
         """
         if isinstance(output, AsyncModelRunnerOutput):
-            output = output.get_output()
+            try:
+                output = output.get_output()
+            except Exception as e:
+                output = e
 
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
@@ -945,6 +1000,29 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
+    def _drain_rpc_broadcast_mq(self):
+        """Drain all pending RPCs from broadcast MQ to clear stale requests.
+
+        Called when a fault tolerance error occurs, to ensure the MQ is clean
+        for subsequent FT recovery commands.
+        """
+        mq = self.rpc_broadcast_mq
+        if mq is None:
+            return
+        num_drained = 0
+        while True:
+            try:
+                mq.dequeue(timeout=0)
+                num_drained += 1
+            except Exception:
+                break
+        if num_drained > 0:
+            logger.info(
+                "[FT] Drained %d stale RPC(s) from worker %d broadcast MQ",
+                num_drained,
+                self.rank,
+            )
+
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
@@ -964,6 +1042,15 @@ class WorkerProc:
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())
                 logger.exception("WorkerProc hit an exception.")
+                # FT: drain stale RPCs so that subsequent recovery
+                # commands are not blocked by a full MQ.
+                # Only drain if fault tolerance is enabled (detected
+                # via worker_sentinel presence).
+                if (
+                    hasattr(self.worker, "worker_sentinel")
+                    and self.worker.worker_sentinel is not None
+                ):
+                    self._drain_rpc_broadcast_mq()
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
