@@ -392,7 +392,6 @@ class EngineCoreSentinel(BaseSentinel):
         )
 
     def shutdown(self):
-        self.engine_core.shutdown()
         close_sockets([self.engine_fault_socket, self.worker_cmd_socket])
         super().shutdown()
 
