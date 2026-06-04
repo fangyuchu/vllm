@@ -55,6 +55,10 @@ class ClientSentinel(BaseSentinel):
         core_engines: list[bytes],
         core_client: MPClient,
     ):
+        if parallel_config.local_engines_only:
+            raise NotImplementedError(
+                "Currently only support fault tolerance for internal LB mode."
+            )
         self.ctx = zmq.asyncio.Context()
         super().__init__(parallel_config, None, b"client_sentinel")
         self.engine_identities = core_engines
@@ -145,7 +149,7 @@ class ClientSentinel(BaseSentinel):
         asyncio.create_task(self.run())
         asyncio.create_task(self.poll_and_execute_cmd())
 
-    async def _distribute_engine_registry(self, dp_size, dp_size_local) -> None:
+    async def _distribute_engine_identities(self, dp_size) -> None:
         """Multi-node startup handshake: remote nodes request their slice of
         the engine registry; reply to each until all remote engines are served."""
         recv_engine_count = 0
@@ -412,7 +416,7 @@ class ClientSentinel(BaseSentinel):
 
     async def run(self):
         """Receive fault info from engine and pause engines if happened."""
-        await self._distribute_engine_registry(self.dp_size, self.dp_local_size)
+        await self._distribute_engine_identities(self.dp_size)
         try:
             while not self.sentinel_dead:
                 _, _, message = await self.fault_receiver_socket.recv_multipart()

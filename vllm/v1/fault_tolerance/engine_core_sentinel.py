@@ -183,7 +183,6 @@ class EngineCoreSentinel(BaseSentinel):
         return FaultToleranceResult(
             request_id=ft_request.request_id,
             success=True,
-            reason=None if True else "Worker don't recovered within timeout.",
         )
 
     def _calculate_exclude_ep_ranks(
@@ -274,6 +273,7 @@ class EngineCoreSentinel(BaseSentinel):
         deadline = time.monotonic() + timeout
         original_to_new = {int(k): v for k, v in original_to_new.items()}
         self.engine_index = original_to_new[self.engine_index]
+        self.sentinel_tag = f"DP_{self.engine_index}"
         exclude_ep_ranks = self._calculate_exclude_ep_ranks(
             exclude_dp_ranks, self.engine_core.vllm_config
         )
@@ -287,20 +287,16 @@ class EngineCoreSentinel(BaseSentinel):
             vllm_config_update_dict = self._build_vllm_config_update_dict(
                 parallel_config, new_ep_size, data_parallel_size, original_to_new
             )
-            scale_down_request = FaultToleranceRequest.builder(
-                request_id=str(uuid.uuid4()),
-                instruction="scale_down",
-                params={
-                    "timeout": timeout,
-                    "exclude_ep_ranks": exclude_ep_ranks,
-                    "vllm_config_update_dict": vllm_config_update_dict,
-                    "coord_store_port": self.parallel_config._coord_store_port,
-                },
-            )
-
             self._execute_command_on_workers(
                 FaultToleranceRequest(
-                    str(uuid.uuid4()), "scale_down", scale_down_request.params
+                    request_id=str(uuid.uuid4()),
+                    instruction="scale_down",
+                    params={
+                        "timeout": timeout,
+                        "exclude_ep_ranks": exclude_ep_ranks,
+                        "vllm_config_update_dict": vllm_config_update_dict,
+                        "coord_store_port": self.parallel_config._coord_store_port,
+                    },
                 ),
                 self.worker_identities,
                 timeout=timeout,
@@ -311,15 +307,26 @@ class EngineCoreSentinel(BaseSentinel):
             request_id=str(uuid.uuid4()),
             params={},
         )
+        # Clear stop_busy_loop BEFORE enqueueing so the loop won't
+        # immediately re-pause after executing the reinit command.
+        self.stop_busy_loop.clear()
         self.cmd_q.put(reinit_request)
 
-        remaining_timeout = max(0, deadline - time.monotonic())
-        success = self.busy_loop_paused.wait(remaining_timeout)
-        self.stop_busy_loop.clear()
+        # Poll until busy_loop_paused is cleared (loop resumed) or timeout.
+        # If reinit fails, busy_loop_paused stays set → timeout → failure.
+        while self.busy_loop_paused.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return FaultToleranceResult(
+                    request_id=ft_request.request_id,
+                    success=False,
+                    reason="Engine did not resume within timeout.",
+                )
+            time.sleep(0.1)
+
         return FaultToleranceResult(
             request_id=ft_request.request_id,
-            success=success,
-            reason=None if success else "Busy loop did not pause within timeout.",
+            success=True,
         )
 
     def _execute_command_on_workers(
