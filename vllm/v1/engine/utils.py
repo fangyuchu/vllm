@@ -167,10 +167,13 @@ class CoreEngineProcManager:
                 self.shutdown()
 
     def recv_engine_identity(self, start_engine_index, local_engine_count):
-        start_engine_bytes = str(start_engine_index).encode("utf-8")
-        local_engine_count_bytes = str(local_engine_count).encode("utf-8")
-        self.engine_down_socket.send_multipart([b"", start_engine_bytes])
-        self.engine_down_socket.send_multipart([b"", local_engine_count_bytes])
+        payload = msgpack.dumps(
+            {
+                "start_engine_index": start_engine_index,
+                "local_engine_count": local_engine_count,
+            }
+        )
+        self.engine_down_socket.send_multipart([b"", payload])
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""

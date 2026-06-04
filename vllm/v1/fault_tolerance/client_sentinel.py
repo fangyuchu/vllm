@@ -162,25 +162,19 @@ class ClientSentinel(BaseSentinel):
             (
                 sender_identity,
                 empty_frame,
-                start_engine_index_bytes,
+                payload,
             ) = await self.fault_receiver_socket.recv_multipart()
-            start_engine_index = start_engine_index_bytes.decode("utf-8")
+            info = msgpack.loads(payload, strict_map_key=False)
 
-            (
-                sender_identity,
-                empty_frame,
-                node_engine_count_bytes,
-            ) = await self.fault_receiver_socket.recv_multipart()
-            node_engine_count = node_engine_count_bytes.decode("utf-8")
+            start_engine_index = int(info["start_engine_index"])
+            node_engine_count = int(info["local_engine_count"])
+            recv_engine_count += node_engine_count
 
-            assert node_engine_count is not None, "node_engine_count cannot be None"
-            assert start_engine_index is not None, "start_engine_index cannot be None"
-            recv_engine_count += int(node_engine_count)
             send_engine_registry = {
                 key: self.engine_registry[key]
                 for key in range(
-                    int(start_engine_index),
-                    int(start_engine_index) + int(node_engine_count),
+                    start_engine_index,
+                    start_engine_index + node_engine_count,
                 )
             }
             send_engine_registry_byte = msgpack.dumps(
@@ -205,12 +199,14 @@ class ClientSentinel(BaseSentinel):
 
     async def pause(self, ft_request: FaultToleranceRequest):  # type: ignore[override]
         """Expected params: timeout, exclude_engine_index (optional)."""
-        # Pause all engines except ones already marked dead or being excluded.
-        target_engines = []
-        for i, status in self.engine_status_dict.items():
-            for id, new_index in self.engine_identity_to_index:
-                if new_index == i:
-                    target_engines.append(id.to_bytes(2, "little"))
+        exclude_engine_index = ft_request.params.get("exclude_engine_index")
+        # Pause all healthy engines except ones being excluded.
+        target_engines = [
+            self.engine_identities[i - self.start_rank]
+            for i, status in self.engine_status_dict.items()
+            if status["status"] != EngineStatusType.DEAD.name.lower()
+            and (exclude_engine_index is None or i not in exclude_engine_index)
+        ]
         res = await self._execute_cmd_on_engines(ft_request, target_engines)
         if res.success:
             logger.info("vLLM instance is paused and waiting for recovery commands.")
