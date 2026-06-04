@@ -202,7 +202,7 @@ class CoreEngineProcManager:
         if self.enable_fault_tolerance:
             pid_mapping = {
                 proc: byte_data
-                for proc, byte_data in zip(pids, engine_identity.values())
+                for proc, byte_data in zip(pids, engine_identity)
             }
         while sentinels and not self.manager_stopped.is_set():
             died_sentinels = connection.wait(sentinels, timeout=1)
