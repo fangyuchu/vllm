@@ -159,14 +159,14 @@ class CoreEngineProcManager:
                         proc.start()
                 else:
                     proc.start()
-            if not local_client and vllm_config.parallel_config.enable_fault_tolerance:
-                self.recv_engine_identity(start_index, local_engine_count)
+            if vllm_config.parallel_config.enable_fault_tolerance:
+                self.send_engine_range(start_index, local_engine_count)
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():
                 self.shutdown()
 
-    def recv_engine_identity(self, start_engine_index, local_engine_count):
+    def send_engine_range(self, start_engine_index, local_engine_count):
         payload = msgpack.dumps(
             {
                 "start_engine_index": start_engine_index,
@@ -190,10 +190,10 @@ class CoreEngineProcManager:
 
     def monitor_engine_liveness(self, engine_identity=None, run_headless=False) -> None:
         """Monitor engine core process liveness."""
-        if run_headless and self.enable_fault_tolerance:
+        if self.enable_fault_tolerance:
             engine_identity = msgpack.loads(
                 self.engine_down_socket.recv_multipart()[1], strict_map_key=False
-            )
+            ).values()
 
         sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
         sentinels = set(sentinel_to_proc.keys())
@@ -201,8 +201,7 @@ class CoreEngineProcManager:
         pid_mapping = {}
         if self.enable_fault_tolerance:
             pid_mapping = {
-                proc: byte_data
-                for proc, byte_data in zip(pids, engine_identity.values())
+                proc: byte_data for proc, byte_data in zip(pids, engine_identity)
             }
         while sentinels and not self.manager_stopped.is_set():
             died_sentinels = connection.wait(sentinels, timeout=1)

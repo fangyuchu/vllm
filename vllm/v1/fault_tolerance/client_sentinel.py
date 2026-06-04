@@ -143,8 +143,6 @@ class ClientSentinel(BaseSentinel):
             )
         }
 
-        self.engine_registry = self.core_client.engine_registry
-
         self.engine_identity_to_index = {
             identity: index
             for index, identity in zip(
@@ -157,7 +155,7 @@ class ClientSentinel(BaseSentinel):
         asyncio.create_task(self.poll_and_execute_cmd())
 
     async def send_engine_registry(self, dp_size, dp_size_local) -> None:
-        recv_engine_count = dp_size_local
+        recv_engine_count = 0
         while recv_engine_count < dp_size:
             (
                 sender_identity,
@@ -171,7 +169,7 @@ class ClientSentinel(BaseSentinel):
             recv_engine_count += node_engine_count
 
             send_engine_registry = {
-                key: self.engine_registry[key]
+                key: self.engine_identities[key]
                 for key in range(
                     start_engine_index,
                     start_engine_index + node_engine_count,
@@ -279,7 +277,6 @@ class ClientSentinel(BaseSentinel):
     def update_config(self, exclude_dp_ranks, original_to_new):
         for engine_index in exclude_dp_ranks:
             self.engine_status_dict.pop(engine_index)
-            self.engine_registry.pop(engine_index)
 
         exclude_set = set(exclude_dp_ranks)
 
@@ -297,10 +294,6 @@ class ClientSentinel(BaseSentinel):
                 del self.engine_status_dict[old_idx]
                 self.engine_status_dict[new_idx] = status_value
 
-            # Migrate engine registry
-            if old_idx in self.engine_registry:
-                self.engine_registry[new_idx] = self.engine_registry.pop(old_idx)
-
             # Update the mapping from engine identifier to index
             for identity, idx in self.engine_identity_to_index.items():
                 if idx == old_idx:
@@ -317,6 +310,12 @@ class ClientSentinel(BaseSentinel):
         self.core_client.core_engines = [
             engine_identity
             for engine_identity in self.core_client.core_engines
+            if engine_identity in self.scaled_down_core_engines_dict
+        ]
+
+        self.engine_identities = [
+            engine_identity
+            for engine_identity in self.engine_identities
             if engine_identity in self.scaled_down_core_engines_dict
         ]
 
@@ -448,7 +447,7 @@ class ClientSentinel(BaseSentinel):
                 # Update engine status
                 if (
                     fault_info.engine_identity
-                    and fault_info.engine_identity not in self.engine_registry.values()
+                    and fault_info.engine_identity not in self.core_client.core_engines
                 ):
                     continue
                 if fault_info.type == "EngineDeadError":

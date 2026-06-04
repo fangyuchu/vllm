@@ -722,7 +722,7 @@ class MPClient(EngineCoreClient):
         # marks the engine as dead, and shuts down the client.
         def monitor_engine_cores():
             if isinstance(engine_manager, CoreEngineProcManager):
-                engine_manager.monitor_engine_liveness(self.engine_registry)
+                engine_manager.monitor_engine_liveness(self.core_engines)
             else:
                 engine_manager.monitor_engine_liveness()
 
