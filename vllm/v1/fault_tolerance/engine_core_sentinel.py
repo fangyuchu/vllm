@@ -9,7 +9,6 @@ only a reference to their sentinel.
 """
 
 import threading
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -98,7 +97,7 @@ class EngineCoreSentinel:
             "[FT] Busy loop raised %s. Waiting for recovery.", type(exc).__name__
         )
 
-        self._preempt_running()
+        self._abort_all_requests()
         self._publish_status(EngineStatusType.UNHEALTHY, str(exc))
 
     # ------------------------------------------------------------------
@@ -247,15 +246,17 @@ class EngineCoreSentinel:
                 except Exception:
                     break
 
-    def _preempt_running(self):
-        """Preempt running requests and clear batch state."""
+    def _abort_all_requests(self):
+        """Abort all in-flight and waiting requests.
+
+        Discarding requests (instead of preempting them to resume later)
+        ensures clean state after recovery — no stale KV cache entries
+        or mismatched scheduling state can cause post-retry errors.
+        """
+        from vllm.v1.request import RequestStatus
+
         engine = self.engine
-        timestamp = time.monotonic()
-        while engine.scheduler.running:  # type: ignore[attr-defined]
-            request = engine.scheduler.running.pop()  # type: ignore[attr-defined]
-            engine.scheduler._preempt_request(  # type: ignore[attr-defined]
-                request, timestamp
-            )
+        engine.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
         engine.scheduler.prev_step_scheduled_req_ids.clear()  # type: ignore[attr-defined]
         if engine.batch_queue is not None:
             engine.batch_queue.clear()
