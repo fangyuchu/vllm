@@ -378,7 +378,8 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
-                    if EngineLoopPausedError.PREFIX in result:
+                    # FORCE STOP is the returned msg from stop_device on Ascend NPU.
+                    if EngineLoopPausedError.PREFIX in result or "FORCE STOP" in result:
                         raise EngineLoopPausedError(result)
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"

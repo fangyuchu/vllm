@@ -1832,7 +1832,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter += 1
         if self.step_counter % 32 != 0:
             return True
-
+        self._ensure_busy_loop_running()
         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
 
     def reinit_dp_group_on_fault_tolerance(self):
