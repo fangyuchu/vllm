@@ -57,7 +57,7 @@ class ClientSentinel(BaseSentinel):
     ):
         if parallel_config.local_engines_only:
             raise NotImplementedError(
-                "Currently only support fault tolerance for internal LB mode."
+                "Fault tolerance is currently supported only for internal LB mode."
             )
         self.ctx = zmq.asyncio.Context()
         super().__init__(parallel_config, None, b"client_sentinel")
@@ -317,7 +317,9 @@ class ClientSentinel(BaseSentinel):
                 if 0 <= local_rank < len(self.core_client.lb_engines):
                     del self.core_client.lb_engines[local_rank]
 
-    async def scale_down(self, ft_request: FaultToleranceRequest) -> bool:  # type: ignore[override]
+    async def scale_down(
+        self, ft_request: FaultToleranceRequest
+    ) -> FaultToleranceResult:  # type: ignore[override]
         exclude_dp_ranks = ft_request.params.get("exclude_dp_ranks")
         timeout = ft_request.params.get("timeout")
         assert timeout is not None, "timeout is required"
