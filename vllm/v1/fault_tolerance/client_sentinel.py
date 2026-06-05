@@ -382,6 +382,11 @@ class ClientSentinel(BaseSentinel):
                 exclude_dp_ranks, original_to_new, timeout
             )
             self.update_config(exclude_dp_ranks, original_to_new)
+            for i in self.engine_status_dict:
+                self.engine_status_dict[i]["status"] = (
+                    EngineStatusType.HEALTHY.name.lower()
+                )
+            await self._pub_engine_status()
             # self.engine_running.set()
             self.is_faulted.clear()
 
