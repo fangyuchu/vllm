@@ -48,7 +48,7 @@ class EngineCoreSentinel(BaseSentinel):
         engine_fault_socket_addr: str,
         sentinel_identity: bytes,
         worker_cmd_addr: str,
-        engine_core: "EngineCoreProc",
+        engine: "EngineCoreProc",
     ):
         self.engine_index = engine_index
         super().__init__(
@@ -57,7 +57,7 @@ class EngineCoreSentinel(BaseSentinel):
             sentinel_identity,
         )
         self.engine_identity = self.engine_index.to_bytes(length=2, byteorder="little")
-        self.engine_core = engine_core
+        self.engine = engine
         self.data_parallel_size = parallel_config.data_parallel_size
         self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
         self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue(maxsize=1)
@@ -249,13 +249,13 @@ class EngineCoreSentinel(BaseSentinel):
         }
 
     def reinit_dp_group_on_fault_tolerance(self):
-        if not isinstance(self.engine_core, DPEngineCoreProc):
+        if not isinstance(self.engine, DPEngineCoreProc):
             return
-        stateless_destroy_torch_distributed_process_group(self.engine_core.dp_group)
-        self.engine_core.dp_group = (
-            self.engine_core.vllm_config.parallel_config.stateless_init_dp_group()
+        stateless_destroy_torch_distributed_process_group(self.engine.dp_group)
+        self.engine.dp_group = (
+            self.engine.vllm_config.parallel_config.stateless_init_dp_group()
         )
-        self.engine_core.step_counter = 0
+        self.engine.step_counter = 0
 
     def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         """Scale down the engine cluster by removing specified DP ranks.
@@ -275,15 +275,15 @@ class EngineCoreSentinel(BaseSentinel):
         self.engine_index = original_to_new[self.engine_index]
         self.sentinel_tag = f"DP_{self.engine_index}"
         exclude_ep_ranks = self._calculate_exclude_ep_ranks(
-            exclude_dp_ranks, self.engine_core.vllm_config
+            exclude_dp_ranks, self.engine.vllm_config
         )
 
         new_ep_size, data_parallel_size = self._calculate_parallel_config(
-            self.engine_core.vllm_config, exclude_dp_ranks
+            self.engine.vllm_config, exclude_dp_ranks
         )
-        with set_current_vllm_config(self.engine_core.vllm_config):
-            parallel_config = self.engine_core.vllm_config.parallel_config
-            self.engine_core.update_parallel_config(data_parallel_size, original_to_new)
+        with set_current_vllm_config(self.engine.vllm_config):
+            parallel_config = self.engine.vllm_config.parallel_config
+            self.engine.update_parallel_config(data_parallel_size, original_to_new)
             vllm_config_update_dict = self._build_vllm_config_update_dict(
                 parallel_config, new_ep_size, data_parallel_size, original_to_new
             )
@@ -382,6 +382,20 @@ class EngineCoreSentinel(BaseSentinel):
             or None,
         )
 
+    def check_worker_responsive(self) -> bool:
+        # Check if workers are responsive. Should only be called in busy_loop thread.
+        try:
+            self.engine.model_executor.check_health()
+            return True
+        except TimeoutError:
+            logger.warning("Executor check_health() timeout; worker not responsive.")
+            return False
+        except Exception as err:
+            logger.error(
+                "Worker health check raised unexpected exception, shutdown the engine."
+            )
+            raise SystemExit from err
+
     def shutdown_engine_core(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
@@ -420,13 +434,28 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                 raise
             except Exception as original_exc:
                 if self.enable_fault_tolerance:
+                    deadline = (
+                        time.monotonic()
+                        + self.engine_core_sentinel.engine_recovery_timeout_sec
+                    )
                     self.engine_core_sentinel.busy_loop_paused.set()
-                    self.engine_core_sentinel.fault_signal_q.put(original_exc)
                     logger.warning(
-                        "[BusyLoopWrapper] EngineCore busy loop raised a %s exception. "
-                        "Suspended and waiting for fault tolerance instructions.",
+                        "[BusyLoopWrapper] EngineCore busy loop raised a %s exception.",
                         type(original_exc).__name__,
                     )
+                    while (
+                        not self.engine_core_sentinel.check_worker_responsive()
+                        and time.monotonic() < deadline
+                    ):
+                        logger.warning(
+                            "[BusyLoopWrapper] Worker is not responsive. Checking..."
+                        )
+                        time.sleep(1)
+                    logger.warning(
+                        "[BusyLoopWrapper] Engine loop suspended. "
+                        "Wait for fault tolerance instructions."
+                    )
+                    self.engine_core_sentinel.fault_signal_q.put(original_exc)
                     # Put running requests into waiting list.
                     timestamp = time.monotonic()
                     while self.scheduler.running:  # type: ignore[attr-defined]
@@ -439,7 +468,7 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                     try:
                         # Block until recovery command received
                         ft_request = self.engine_core_sentinel.cmd_q.get(
-                            timeout=self.engine_recovery_timeout_sec
+                            timeout=max(0, deadline - time.monotonic())
                         )
 
                         if ft_request is not None:

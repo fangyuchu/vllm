@@ -869,7 +869,7 @@ class EngineCoreProc(EngineCore):
                     engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
                     sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     worker_cmd_addr=worker_cmd_addr,
-                    engine_core=self,
+                    engine=self,
                 )
                 self.model_executor.collective_rpc(
                     method="create_worker_sentinel",
