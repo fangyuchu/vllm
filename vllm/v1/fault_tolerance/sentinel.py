@@ -82,9 +82,6 @@ class BaseSentinel(ABC):
         """
         raise NotImplementedError
 
-    def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
-        raise NotImplementedError
-
     def shutdown(self):
         self.sentinel_dead = True
         self.ctx.term()

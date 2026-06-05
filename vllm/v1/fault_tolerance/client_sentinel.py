@@ -319,7 +319,7 @@ class ClientSentinel(BaseSentinel):
 
     async def scale_down(
         self, ft_request: FaultToleranceRequest
-    ) -> FaultToleranceResult:  # type: ignore[override]
+    ) -> FaultToleranceResult:
         exclude_dp_ranks = ft_request.params.get("exclude_dp_ranks")
         timeout = ft_request.params.get("timeout")
         assert timeout is not None, "timeout is required"
