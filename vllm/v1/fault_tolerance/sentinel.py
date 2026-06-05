@@ -58,6 +58,7 @@ class BaseSentinel(ABC):
             res = run_method(self, method, args=(ft_request,), kwargs={})
             logger.debug("Command (%s) succeeded: %s", method, res.success)
         except Exception as e:
+            logger.exception("Command (%s) failed", method)
             res = FaultToleranceResult(
                 ft_request.request_id,
                 False,

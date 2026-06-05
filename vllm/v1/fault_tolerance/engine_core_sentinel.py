@@ -287,7 +287,7 @@ class EngineCoreSentinel(BaseSentinel):
             vllm_config_update_dict = self._build_vllm_config_update_dict(
                 parallel_config, new_ep_size, data_parallel_size, original_to_new
             )
-            self._execute_command_on_workers(
+            res = self._execute_command_on_workers(
                 FaultToleranceRequest(
                     request_id=str(uuid.uuid4()),
                     instruction="scale_down",
@@ -301,6 +301,8 @@ class EngineCoreSentinel(BaseSentinel):
                 self.worker_identities,
                 timeout=timeout,
             )
+            if not res.success:
+                return res
 
         reinit_request = FaultToleranceRequest(
             instruction="reinit_dp_group_on_fault_tolerance",
