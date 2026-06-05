@@ -900,7 +900,6 @@ class EngineCoreProc(EngineCore):
                 args=(
                     addresses.outputs,
                     addresses.coordinator_output,
-                    self.engine_index,
                 ),
                 daemon=True,
             )
@@ -926,9 +925,8 @@ class EngineCoreProc(EngineCore):
             self.vllm_config.parallel_config.data_parallel_rank_local,
             self.vllm_config.parallel_config.data_parallel_rank_local,
         )
-        # self.vllm_config.parallel_config.expert_parallel_size = (
-        #     data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
-        # )
+        self.engine_index = rank_mapping.get(self.engine_index, self.engine_index)
+        self.dp_rank = self.engine_index
         # todo: Change the method of updating master_port.
         self.vllm_config.parallel_config.data_parallel_master_port += 1000
 
@@ -1493,7 +1491,6 @@ class EngineCoreProc(EngineCore):
         self,
         output_paths: list[str],
         coord_output_path: str | None,
-        engine_index: int,
     ):
         """Output socket IO thread."""
 
@@ -1534,7 +1531,7 @@ class EngineCoreProc(EngineCore):
                     break
                 assert not isinstance(output, bytes)
                 client_index, outputs = output
-                outputs.engine_index = engine_index
+                outputs.engine_index = self.engine_index
 
                 if client_index == -1:
                     # Don't reuse buffer for coordinator message
