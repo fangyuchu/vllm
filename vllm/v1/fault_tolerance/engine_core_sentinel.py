@@ -50,6 +50,8 @@ class EngineCoreSentinel(BaseSentinel):
         worker_cmd_addr: str,
         engine: "EngineCoreProc",
     ):
+        if type(engine.model_executor).__name__ != "MultiprocExecutor":
+            return
         self.engine_index = engine_index
         super().__init__(
             parallel_config,
@@ -257,6 +259,26 @@ class EngineCoreSentinel(BaseSentinel):
         )
         self.engine.step_counter = 0
 
+    def _drain_stale_responses(self):
+        """Drain stale futures and pending responses from the executor's
+        message queues before issuing a new collective_rpc."""
+        executor = self.engine.model_executor
+        num_stale = len(executor.futures_queue)
+        executor.futures_queue.clear()
+        if num_stale == 0 or not executor.response_mqs:
+            return
+        logger.info("[FT] Draining %d stale response(s) from response queue", num_stale)
+        if executor.kv_output_aggregator is not None:
+            mqs = executor.response_mqs
+        else:
+            mqs = (executor.response_mqs[executor.output_rank],)
+        for mq in mqs:
+            for _ in range(num_stale):
+                try:
+                    mq.dequeue(timeout=self.engine_recovery_timeout_sec)
+                except Exception:
+                    break
+
     def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         """Scale down the engine cluster by removing specified DP ranks.
 
@@ -266,6 +288,7 @@ class EngineCoreSentinel(BaseSentinel):
         """
         # Validate required keyword arguments
         # Extract and type-cast parameters from kwargs
+        self._drain_stale_responses()
         timeout = ft_request.params["timeout"]
         original_to_new = ft_request.params["original_to_new"]
         exclude_dp_ranks = ft_request.params["exclude_dp_ranks"]
@@ -445,6 +468,7 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         "[BusyLoopWrapper] EngineCore busy loop raised a %s exception.",
                         type(original_exc).__name__,
                     )
+                    self.engine_core_sentinel._drain_stale_responses()
                     while (
                         not self.engine_core_sentinel.check_worker_responsive()
                         and time.monotonic() < deadline
