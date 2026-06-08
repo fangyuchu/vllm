@@ -144,6 +144,7 @@ class EngineCoreSentinel(BaseSentinel):
         )
         remaining_timeout = max(0, deadline - time.monotonic())
         success = self.busy_loop_paused.wait(remaining_timeout)
+        logger.info("Engine finished the pause instruction.")
         return FaultToleranceResult(
             request_id=ft_request.request_id,
             success=success,
@@ -180,6 +181,7 @@ class EngineCoreSentinel(BaseSentinel):
             self.cmd_q.put(None)
 
         self.stop_busy_loop.clear()
+        logger.info("Engine finished the retry instruction.")
         return FaultToleranceResult(
             request_id=ft_request.request_id,
             success=True,
@@ -326,6 +328,7 @@ class EngineCoreSentinel(BaseSentinel):
                 )
             time.sleep(0.1)
 
+        logger.info("Engine finished the scale down instruction.")
         return FaultToleranceResult(
             request_id=ft_request.request_id,
             success=True,
@@ -419,6 +422,17 @@ class EngineCoreSentinel(BaseSentinel):
         close_sockets([self.engine_fault_socket, self.worker_cmd_socket])
         super().shutdown()
 
+    def drain_engine_responses(self):
+        num_stale_futures = 0
+        while self.engine.batch_queue:
+            future, scheduler_output, exec_model_fut = self.engine.batch_queue.pop()
+            try:
+                num_stale_futures += 1
+                future.result()
+            except Exception:
+                pass
+        logger.info("Drained %s responses from engine batch_queue.", num_stale_futures)
+
 
 def fault_tolerant_wrapper(busy_loop_func: Callable):
     """
@@ -457,6 +471,8 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         "[BusyLoopWrapper] Engine loop suspended. "
                         "Wait for fault tolerance instructions."
                     )
+                    self.engine_core_sentinel.drain_engine_responses()
+
                     self.engine_core_sentinel.fault_signal_q.put(original_exc)
                     # Put running requests into waiting list.
                     timestamp = time.monotonic()
@@ -464,8 +480,11 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         request = self.scheduler.running.pop()  # type: ignore[attr-defined]
                         self.scheduler.preempt_request(request, timestamp)  # type: ignore[attr-defined]
                     self.scheduler.prev_step_scheduled_req_ids.clear()  # type: ignore[attr-defined]
-                    if self.batch_queue is not None:
-                        self.batch_queue.clear()
+                    if len(self.batch_queue) is not None:
+                        assert len(self.batch_queue) == 0, (
+                            f"batch_queue should be empty after draining, "
+                            f"but got {len(self.batch_queue)}"
+                        )
 
                     try:
                         # Block until recovery command received
