@@ -800,9 +800,19 @@ class EngineCoreProc(EngineCore):
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
-        executor_fail_callback = lambda: self.input_queue.put_nowait(
-            (EngineCoreRequestType.EXECUTOR_FAILED, b"")
-        )
+        if vllm_config.parallel_config.enable_fault_tolerance:
+
+            def kill_process():
+                import os
+
+                logger.exception("EngineCore is shutting down due to executor failure")
+                os._exit(1)
+
+            executor_fail_callback = kill_process
+        else:
+            executor_fail_callback = lambda: self.input_queue.put_nowait(
+                (EngineCoreRequestType.EXECUTOR_FAILED, b"")
+            )
 
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")

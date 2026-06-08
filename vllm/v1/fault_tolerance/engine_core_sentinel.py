@@ -480,7 +480,7 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         request = self.scheduler.running.pop()  # type: ignore[attr-defined]
                         self.scheduler.preempt_request(request, timestamp)  # type: ignore[attr-defined]
                     self.scheduler.prev_step_scheduled_req_ids.clear()  # type: ignore[attr-defined]
-                    if len(self.batch_queue) is not None:
+                    if self.batch_queue is not None:
                         assert len(self.batch_queue) == 0, (
                             f"batch_queue should be empty after draining, "
                             f"but got {len(self.batch_queue)}"
