@@ -290,32 +290,11 @@ class ClientSentinel(BaseSentinel):
             if old_idx in idx_to_identity:
                 self.engine_identity_to_index[idx_to_identity[old_idx]] = new_idx
 
-        self.core_client.core_engines = [
-            identity
-            for identity in self.core_client.core_engines
-            if identity in self.engine_identity_to_index
-        ]
-
         self.engine_identities = [
             identity
             for identity in self.engine_identities
             if identity in self.engine_identity_to_index
         ]
-
-        new_dp_size = len(original_to_new)
-        self.core_client.engine_ranks_managed = list(range(new_dp_size))
-        self.core_client.vllm_config.parallel_config.data_parallel_size = new_dp_size
-
-        scale_down_marker = msgspec.msgpack.encode(("SCALE_ELASTIC_EP", new_dp_size))
-        if self.core_client.resources.first_req_send_socket:
-            self.core_client.resources.first_req_send_socket.send(scale_down_marker)
-
-        if hasattr(self.core_client, "lb_engines"):
-            dp_rank = self.core_client.vllm_config.parallel_config.data_parallel_rank
-            for dead_engine in sorted(exclude_dp_ranks, reverse=True):
-                local_rank = dead_engine - dp_rank
-                if 0 <= local_rank < len(self.core_client.lb_engines):
-                    del self.core_client.lb_engines[local_rank]
 
     async def scale_down(
         self, ft_request: FaultToleranceRequest
@@ -361,12 +340,15 @@ class ClientSentinel(BaseSentinel):
                 self.engine_status_dict[i]["status"] = (
                     EngineStatusType.HEALTHY.name.lower()
                 )
-            await self._pub_engine_status()
+            await self._pub_engine_status(
+                exclude_dp_ranks=exclude_dp_ranks,
+                original_to_new=original_to_new,
+            )
             self.is_faulted.clear()
 
         return res
 
-    async def _pub_engine_status(self):
+    async def _pub_engine_status(self, **extra_fields):
         engine_status = self.engine_status_dict.copy()
         pub_msg = {
             "total_engines": len(engine_status),
@@ -374,6 +356,7 @@ class ClientSentinel(BaseSentinel):
                 {"id": i, "status": status["status"]}
                 for i, status in engine_status.items()
             ],
+            **extra_fields,
         }
         topic = FAULT_STATE_PUB_TOPIC.encode()
         await self.fault_state_pub_socket.send_multipart(

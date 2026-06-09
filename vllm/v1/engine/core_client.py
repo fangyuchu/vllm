@@ -1240,10 +1240,57 @@ class AsyncMPClient(MPClient):
         while True:
             try:
                 frames = self.fault_state_sub_socket.recv_multipart()
+                msg = decoder.decode(frames[-1])
                 with self.engine_status_lock:
-                    self.engine_status = decoder.decode(frames[-1])
+                    self.engine_status = msg
+                    if "original_to_new" in msg and "exclude_dp_ranks" in msg:
+                        self._apply_scale_down_config(
+                            msg["exclude_dp_ranks"],
+                            msg["original_to_new"],
+                        )
             except zmq.ZMQError:
                 break
+
+    def _apply_scale_down_config(
+        self, exclude_dp_ranks: list[int], original_to_new: dict[int, int]
+    ):
+        """Apply scale_down config updates from ClientSentinel pub message.
+
+        Mirrors ClientSentinel.update_config() operations on self.core_client,
+        adapted for when self is the core_client (other API server processes).
+        """
+        exclude_set = set(exclude_dp_ranks)
+        old_to_new = {int(k): v for k, v in original_to_new.items()}
+
+        # 1. Filter core_engines: keep identities whose rank is not excluded.
+        self.core_engines = [
+            identity
+            for rank, identity in zip(self.engine_ranks_managed, self.core_engines)
+            if rank not in exclude_set
+        ]
+
+        # 2. Reset engine_ranks_managed to contiguous range [0, new_dp_size).
+        new_dp_size = len(old_to_new)
+        self.engine_ranks_managed = list(range(new_dp_size))
+
+        # 3. Update data_parallel_size.
+        self.vllm_config.parallel_config.data_parallel_size = new_dp_size
+
+        # 4. Remove excluded engines from lb_engines by local index (reverse sorted).
+        if hasattr(self, "lb_engines"):
+            dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+            for dead_engine in sorted(exclude_dp_ranks, reverse=True):
+                local_rank = dead_engine - dp_rank
+                if 0 <= local_rank < len(self.lb_engines):
+                    del self.lb_engines[local_rank]
+
+        # 5. Notify DPCoordinator of the scale down (only from client_index=0).
+        if self.client_index == 0:
+            scale_down_marker = msgspec.msgpack.encode(
+                ("SCALE_ELASTIC_EP", new_dp_size)
+            )
+            if self.resources.first_req_send_socket:
+                self.resources.first_req_send_socket.send(scale_down_marker)
 
     async def fault_reporter(self):
         with self.engine_status_lock:
