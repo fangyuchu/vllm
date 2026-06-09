@@ -267,10 +267,9 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
-        self.enable_ft = (
+        self.support_fault_tolerance = (
             get_current_vllm_config().parallel_config.enable_fault_tolerance
         )
-        self.buffer = None
 
     def _make_all2all_kwargs(
         self,
@@ -312,7 +311,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             allow_nvlink_for_low_latency_mode=True,
             allow_mnnvl=envs.VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL,
             explicitly_destroy=True,
-            enable_shrink=self.enable_ft,
+            enable_shrink=self.support_fault_tolerance,
         )
         return kwargs
 
@@ -329,19 +328,11 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
             buffer_kwargs, deep_ep.Buffer
         )
         DeepEPLLAll2AllManager._active_buffer = handle
-        self._ll_max_tokens_per_rank = kwargs["max_num_tokens_per_dp_rank"]
-        self._ll_hidden = kwargs["token_hidden_size"]
-        self._ll_num_experts = kwargs["num_global_experts"]
         return handle
 
     # DeepEP LL uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
-
-    @property
-    def support_fault_tolerance(self) -> bool:
-        buf = DeepEPLLAll2AllManager._active_buffer
-        return buf is not None and getattr(buf, "enable_shrink", False)
 
     def query_active_mask(self) -> torch.Tensor:
         buf = DeepEPLLAll2AllManager._active_buffer
@@ -396,6 +387,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         super().__init__(cpu_group, tcp_store_group)
 
         self.max_num_ep_ranks = envs.VLLM_NIXL_EP_MAX_NUM_RANKS
+        self.support_fault_tolerance = True
 
     def _init_buffer(
         self,
@@ -463,10 +455,6 @@ class NixlEPAll2AllManager(All2AllManagerBase):
             else:
                 self._update_buffer()
 
-            self._ll_max_tokens_per_rank = kwargs["max_num_tokens_per_dp_rank"]
-            self._ll_hidden = kwargs["token_hidden_size"]
-            self._ll_num_experts = self.max_num_ep_ranks * num_experts_per_rank
-
             assert NixlEPAll2AllManager._buffer is not None
             handle = NixlEPAll2AllManager._buffer[0]
             return handle
@@ -499,10 +487,6 @@ class NixlEPAll2AllManager(All2AllManagerBase):
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
-
-    @property
-    def support_fault_tolerance(self) -> bool:
-        return True
 
     def query_active_mask(self) -> torch.Tensor:
         assert self._buffer is not None
