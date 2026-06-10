@@ -37,6 +37,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     EngineCoreRequestType,
+    EngineStatusType,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -1230,6 +1231,19 @@ class AsyncMPClient(MPClient):
     async def handle_fault(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
+        # Reject fault tolerance instructions if any engine is not healthy.
+        hung_engines = [
+            e
+            for e in self.engine_status["engines"]  # type: ignore[attr-defined]
+            if e["status"] == EngineStatusType.HEALTHY.name.lower()
+        ]
+        if hung_engines:
+            return FaultToleranceResult(
+                request_id=ft_request.request_id,
+                success=False,
+                reason=f"Some Engines are still hung: {hung_engines}",
+            )
+
         res = await self._call_utility_async(
             ft_request.instruction, ft_request, engine=b"client_sentinel"
         )
@@ -1240,10 +1254,76 @@ class AsyncMPClient(MPClient):
         while True:
             try:
                 frames = self.fault_state_sub_socket.recv_multipart()
+                msg = decoder.decode(frames[-1])
                 with self.engine_status_lock:
-                    self.engine_status = decoder.decode(frames[-1])
+                    self.engine_status = {
+                        "total_engines": msg["total_engines"],
+                        "engines": msg["engines"],
+                    }
+                    if msg["type"] == "scale_down":
+                        loop = (
+                            self.resources.output_queue_task.get_loop()
+                            if self.resources.output_queue_task
+                            else None
+                        )
+                        if loop and loop.is_running():
+                            loop.call_soon_threadsafe(
+                                self._apply_scale_down_config,
+                                msg["exclude_dp_ranks"],
+                                msg["original_to_new"],
+                            )
+                        else:
+                            self._apply_scale_down_config(
+                                msg["exclude_dp_ranks"],
+                                msg["original_to_new"],
+                            )
             except zmq.ZMQError:
                 break
+
+    def _apply_scale_down_config(
+        self, exclude_dp_ranks: list[int], original_to_new: dict[int, int]
+    ):
+        """Apply scale_down config updates from ClientSentinel pub message.
+
+        Mirrors ClientSentinel.update_config() operations on self.core_client,
+        adapted for when self is the core_client (other API server processes).
+        """
+        exclude_set = set(exclude_dp_ranks)
+        old_to_new = {int(k): v for k, v in original_to_new.items()}
+
+        # 1. Filter core_engines: keep identities whose rank is not excluded.
+        self.core_engines = [
+            identity
+            for rank, identity in zip(self.engine_ranks_managed, self.core_engines)
+            if rank not in exclude_set
+        ]
+        if self.core_engines:
+            self.core_engine = self.core_engines[0]
+
+        # 2. Reset engine_ranks_managed to contiguous range [0, new_dp_size).
+        new_dp_size = len(old_to_new)
+        self.engine_ranks_managed = list(range(new_dp_size))
+
+        # 3. Update data_parallel_size.
+        self.vllm_config.parallel_config.data_parallel_size = new_dp_size
+
+        # 4. Remove excluded engines from lb_engines by local index (reverse sorted).
+        if hasattr(self, "lb_engines"):
+            dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+            for dead_engine in sorted(exclude_dp_ranks, reverse=True):
+                local_rank = dead_engine - dp_rank
+                if 0 <= local_rank < len(self.lb_engines):
+                    del self.lb_engines[local_rank]
+
+        # 5. Notify DPCoordinator of the scale down (only from client_index=0).
+        if self.client_index == 0:
+            scale_down_marker = msgspec.msgpack.encode(
+                ("SCALE_ELASTIC_EP", new_dp_size)
+            )
+            if self.resources.first_req_send_socket:
+                zmq.Socket.shadow(self.resources.first_req_send_socket).send(
+                    scale_down_marker
+                )
 
     async def fault_reporter(self):
         with self.engine_status_lock:
