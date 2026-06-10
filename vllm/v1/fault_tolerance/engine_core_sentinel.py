@@ -434,6 +434,24 @@ class EngineCoreSentinel(BaseSentinel):
         logger.info("Drained %s responses from engine batch_queue.", num_stale_futures)
 
 
+def drain_stale_responses(executor, num_stale):
+    """Drain stale futures and pending responses from the executor's
+    message queues before issuing a new collective_rpc."""
+    if not executor.response_mqs:
+        return
+    logger.info("[FT] Draining %d stale response(s) from response queue", num_stale)
+    if executor.kv_output_aggregator is not None:
+        mqs = executor.response_mqs
+    else:
+        mqs = (executor.response_mqs[executor.output_rank],)
+    for mq in mqs:
+        for _ in range(num_stale):
+            try:
+                mq.dequeue(10)
+            except Exception:
+                break
+
+
 def fault_tolerant_wrapper(busy_loop_func: Callable):
     """
     Wrap the busy loop function to perform fault tolerance.
@@ -459,6 +477,7 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         "[BusyLoopWrapper] EngineCore busy loop raised a %s exception.",
                         type(original_exc).__name__,
                     )
+                    check_responsive_cnt = 0
                     while (
                         not self.engine_core_sentinel.check_worker_responsive()
                         and time.monotonic() < deadline
@@ -466,11 +485,13 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         logger.warning(
                             "[BusyLoopWrapper] Worker is not responsive. Checking..."
                         )
+                        check_responsive_cnt += 1
                         time.sleep(1)
                     logger.warning(
                         "[BusyLoopWrapper] Engine loop suspended. "
                         "Wait for fault tolerance instructions."
                     )
+                    drain_stale_responses(self.model_executor, check_responsive_cnt)
                     self.engine_core_sentinel.drain_engine_responses()
 
                     self.engine_core_sentinel.fault_signal_q.put(original_exc)
