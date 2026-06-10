@@ -341,6 +341,7 @@ class ClientSentinel(BaseSentinel):
                     EngineStatusType.HEALTHY.name.lower()
                 )
             await self._pub_engine_status(
+                type="scale_down",
                 exclude_dp_ranks=exclude_dp_ranks,
                 original_to_new=original_to_new,
             )

@@ -1232,16 +1232,16 @@ class AsyncMPClient(MPClient):
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
         # Reject fault tolerance instructions if any engine is not healthy.
-        healthy_engines = [
+        hung_engines = [
             e
             for e in self.engine_status["engines"]  # type: ignore[attr-defined]
             if e["status"] == EngineStatusType.HEALTHY.name.lower()
         ]
-        if healthy_engines:
+        if hung_engines:
             return FaultToleranceResult(
                 request_id=ft_request.request_id,
                 success=False,
-                reason=f"Some Engines are still hung: {healthy_engines}",
+                reason=f"Some Engines are still hung: {hung_engines}",
             )
 
         res = await self._call_utility_async(
@@ -1260,7 +1260,7 @@ class AsyncMPClient(MPClient):
                         "total_engines": msg["total_engines"],
                         "engines": msg["engines"],
                     }
-                    if "original_to_new" in msg and "exclude_dp_ranks" in msg:
+                    if msg["type"] == "scale_down":
                         loop = (
                             self.resources.output_queue_task.get_loop()
                             if self.resources.output_queue_task
@@ -1297,6 +1297,8 @@ class AsyncMPClient(MPClient):
             for rank, identity in zip(self.engine_ranks_managed, self.core_engines)
             if rank not in exclude_set
         ]
+        if self.core_engines:
+            self.core_engine = self.core_engines[0]
 
         # 2. Reset engine_ranks_managed to contiguous range [0, new_dp_size).
         new_dp_size = len(old_to_new)
