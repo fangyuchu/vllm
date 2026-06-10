@@ -1260,7 +1260,7 @@ class AsyncMPClient(MPClient):
                         "total_engines": msg["total_engines"],
                         "engines": msg["engines"],
                     }
-                    if msg["type"] == "scale_down":
+                    if "type" in msg and msg["type"] == "scale_down":
                         loop = (
                             self.resources.output_queue_task.get_loop()
                             if self.resources.output_queue_task
