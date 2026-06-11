@@ -149,27 +149,6 @@ class EngineCoreSentinel:
         )
         return {"new_stateless_dp_group_port": worker_port}
 
-    @staticmethod
-    def _drain_stale_responses(executor):
-        """Drain stale futures/responses before issuing a new collective_rpc."""
-        if not hasattr(executor, "futures_queue"):
-            return
-        num_stale = len(executor.futures_queue)
-        executor.futures_queue.clear()
-        if num_stale == 0:
-            return
-        logger.info("[FT] Draining %d stale response(s)", num_stale)
-        if executor.kv_output_aggregator is not None:
-            mqs = executor.response_mqs
-        else:
-            mqs = (executor.response_mqs[executor.output_rank],)
-        for mq in mqs:
-            for _ in range(num_stale):
-                try:
-                    mq.dequeue(timeout=30)
-                except Exception:
-                    break
-
 
 def fault_tolerant_wrapper(busy_loop_func: Callable):
     """Wrap the busy loop to catch faults and delegate recovery."""
