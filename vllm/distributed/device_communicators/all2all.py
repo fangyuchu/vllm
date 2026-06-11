@@ -352,8 +352,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         torch.accelerator.synchronize()
         buf.low_latency_clean_mask_buffer()
         torch.accelerator.synchronize()
-        if DeepEPLLAll2AllManager._last_mask is not None:
-            DeepEPLLAll2AllManager._last_mask.zero_()
+        DeepEPLLAll2AllManager._last_mask = None
 
     def query_fault(self) -> tuple[torch.Tensor, torch.Tensor]:
         current = self.query_active_mask()

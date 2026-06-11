@@ -79,7 +79,9 @@ class EngineCoreSentinel:
             engine.batch_queue.clear()
 
         self.status_type = EngineStatusType.UNHEALTHY
-        logger.info("[FT] Engine %d status -> UNHEALTHY: %s", self.engine_index, exc)
+        logger.info(
+            "[FT] Engine %d status -> UNHEALTHY:", self.engine_index, exc_info=exc
+        )
 
     # ------------------------------------------------------------------
     # Instruction handlers (method name == instruction string)
@@ -99,8 +101,9 @@ class EngineCoreSentinel:
 
         with set_current_vllm_config(engine.vllm_config):
             ft_request.params.update(self._reinit_dp_group())
+        if hasattr(engine, "step_counter"):
+            engine.step_counter = 0
 
-        self._drain_stale_responses(executor)
         executor.collective_rpc("handle_ft_command", args=(ft_request,))
 
         self.status_type = EngineStatusType.HEALTHY
@@ -115,12 +118,12 @@ class EngineCoreSentinel:
     def _reinit_dp_group(self) -> dict:
         """Reinit DP process group if in DP mode. Returns worker params."""
         engine = self.engine
-        if not hasattr(engine, "dp_group"):
+        if not hasattr(engine, "dp_group") or not hasattr(engine, "dp_store"):
             return {}
 
         parallel_config = engine.vllm_config.parallel_config
 
-        if engine.dp_rank == 0:
+        if parallel_config.data_parallel_rank == 0:
             worker_port = get_open_port()
             engine_port = get_open_port()
             engine.dp_store.set("ft_worker_dp_port", str(worker_port).encode())
