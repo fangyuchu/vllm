@@ -1044,9 +1044,8 @@ class AsyncLLM(EngineClient):
         """send fault tolerance instruction to the engine"""
         return await self.engine_core.handle_fault(fault_tolerance_request)
 
-    async def get_fault_info(self):
-        """report exception in engine core"""
-        return await self.engine_core.fault_reporter()
+    async def get_status(self):
+        return await self.engine_core.get_status()
 
     @property
     def is_running(self) -> bool:

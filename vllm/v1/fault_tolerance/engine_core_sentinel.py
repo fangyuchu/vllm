@@ -37,6 +37,7 @@ class EngineCoreSentinel:
         self.resumed = threading.Event()
         self.resumed.set()
         self.status_type = EngineStatusType.HEALTHY
+        self._dp_reinit_epoch = 0
 
     # ------------------------------------------------------------------
     # Command dispatch (called from process_input_sockets thread)
@@ -122,15 +123,18 @@ class EngineCoreSentinel:
             return {}
 
         parallel_config = engine.vllm_config.parallel_config
+        worker_key = f"ft_worker_dp_port_{self._dp_reinit_epoch}"
+        engine_key = f"ft_engine_dp_port_{self._dp_reinit_epoch}"
+        self._dp_reinit_epoch += 1
 
         if parallel_config.data_parallel_rank == 0:
             worker_port = get_open_port()
             engine_port = get_open_port()
-            engine.dp_store.set("ft_worker_dp_port", str(worker_port).encode())
-            engine.dp_store.set("ft_engine_dp_port", str(engine_port).encode())
+            engine.dp_store.set(worker_key, str(worker_port).encode())
+            engine.dp_store.set(engine_key, str(engine_port).encode())
         else:
-            worker_port = int(engine.dp_store.get("ft_worker_dp_port").decode())
-            engine_port = int(engine.dp_store.get("ft_engine_dp_port").decode())
+            worker_port = int(engine.dp_store.get(worker_key).decode())
+            engine_port = int(engine.dp_store.get(engine_key).decode())
 
         stateless_destroy_torch_distributed_process_group(engine.dp_group)
         engine.dp_group, engine.dp_store = (

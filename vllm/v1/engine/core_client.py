@@ -280,7 +280,7 @@ class EngineCoreClient(ABC):
     ) -> FaultToleranceResult:
         raise NotImplementedError
 
-    async def fault_reporter(self):
+    async def get_status(self):
         raise NotImplementedError
 
 
@@ -1153,7 +1153,7 @@ class AsyncMPClient(MPClient):
         result = FaultToleranceResult(**res)
         return result
 
-    async def fault_reporter(self):
+    async def get_status(self):
         ft_request = FaultToleranceRequest(instruction="status", params={})
         res = await self.call_utility_async(FT_UTILITY_METHOD, ft_request)
         return {

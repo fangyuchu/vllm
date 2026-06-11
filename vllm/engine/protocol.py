@@ -241,8 +241,8 @@ class EngineClient(ABC):
         """send fault tolerance instruction to the engine"""
         raise NotImplementedError
 
-    async def get_fault_info(self):
-        """report exception from engine_core"""
+    async def get_status(self):
+        """Get fault tolerance status of all engines."""
         raise NotImplementedError
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

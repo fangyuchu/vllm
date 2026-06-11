@@ -27,8 +27,7 @@ def _validate_payload(body: dict) -> tuple[str, dict]:
         raise HTTPException(400, "'instruction' and 'params' are required.")
     if instruction not in _ALLOWED_INSTRUCTIONS:
         raise HTTPException(400, f"Invalid instruction: '{instruction}'.")
-    if "timeout" not in params or not isinstance(
-            params["timeout"], (int, float)):
+    if "timeout" not in params or not isinstance(params["timeout"], (int, float)):
         raise HTTPException(400, "Missing or invalid 'timeout' parameter.")
     return instruction, params
 
@@ -51,7 +50,8 @@ async def process_fault_tolerance_instruction(raw_request: Request):
 
     instruction, params = _validate_payload(body)
     ft_request = FaultToleranceRequest(
-        instruction=instruction, params=params,
+        instruction=instruction,
+        params=params,
         request_id=str(uuid.uuid4()),
     )
 
@@ -68,9 +68,9 @@ async def process_fault_tolerance_instruction(raw_request: Request):
 
 
 @router.get("/fault_tolerance/status")
-async def get_fault_info(raw_request: Request):
+async def get_status(raw_request: Request):
     client: EngineClient = raw_request.app.state.engine_client
-    return JSONResponse(content=await client.get_fault_info())
+    return JSONResponse(content=await client.get_status())
 
 
 def register_fault_tolerance_api_router(app: FastAPI):
