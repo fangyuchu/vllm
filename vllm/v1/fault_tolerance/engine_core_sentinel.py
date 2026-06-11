@@ -404,9 +404,7 @@ class EngineCoreSentinel(BaseSentinel):
     def drain_stale_executor_responses(self, executor, num_stale, timeout):
         """Drain stale futures and pending responses from the executor's
         message queues before issuing a new collective_rpc."""
-        deadline = (
-            time.monotonic() + self.engine_core_sentinel.engine_recovery_timeout_sec
-        )
+        deadline = time.monotonic() + timeout
         if not executor.response_mqs:
             return
         logger.info("[FT] Draining %d stale response(s) from response queue", num_stale)
