@@ -230,6 +230,7 @@ class ClientSentinel(BaseSentinel):
                 self.engine_status_dict[i]["status"] = (
                     EngineStatusType.HEALTHY.name.lower()
                 )
+            self.is_faulted.clear()
             await self._pub_engine_status()
         return res
 
