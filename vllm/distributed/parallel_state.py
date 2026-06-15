@@ -338,7 +338,6 @@ class GroupCoordinator:
         gloo_timeout_timedelta: timedelta | None = None
         if gloo_timeout_seconds is not None:
             gloo_timeout_timedelta = timedelta(seconds=gloo_timeout_seconds)
-        self.group_type = "normal"
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
@@ -1072,10 +1071,7 @@ class GroupCoordinator:
 
     def destroy_cpu_group(self):
         if hasattr(self, "cpu_group"):
-            if self.group_type == "normal":
-                torch.distributed.destroy_process_group(self.cpu_group)
-            else:
-                stateless_destroy_torch_distributed_process_group(self.cpu_group)
+            stateless_destroy_torch_distributed_process_group(self.cpu_group)
             del self.cpu_group
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
