@@ -148,6 +148,72 @@ class FaultToleranceZmqAddresses:
         )
 
 
+def validate_ft_request(
+    engines: list[dict[str, object]],
+    request_id: str,
+    instruction: str,
+    exclude_dp_ranks: Any = None,
+) -> FaultToleranceResult | None:
+    """Validate engine status before forwarding a fault tolerance instruction.
+
+    Returns None if validation passes (caller should proceed to execute),
+    or a FaultToleranceResult with success=False if validation fails
+    (caller should return it immediately).
+
+    Validation rules:
+    - **pause**: Always passes — pause itself transitions healthy engines
+      to paused/unhealthy, so rejecting on healthy would create a deadlock.
+    - **retry**: Rejects if any engine is still healthy. After pause, all
+      engines should be paused/unhealthy; a healthy engine at this stage
+      indicates it may have hung during pause, so retry cannot safely proceed.
+    - **scale_down**: Only checks retained engines (those NOT in
+      exclude_dp_ranks). Excluded ranks are being removed and their
+      hung/healthy state is irrelevant to the scale-down operation.
+    - Unknown instructions are passed through without validation.
+    """
+    exclude_set: set[int] = set()
+    if exclude_dp_ranks is not None:
+        exclude_set = set(exclude_dp_ranks)
+
+    if instruction == "pause":
+        # No pre-condition: pause is the first step that puts engines
+        # into paused/unhealthy state.
+        return None
+
+    healthy_engines = [
+        e for e in engines if e["status"] == EngineStatusType.HEALTHY.name.lower()
+    ]
+
+    if instruction == "retry":
+        if healthy_engines:
+            return FaultToleranceResult(
+                request_id=request_id,
+                success=False,
+                reason=(
+                    "Some engines are still healthy — may have hung during "
+                    f"pause: {healthy_engines}"
+                ),
+            )
+        return None
+
+    if instruction == "scale_down":
+        # Only care about engines that will be kept.
+        healthy_retained = [e for e in healthy_engines if e["id"] not in exclude_set]
+        if healthy_retained:
+            return FaultToleranceResult(
+                request_id=request_id,
+                success=False,
+                reason=(
+                    "Some retained engines are still healthy — may have hung "
+                    f"during pause: {healthy_retained}"
+                ),
+            )
+        return None
+
+    # Unknown / future instruction — let it through.
+    return None
+
+
 def make_engine_down_report_socket(vllm_config):
     zmq_ctx = zmq.Context()
     zmq_addr = get_engine_client_zmq_addr(
