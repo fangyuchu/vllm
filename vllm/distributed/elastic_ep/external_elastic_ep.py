@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine.core_client import DPAsyncMPClient
 
 logger = init_logger(__name__)
+POLL_BACKOFF_STEPS_S = (0.1, 0.2, 0.5, 1.0)
 
 
 class ExternalElasticEPScaleUpHandshakeServer:
@@ -165,6 +166,11 @@ class ExternalElasticEPScaleCoordinator:
     def key(*parts: str | int) -> str:
         return "/".join(["elastic_ep/external", *[str(part) for part in parts]])
 
+    @staticmethod
+    async def _sleep_with_backoff(backoff_step: int) -> int:
+        await asyncio.sleep(POLL_BACKOFF_STEPS_S[backoff_step])
+        return min(backoff_step + 1, len(POLL_BACKOFF_STEPS_S) - 1)
+
     def _update_parallel_config(self, bootstrap: ReconfigureDistributedRequest) -> None:
         parallel_config = self.client.vllm_config.parallel_config
         parallel_config.data_parallel_size = bootstrap.new_data_parallel_size
@@ -272,6 +278,7 @@ class ExternalElasticEPScaleCoordinator:
         bootstrap_key = self.key("bootstrap")
         prepared_key = self.key("prepared")
         completed_key = self.key("completed")
+        backoff_step = 0
         while True:
             error = self._get_error(store)
             if error is not None:
@@ -299,7 +306,7 @@ class ExternalElasticEPScaleCoordinator:
                     "Timed out waiting for rank 0 to publish external Elastic EP "
                     "bootstrap metadata."
                 )
-            await asyncio.sleep(0.1)
+            backoff_step = await self._sleep_with_backoff(backoff_step)
 
     def _prepare_reconfig_bootstrap(
         self,
@@ -378,6 +385,7 @@ class ExternalElasticEPScaleCoordinator:
             key = self.key("notifications", notification_type.value, rank)
             return reconfig_store.check([key])
 
+        backoff_step = 0
         while True:
             error = self._get_error(control_store)
             if error is not None:
@@ -401,7 +409,7 @@ class ExternalElasticEPScaleCoordinator:
                     "Timed out waiting for external Elastic EP notification "
                     f"{notification_type.value}."
                 )
-            await asyncio.sleep(0.1)
+            backoff_step = await self._sleep_with_backoff(backoff_step)
 
     async def _wait_for_local_reconfig_finished(
         self,
@@ -428,6 +436,7 @@ class ExternalElasticEPScaleCoordinator:
 
         loop = asyncio.get_running_loop()
         start = loop.time()
+        backoff_step = 0
         while True:
             error = self._get_error(control_store)
             if error is not None:
@@ -441,7 +450,7 @@ class ExternalElasticEPScaleCoordinator:
             now = loop.time()
             if now - start > timeout_s:
                 raise TimeoutError(timeout_msg)
-            await asyncio.sleep(0.1)
+            backoff_step = await self._sleep_with_backoff(backoff_step)
 
     async def scale(
         self, cur_data_parallel_size: int, new_data_parallel_size: int
