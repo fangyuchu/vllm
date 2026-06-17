@@ -118,18 +118,17 @@ class EngineCoreSentinel:
         parallel_config.data_parallel_rank = new_dp_rank
         engine.dp_rank = new_dp_rank
         engine.dp_size = new_dp_size
+        self.engine_index = new_dp_rank
 
         # Rank 0 hosts the TCPStore master; rebuild if it was removed.
         if 0 in removed_set and hasattr(engine, "dp_store"):
             dp_store_port = ft_request.params.get("dp_store_port")
-            if dp_store_port is None:
-                raise ValueError(
-                    "dp_store_port required when rank 0 is removed "
-                    "(old dp_store master is dead)"
-                )
             new_master_ip = ft_request.params.get("dp_master_ip")
-            if new_master_ip is not None:
-                parallel_config.data_parallel_master_ip = new_master_ip
+            if dp_store_port is None or new_master_ip is None:
+                raise ValueError(
+                    "dp_store_port and dp_master_ip required when rank 0 is removed "
+                )
+            parallel_config.data_parallel_master_ip = new_master_ip
             self._rebuild_dp_store(
                 parallel_config.data_parallel_master_ip,
                 dp_store_port,

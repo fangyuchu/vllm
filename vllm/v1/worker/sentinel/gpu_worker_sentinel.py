@@ -126,12 +126,10 @@ class WorkerSentinel:
 
         surviving_slots = (ep_world_size - len(dead_ep_ranks)) * num_local_experts
         if surviving_slots < num_logical:
-            logger.warning(
-                "[FT] Cannot redistribute: %d surviving slots < %d logical experts",
-                surviving_slots,
-                num_logical,
+            raise RuntimeError(
+                f"[FT] Cannot redistribute: {surviving_slots} surviving slots "
+                f"< {num_logical} logical experts. "
             )
-            return
 
         mark_dead_columns_inplace(p2l, dead_ep_ranks, num_local_experts)
         reassignments = redistribute_expert_placement(
