@@ -37,7 +37,6 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     EngineCoreRequestType,
-    EngineStatusType,
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
@@ -59,6 +58,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
     FaultToleranceZmqAddresses,
+    validate_ft_request,
 )
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -1231,18 +1231,14 @@ class AsyncMPClient(MPClient):
     async def handle_fault(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
-        # Reject fault tolerance instructions if any engine is not healthy.
-        hung_engines = [
-            e
-            for e in self.engine_status["engines"]  # type: ignore[attr-defined]
-            if e["status"] == EngineStatusType.HEALTHY.name.lower()
-        ]
-        if hung_engines:
-            return FaultToleranceResult(
-                request_id=ft_request.request_id,
-                success=False,
-                reason=f"Some Engines are still hung: {hung_engines}",
-            )
+        # Validate engine status according to instruction semantics.
+        if rejection := validate_ft_request(
+            engines=self.engine_status["engines"],  # type: ignore[attr-defined, arg-type]
+            request_id=ft_request.request_id,
+            instruction=ft_request.instruction,
+            exclude_dp_ranks=ft_request.params.get("exclude_dp_ranks"),
+        ):
+            return rejection
 
         res = await self._call_utility_async(
             ft_request.instruction, ft_request, engine=b"client_sentinel"
