@@ -4,10 +4,12 @@
 
 import threading
 from collections.abc import Callable
+from datetime import timedelta
 from typing import TYPE_CHECKING
+from torch.distributed.distributed_c10d import _set_pg_timeout
 
 from vllm.config import set_current_vllm_config
-from vllm.distributed import stateless_destroy_torch_distributed_process_group
+from vllm.distributed import stateless_destroy_torch_distributed_process_group, get_dp_group
 from vllm.distributed.utils import stateless_init_torch_distributed_process_group
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
@@ -34,14 +36,14 @@ class EngineCoreSentinel:
         ft_config = parallel_config.fault_tolerance_config
         self.engine_recovery_timeout_sec = ft_config.engine_recovery_timeout_sec
 
+        self.auto_recovery = ft_config.auto_recovery
+
         self.resumed = threading.Event()
         self.resumed.set()
         self.status_type = EngineStatusType.HEALTHY
         self._dp_reinit_epoch = 0
-
-    # ------------------------------------------------------------------
-    # Command dispatch (called from process_input_sockets thread)
-    # ------------------------------------------------------------------
+        timeout = timedelta(seconds=self.engine.vllm_config.parallel_config.cpu_distributed_timeout_seconds)
+        _set_pg_timeout(timeout=timeout, group=self.engine.dp_group)
 
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
         """Dispatch an FT command by instruction name and enqueue result."""
@@ -62,10 +64,6 @@ class EngineCoreSentinel:
             (client_idx, EngineCoreOutputs(utility_output=uo))
         )
 
-    # ------------------------------------------------------------------
-    # Fault handling (called by wrapper, runs in busy-loop thread)
-    # ------------------------------------------------------------------
-
     def on_fault(self, exc: Exception):
         """Called by the wrapper when the busy loop raises an exception."""
         self.resumed.clear()
@@ -84,17 +82,25 @@ class EngineCoreSentinel:
             "[FT] Engine %d status -> UNHEALTHY:", self.engine_index, exc_info=exc
         )
 
-    # ------------------------------------------------------------------
-    # Instruction handlers (method name == instruction string)
-    # ------------------------------------------------------------------
+        if self.auto_recovery:
+            try:
+                self.auto_recover()
+            except Exception:
+                logger.exception("[FT] Auto-recovery failed")
 
     def status(self, ft_request: FaultToleranceRequest) -> dict:
-        return {
+        result = {
             "request_id": ft_request.request_id,
             "success": True,
             "engine_id": self.engine_index,
             "status": self.status_type.name.lower(),
         }
+        if self.status_type == EngineStatusType.UNHEALTHY:
+            try:
+                result["mask"] = self._query_mask()
+            except Exception:
+                logger.warning("[FT] Failed to query mask for status")
+        return result
 
     def retry(self, ft_request: FaultToleranceRequest) -> dict:
         engine = self.engine
@@ -115,7 +121,18 @@ class EngineCoreSentinel:
     def scale_down(self, ft_request: FaultToleranceRequest) -> dict:
         engine = self.engine
         parallel_config = engine.vllm_config.parallel_config
+
+        # if not (
+        #     parallel_config.enable_eplb
+        #     and parallel_config.eplb_config.num_redundant_experts > 0
+        # ):
+        #     raise ValueError(
+        #         "scale_down requires --enable-eplb with num_redundant_experts > 0"
+        #     )
         removed_dp_ranks = ft_request.params["removed_dp_ranks"]
+
+        if self.engine_index in removed_dp_ranks:
+            return {"request_id": ft_request.request_id, "success": False}
 
         old_dp_size = parallel_config.data_parallel_size
         old_dp_rank = parallel_config.data_parallel_rank
@@ -180,6 +197,42 @@ class EngineCoreSentinel:
         )
         self.resumed.set()
         return {"request_id": ft_request.request_id, "success": True}
+
+    def _query_mask(self) -> list[int]:
+        """Query the first worker for the current all2all mask."""
+        ft_request = FaultToleranceRequest(instruction="query_mask", params={})
+        results = self.engine.model_executor.collective_rpc(
+            "handle_ft_command", args=(ft_request,)
+        )
+        return results[0]["mask"]
+
+    def auto_recover(self):
+        """Auto-recover based on worker mask state.
+
+        Queries the all2all mask from workers:
+        - All zeros → retry (no dead peer detected).
+        - Non-zero entries → scale_down with the dead DP ranks.
+        """
+        mask = self._query_mask()
+
+        if all(v == 0 for v in mask):
+            logger.info("[FT] Auto-recovery: mask is all zeros, retrying")
+            ft_request = FaultToleranceRequest(instruction="retry", params={})
+            self.retry(ft_request)
+            return
+
+        parallel_config = self.engine.vllm_config.parallel_config
+        tp_size = parallel_config.tensor_parallel_size
+        my_dp_rank = parallel_config.data_parallel_rank
+        dead_ep_ranks = [i for i, v in enumerate(mask) if v != 0]
+        dead_dp_ranks = sorted(set(r // tp_size for r in dead_ep_ranks) - {my_dp_rank})
+
+        logger.info("[FT] Auto-recovery: dead_dp_ranks=%s, scaling down", dead_dp_ranks)
+        ft_request = FaultToleranceRequest(
+            instruction="scale_down",
+            params={"removed_dp_ranks": dead_dp_ranks},
+        )
+        self.scale_down(ft_request)
 
     def _rebuild_dp_store(
         self,
