@@ -195,6 +195,13 @@ class WorkerSentinel:
         eplb_state.expert_rearrangement_step = 0
         eplb_state.expert_load_window_step = 0
 
+    def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
+        """Return the current all2all active mask from the FT backend."""
+        comm = get_ep_group().device_communicator
+        assert comm and comm.all2all_manager
+        mask = comm.all2all_manager.query_active_mask()
+        return {"mask": mask.tolist()}
+
     def _reinit_gloo_group(
         self,
         group_coordinator,
