@@ -27,8 +27,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_FT_BACKEND_SET = {"deepep_low_latency", "nixl_ep"}
-
 
 class WorkerSentinel:
     """Holds FT state for a single worker (mask tensors, DP config).
@@ -42,11 +40,6 @@ class WorkerSentinel:
         self.dp_rank = worker.parallel_config.data_parallel_rank
         self.dp_size = worker.parallel_config.data_parallel_size
         self.data_parallel_master_ip = worker.parallel_config.data_parallel_master_ip
-
-        self.use_ft_backend = (
-            worker.parallel_config.all2all_backend in _FT_BACKEND_SET
-            and self.dp_size > 1
-        )
 
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""
@@ -65,11 +58,12 @@ class WorkerSentinel:
                 self.dp_rank,
                 self.dp_size,
             )
-            if self.use_ft_backend:
-                comm = get_ep_group().device_communicator
-                assert comm and comm.all2all_manager
-                mgr = comm.all2all_manager
-                mgr.clean_buffers()
+            self._get_all2all_manager().clean_buffers()
+
+    def _get_all2all_manager(self):
+        comm = get_ep_group().device_communicator
+        assert comm and comm.all2all_manager
+        return comm.all2all_manager
 
     def scale_down(self, ft_request: FaultToleranceRequest):
         params = ft_request.params
