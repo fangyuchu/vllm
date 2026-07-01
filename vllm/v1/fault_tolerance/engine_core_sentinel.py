@@ -121,7 +121,6 @@ class EngineCoreSentinel:
     def scale_down(self, ft_request: FaultToleranceRequest) -> dict:
         engine = self.engine
         parallel_config = engine.vllm_config.parallel_config
-
         # if not (
         #     parallel_config.enable_eplb
         #     and parallel_config.eplb_config.num_redundant_experts > 0
@@ -279,6 +278,8 @@ class EngineCoreSentinel:
 
         worker_port = self._coordinate_port("ft_worker_dp_port")
         engine_port = self._coordinate_port("ft_engine_dp_port")
+        eplb_port = self._coordinate_port("ft_engine_eplb_port")
+        print(f'worker_port is {worker_port} engine_port is {engine_port} eplb_port is {eplb_port}')
         self._dp_reinit_epoch += 1
 
         stateless_destroy_torch_distributed_process_group(engine.dp_group)
@@ -292,7 +293,7 @@ class EngineCoreSentinel:
                 return_store=True,
             )
         )
-        return {"new_stateless_dp_group_port": worker_port}
+        return {"new_stateless_dp_group_port": worker_port, "new_stateless_eplb_group_port": eplb_port}
 
     def _coordinate_port(self, key_prefix: str) -> int:
         """Rank 0 picks a fresh port, publishes via dp_store;
