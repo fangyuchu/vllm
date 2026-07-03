@@ -1694,6 +1694,24 @@ class DPEngineCoreProc(EngineCoreProc):
         self.eep_notification_socket = None
         self.eep_notification_socket_address = None
 
+    def _pause_complete(self) -> bool:
+        """Two-phase DP-aware pause.
+
+        Phase 1: Set local pause state and ``pending_pause`` flag. If the
+        engines are idle, kick-start them by setting ``engines_running`` to
+        True so ranks enter the stepping loop and reach the all-reduce
+        consensus checkpoint in ``_has_global_unfinished_reqs``.
+
+        Phase 2 (in ``_has_global_unfinished_reqs``): Once the all-reduce
+        confirms that **all** ranks have ``pending_pause`` set, collectively
+        stop stepping and set ``ignore_start_dp_wave`` so that stale
+        ``START_DP_WAVE`` messages cannot re-wake any engine.
+        """
+        self.pending_pause = True
+        self.engines_running = True
+
+        return False
+
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
         if self.has_coordinator and request_wave != self.current_wave:
