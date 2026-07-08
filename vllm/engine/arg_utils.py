@@ -40,6 +40,7 @@ from vllm.config import (
     DeviceConfig,
     ECTransferConfig,
     EPLBConfig,
+    FaultToleranceConfig,
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
@@ -114,6 +115,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import resolve_kv_cache_dtype_string
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.fault_tolerance.utils import FT_BACKEND_SET
 from vllm.v1.sample.logits_processor import LogitsProcessor
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -700,6 +702,12 @@ class EngineArgs:
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
 
+    # fault tolerance fields (`None` means not explicitly provided).
+    fault_tolerance_config: FaultToleranceConfig | None = get_field(
+        ParallelConfig, "fault_tolerance_config"
+    )
+    enable_fault_tolerance: bool = ParallelConfig.enable_fault_tolerance
+
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
     tokens_only: bool = False
@@ -731,6 +739,10 @@ class EngineArgs:
         if isinstance(self.weight_transfer_config, dict):
             self.weight_transfer_config = WeightTransferConfig(
                 **self.weight_transfer_config
+            )
+        if isinstance(self.fault_tolerance_config, dict):
+            self.fault_tolerance_config = FaultToleranceConfig(
+                **self.fault_tolerance_config
             )
         if isinstance(self.ir_op_priority, dict):
             self.ir_op_priority = IrOpPriorityConfig(**self.ir_op_priority)
@@ -1111,6 +1123,16 @@ class EngineArgs:
         parallel_group.add_argument("--worker-cls", **parallel_kwargs["worker_cls"])
         parallel_group.add_argument(
             "--worker-extension-cls", **parallel_kwargs["worker_extension_cls"]
+        )
+        parallel_group.add_argument(
+            "--enable-fault-tolerance", **parallel_kwargs["enable_fault_tolerance"]
+        )
+        parallel_group.add_argument(
+            "--fault-tolerance-config",
+            **{
+                **parallel_kwargs["fault_tolerance_config"],
+                "default": None,
+            },
         )
 
         # KV cache arguments
@@ -1542,6 +1564,13 @@ class EngineArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
+
+        # If --fault-tolerance-config is provided, enable fault tolerance by default.
+        if args.fault_tolerance_config is not None:
+            args.enable_fault_tolerance = True
+        if args.enable_fault_tolerance and args.fault_tolerance_config is None:
+            args.fault_tolerance_config = FaultToleranceConfig()
+
         # Set the attributes from the parsed arguments.
         engine_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
@@ -1859,6 +1888,17 @@ class EngineArgs:
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
+        if self.enable_fault_tolerance and not data_parallel_external_lb:
+            raise ValueError(
+                "Fault tolerance requires external load balancer mode "
+                "(--data-parallel-external-lb or --data-parallel-rank). "
+                "Internal LB mode is not supported."
+            )
+        if self.enable_fault_tolerance and self.all2all_backend not in FT_BACKEND_SET:
+            raise ValueError(
+                "Fault tolerance requires an FT-capable all2all backend "
+                f"(deepep_low_latency or nixl_ep), but got '{self.all2all_backend}'."
+            )
         if (
             self.data_parallel_size > 1
             and data_parallel_external_lb
@@ -2004,6 +2044,10 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
+            enable_fault_tolerance=self.enable_fault_tolerance,
+            fault_tolerance_config=(
+                self.fault_tolerance_config or FaultToleranceConfig()
+            ),
             numa_bind=self.numa_bind,
             numa_bind_nodes=self.numa_bind_nodes,
             numa_bind_cpus=self.numa_bind_cpus,

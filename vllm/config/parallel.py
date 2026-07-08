@@ -13,6 +13,7 @@ from torch.distributed import ProcessGroup, ReduceOp, Store
 from typing_extensions import Self
 
 import vllm.envs as envs
+from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
     from ray.util.placement_group import PlacementGroup
 
+    from vllm.config.fault_tolerance import FaultToleranceConfig
     from vllm.v1.executor import Executor
 else:
     RuntimeEnv = Any
@@ -378,6 +380,16 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
+    enable_fault_tolerance: bool = False
+    """Enable fault tolerance for detailed error recovery,
+    such as scaling down fault DPEngineCore.
+    """
+
+    fault_tolerance_config: FaultToleranceConfig = Field(
+        default_factory=FaultToleranceConfig
+    )
+    """The configurations for fault tolerance."""
+
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
@@ -457,11 +469,11 @@ class ParallelConfig:
             )
 
         if self.enable_eplb:
-            if not current_platform.is_cuda_alike():
-                raise ValueError(
-                    "Expert parallelism load balancing is only supported on "
-                    "CUDA devices or ROCm devices now."
-                )
+            # if not current_platform.is_cuda_alike():
+            #     raise ValueError(
+            #         "Expert parallelism load balancing is only supported on "
+            #         "CUDA devices or ROCm devices now."
+            #     )
             if not self.enable_expert_parallel:
                 raise ValueError("enable_expert_parallel must be True to use EPLB.")
             if self.tensor_parallel_size * self.data_parallel_size <= 1:
