@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING
 from torch.distributed.distributed_c10d import _set_pg_timeout
 
 from vllm.config import set_current_vllm_config
-from vllm.distributed import stateless_destroy_torch_distributed_process_group, get_dp_group
+from vllm.distributed import (
+    stateless_destroy_torch_distributed_process_group,
+    get_dp_group,
+)
 from vllm.distributed.utils import stateless_init_torch_distributed_process_group
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
@@ -42,10 +45,14 @@ class EngineCoreSentinel:
         self.resumed.set()
         self.status_type = EngineStatusType.HEALTHY
         self._dp_reinit_epoch = 0
-        timeout = timedelta(seconds=self.engine.vllm_config.parallel_config.cpu_distributed_timeout_seconds)
+        timeout = timedelta(
+            seconds=self.engine.vllm_config.parallel_config.
+            cpu_distributed_timeout_seconds)
         _set_pg_timeout(timeout=timeout, group=self.engine.dp_group)
 
-    def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
+    def handle_command(
+        self, client_idx: int, call_id: int, ft_args: dict
+    ):
         """Dispatch an FT command by instruction name and enqueue result."""
         ft_request = FaultToleranceRequest(**ft_args)
         try:
@@ -279,7 +286,6 @@ class EngineCoreSentinel:
         worker_port = self._coordinate_port("ft_worker_dp_port")
         engine_port = self._coordinate_port("ft_engine_dp_port")
         eplb_port = self._coordinate_port("ft_engine_eplb_port")
-        print(f'worker_port is {worker_port} engine_port is {engine_port} eplb_port is {eplb_port}')
         self._dp_reinit_epoch += 1
 
         stateless_destroy_torch_distributed_process_group(engine.dp_group)
@@ -293,7 +299,10 @@ class EngineCoreSentinel:
                 return_store=True,
             )
         )
-        return {"new_stateless_dp_group_port": worker_port, "new_stateless_eplb_group_port": eplb_port}
+        return {
+            "new_stateless_dp_group_port": worker_port,
+            "new_stateless_eplb_group_port": eplb_port,
+        }
 
     def _coordinate_port(self, key_prefix: str) -> int:
         """Rank 0 picks a fresh port, publishes via dp_store;

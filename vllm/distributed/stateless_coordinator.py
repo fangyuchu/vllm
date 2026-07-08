@@ -166,8 +166,8 @@ class StatelessGroupCoordinator(GroupCoordinator):
             device_comm_cls = resolve_obj_by_qualname(
                 current_platform.get_device_communicator_cls()
             )
-            assert device_comm_cls == CudaCommunicator
-            self.device_communicator = CudaCommunicator(
+            # assert device_comm_cls == CudaCommunicator
+            self.device_communicator = device_comm_cls(
                 cpu_group=self.cpu_group,
                 device=self.device,
                 device_group=self.device_group,

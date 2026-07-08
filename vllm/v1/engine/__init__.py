@@ -282,9 +282,3 @@ class EngineStatusType(enum.IntEnum):
     HEALTHY = 0
     DEAD = 1
     UNHEALTHY = 2
-
-
-class EngineStatusType(enum.IntEnum):
-    HEALTHY = 0
-    DEAD = 1
-    UNHEALTHY = 2

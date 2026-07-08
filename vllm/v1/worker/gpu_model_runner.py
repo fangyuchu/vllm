@@ -459,8 +459,8 @@ class GPUModelRunner(
         self.dtype = self.model_config.dtype
 
         self.check_ep_fault = False
-        if parallel_config.data_parallel_size > 1 and self.model_config.is_moe:
-            self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
+        # if parallel_config.data_parallel_size > 1 and self.model_config.is_moe:
+        #     self.check_ep_fault = get_ep_all2all_manager().support_fault_tolerance
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
