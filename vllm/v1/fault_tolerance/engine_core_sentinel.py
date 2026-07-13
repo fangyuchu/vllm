@@ -481,6 +481,19 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                         "[BusyLoopWrapper] EngineCore busy loop raised a %s exception.",
                         type(original_exc).__name__,
                     )
+                    # Notify all WorkerSentinelThreads to set the in-process
+                    # fault detected flag via the existing zmq channel.
+                    ft_req = FaultToleranceRequest(
+                        instruction="fault_detected",
+                        request_id=str(uuid.uuid4()),
+                        params={},
+                    )
+                    request_bytes = msgspec.msgpack.encode(ft_req)
+                    for identity in self.engine_core_sentinel.worker_identities:
+                        self.engine_core_sentinel.worker_cmd_socket.send_multipart(
+                            [identity, b"", request_bytes]
+                        )
+                    logger.info("Send fault detected request to all workers.")
                     check_stale_cnt = 0
                     while (
                         not self.engine_core_sentinel.check_worker_responsive()
