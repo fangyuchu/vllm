@@ -1657,6 +1657,9 @@ class EngineCoreProc(EngineCore):
             max_num_seqs=scheduler_config.max_num_seqs,
             max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
             instance_id=self.vllm_config.instance_id,
+            coord_store_port=parallel_config._coord_store_port,
+            coordinator_input_address=self.addresses.coordinator_input,
+            coordinator_output_address=self.addresses.coordinator_output,
         )
 
     def process_input_sockets(
@@ -2290,6 +2293,20 @@ class DPEngineCoreProc(EngineCoreProc):
         """
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         notification_data = (notification_type.value, dp_rank)
+        effective_config = vllm_config or self.vllm_config
+        if (
+            envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+            and effective_config.parallel_config.data_parallel_external_lb
+        ):
+            from vllm.distributed.elastic_ep.external_elastic_ep import (
+                publish_external_eep_notification,
+            )
+
+            publish_external_eep_notification(
+                effective_config, notification_type, dp_rank
+            )
+            return
+
         outputs = EngineCoreOutputs(
             utility_output=UtilityOutput(
                 call_id=EEP_NOTIFICATION_CALL_ID,
