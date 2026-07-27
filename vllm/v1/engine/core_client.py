@@ -1052,10 +1052,7 @@ class AsyncMPClient(MPClient):
         notification_callback_handler: (
             Callable[[AsyncMPClient, Sequence[Any]], Any] | None
         ) = getattr(self.__class__, "eep_process_engine_core_notification", None)
-        needs_self_ref = (
-            output_handler is not None or notification_callback_handler is not None
-        )
-        _self_ref = weakref.ref(self) if needs_self_ref else None
+        _self_ref = weakref.ref(self)
 
         async def process_outputs_socket():
             try:
@@ -1068,7 +1065,6 @@ class AsyncMPClient(MPClient):
                             outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID
                             and notification_callback_handler is not None
                         ):
-                            assert _self_ref is not None
                             _self = _self_ref()
                             if not _self:
                                 return
@@ -1095,7 +1091,6 @@ class AsyncMPClient(MPClient):
                         continue
 
                     if output_handler is not None:
-                        assert _self_ref is not None
                         _self = _self_ref()
                         if not _self:
                             # Client has been garbage collected, abort.
