@@ -205,7 +205,7 @@ def test_preempt_defers_free_and_clears_bookkeeping():
     # Preempt the request while steps are in flight (mirrors the
     # preemption path inside schedule()).
     scheduler.running.remove(request)
-    scheduler._preempt_request(request, time.monotonic())
+    scheduler.preempt_request(request, time.monotonic())
     assert request.status == RequestStatus.PREEMPTED
 
     # Blocks are withheld from the pool, but the manager bookkeeping is
