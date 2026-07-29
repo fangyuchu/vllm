@@ -1113,7 +1113,7 @@ def test_preemption_re_records_prefix_cache_query():
     assert (stats.requests, stats.preempted_requests) == (1, 0)
 
     scheduler.running.remove(request)
-    scheduler._preempt_request(request, 0.0)
+    scheduler.preempt_request(request, 0.0)
     assert request.status == RequestStatus.PREEMPTED
 
     scheduler.schedule()
@@ -5226,7 +5226,7 @@ def test_encoder_cache_retained_across_preemption_and_resume():
     """Regression guard for issue #38551 (preemption path).
 
     A request preempted under KV pressure resets num_computed_tokens to 0
-    and drops its encoder references (scheduler._preempt_request calls
+    and drops its encoder references (scheduler.preempt_request calls
     encoder_cache_manager.free). Because that only moves the entry into
     `freeable` (it is not evicted), the worker still holds it: the scheduler
     must NOT report the mm_hash as freed. On resume, re-requesting the
@@ -5253,7 +5253,7 @@ def test_encoder_cache_retained_across_preemption_and_resume():
     assert manager.get_cached_input_ids(request) == {0}
 
     # Preemption drops the request's encoder references (scheduler.py:
-    # _preempt_request -> encoder_cache_manager.free) and resets progress.
+    # preempt_request -> encoder_cache_manager.free) and resets progress.
     manager.free(request)
     request.num_computed_tokens = 0
     # The entry is now ref-free but only `freeable` (not evicted): the
