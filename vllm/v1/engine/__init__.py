@@ -87,12 +87,12 @@ class EngineCoreReadyResponse:
     max_num_seqs: int
     max_num_batched_tokens: int
     instance_id: str
-    # KV cache capacity (None for encoder-only/attention-free models).
-    kv_cache_size_tokens: int | None = None
-    kv_cache_max_concurrency: float | None = None
     coord_store_port: int = 0
     coordinator_input_address: str | None = None
     coordinator_output_address: str | None = None
+    # KV cache capacity (None for encoder-only/attention-free models).
+    kv_cache_size_tokens: int | None = None
+    kv_cache_max_concurrency: float | None = None
 
 
 class EngineCoreRequest(
