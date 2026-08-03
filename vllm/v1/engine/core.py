@@ -1653,6 +1653,7 @@ class EngineCoreProc(EngineCore):
             coordinator_input_address=self.addresses.coordinator_input,
             coordinator_output_address=self.addresses.coordinator_output,
             instance_id=self.vllm_config.instance_id,
+            kv_events_config=self.scheduler.get_kv_event_publisher_config(),
         )
 
     def process_input_sockets(
