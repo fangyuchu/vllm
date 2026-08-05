@@ -50,6 +50,12 @@ class EngineCoreSentinel:
         self.status_type = EngineStatusType.HEALTHY
         self.fault_info: str | None = None
         self._dp_reinit_epoch = 0
+        # Original DP ranks indexed by current (densified) rank. The public FT
+        # coordinate system is the current one; original ranks never leave the
+        # engine except as the cumulative dead set passed to workers.
+        dp_size = parallel_config.data_parallel_size
+        self._alive_dp_ranks = list(range(dp_size))
+        self._initial_dp_size = dp_size
         # Guards against concurrent recovery: auto-recovery runs on the
         # busy-loop thread, external commands on the input-sockets thread.
         self._recovering = False
@@ -127,13 +133,19 @@ class EngineCoreSentinel:
 
     def _push_status(self):
         """Push current health to the client so it can refresh its cache."""
-        payload = {"id": self.engine_index, "status": self.status_type.name.lower()}
+        parallel_config = self.engine.vllm_config.parallel_config
+        payload = {
+            "id": self.engine_index,
+            "status": self.status_type.name.lower(),
+            "rank": parallel_config.data_parallel_rank,
+            "dp_size": parallel_config.data_parallel_size,
+        }
         if self.status_type == EngineStatusType.UNHEALTHY:
             payload["fault_info"] = self.fault_info
             try:
-                payload["mask"] = self._query_mask()
+                payload["dead_dp_ranks"] = self._dead_dp_ranks(self._query_mask())
             except Exception:
-                logger.warning("[FT] Failed to query mask for status push")
+                logger.warning("[FT] Failed to query dead ranks for status push")
         outputs = EngineCoreOutputs(
             utility_output=UtilityOutput(
                 call_id=FT_STATUS_CALL_ID,
@@ -153,6 +165,21 @@ class EngineCoreSentinel:
             "handle_ft_command", args=(ft_request,)
         )
         return [max(bits) for bits in zip(*(r["mask"] for r in results))]
+
+    def _dead_dp_ranks(self, mask: list[int]) -> list[int]:
+        """Translate an original-coordinate EP mask into current-coordinate
+        dead DP ranks; ranks removed by earlier scale-downs are excluded."""
+        tp_size = self.parallel_config.tensor_parallel_size
+        dead_original = {r // tp_size for r, v in enumerate(mask) if v}
+        return [
+            current
+            for current, original in enumerate(self._alive_dp_ranks)
+            if original in dead_original
+        ]
+
+    def _cumulative_dead_dp_ranks(self) -> list[int]:
+        """Original-coordinate DP ranks removed by all past scale-downs."""
+        return sorted(set(range(self._initial_dp_size)) - set(self._alive_dp_ranks))
 
     def _exchange_masks(self, my_mask: list[int]) -> list[int] | None:
         """Rank 0 unions all engines' masks via dp_store and publishes it back.
@@ -177,7 +204,10 @@ class EngineCoreSentinel:
 
         combined = list(my_mask)
         for rank in range(1, dp_size):
-            ep_range = range(rank * tp_size, (rank + 1) * tp_size)
+            # Masks use original EP coordinates; map the current rank back to
+            # its original rank to find the EP slots it would report on.
+            original = self._alive_dp_ranks[rank]
+            ep_range = range(original * tp_size, (original + 1) * tp_size)
             if all(combined[i] for i in ep_range):
                 continue  # presumed dead: it will never write its mask
             try:
@@ -203,16 +233,14 @@ class EngineCoreSentinel:
                 )
                 return
 
-            if all(v == 0 for v in mask):
-                logger.info("[FT] Auto-recovery: mask is all zeros, retrying")
+            dead_dp_ranks = self._dead_dp_ranks(mask)
+            if not dead_dp_ranks:
+                logger.info("[FT] Auto-recovery: no newly dead ranks, retrying")
                 ft_request = FaultToleranceRequest(instruction="retry", params={})
                 self.retry(ft_request)
                 return
 
-            parallel_config = self.engine.vllm_config.parallel_config
-            tp_size = parallel_config.tensor_parallel_size
-            my_dp_rank = parallel_config.data_parallel_rank
-            dead_dp_ranks = sorted({r // tp_size for r, v in enumerate(mask) if v})
+            my_dp_rank = self.parallel_config.data_parallel_rank
             if my_dp_rank in dead_dp_ranks:
                 logger.warning(
                     "[FT] Auto-recovery aborted: this rank is masked as dead "
@@ -232,6 +260,9 @@ class EngineCoreSentinel:
             self._recovering = False
 
     def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        # Workers replay masks for the cumulative dead set (original
+        # coordinates), which clean_buffers would otherwise wipe.
+        ft_request.params.setdefault("dead_dp_ranks", self._cumulative_dead_dp_ranks())
         return self._reinit_dp_and_dispatch_command(ft_request)
 
     def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
@@ -246,16 +277,31 @@ class EngineCoreSentinel:
                 "scale_down requires --enable-eplb with num_redundant_experts > 0"
             )
 
-        removed_dp_ranks = ft_request.params["removed_dp_ranks"]
-
+        # removed_dp_ranks uses current (densified) coordinates, sourced from
+        # the dead_dp_ranks field of the status response.
+        removed_set = set(ft_request.params["removed_dp_ranks"])
         old_dp_size = parallel_config.data_parallel_size
         old_dp_rank = parallel_config.data_parallel_rank
-        new_dp_size = old_dp_size - len(removed_dp_ranks)
-        removed_set = set(removed_dp_ranks)
+        new_dp_size = old_dp_size - len(removed_set)
+        if (
+            not removed_set
+            or not removed_set <= set(range(old_dp_size))
+            or old_dp_rank in removed_set
+            or new_dp_size < 1
+        ):
+            raise ValueError(
+                f"Invalid removed_dp_ranks {sorted(removed_set)} for engine "
+                f"{self.engine_index} (dp_size={old_dp_size}, "
+                f"dp_rank={old_dp_rank})"
+            )
 
-        # Densify: map old sparse ranks to new contiguous ranks.
-        surviving = [r for r in range(old_dp_size) if r not in removed_set]
-        new_dp_rank = surviving.index(old_dp_rank)
+        new_alive = [
+            r for i, r in enumerate(self._alive_dp_ranks) if i not in removed_set
+        ]
+        new_dp_rank = new_alive.index(self._alive_dp_ranks[old_dp_rank])
+        ft_request.params["dead_dp_ranks"] = sorted(
+            set(range(self._initial_dp_size)) - set(new_alive)
+        )
 
         master_ip = parallel_config.data_parallel_master_ip
         # Rank 0 hosts the TCPStore master; rebuild if it was removed.
@@ -281,6 +327,8 @@ class EngineCoreSentinel:
             dp_rank=new_dp_rank,
             master_ip=master_ip,
         )
+        # Commit the alive-rank mapping only after the reinit succeeded.
+        self._alive_dp_ranks = new_alive
         logger.info(
             "[FT] Engine %d scale_down complete: dp_size %d->%d, "
             "dp_rank %d->%d, removed %s",
@@ -289,7 +337,7 @@ class EngineCoreSentinel:
             new_dp_size,
             old_dp_rank,
             new_dp_rank,
-            removed_dp_ranks,
+            sorted(removed_set),
         )
         return result
 

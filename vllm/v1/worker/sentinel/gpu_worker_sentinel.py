@@ -68,7 +68,13 @@ class WorkerSentinel:
         self._clean_worker_state()
         self._reset_eplb_async_state()
         if self.dp_size > 1:
-            get_ep_all2all_manager().clean_buffers()
+            mgr = get_ep_all2all_manager()
+            mgr.clean_buffers()
+            # clean_buffers wiped the mask state; replay masks for all
+            # previously removed ranks (original DP coordinates).
+            tp_size = self.worker.parallel_config.tensor_parallel_size
+            for ep_rank in compute_dead_ep_ranks(params["dead_dp_ranks"], tp_size):
+                mgr.update_mask(ep_rank, masked=True)
             world_size = self.worker.parallel_config.world_size
             port = params["new_stateless_dp_group_ports"][self.worker.rank % world_size]
             reinit_gloo_group(
@@ -88,7 +94,9 @@ class WorkerSentinel:
         self.worker.parallel_config.data_parallel_master_ip = (
             self.data_parallel_master_ip
         )
-        removed_dp_ranks = params["removed_dp_ranks"]
+        # Cumulative dead set in original DP coordinates (covers ranks removed
+        # by earlier scale-downs, whose masks clean_buffers wiped).
+        dead_dp_ranks = params["dead_dp_ranks"]
         new_dp_size = params["new_dp_size"]
         new_dp_rank = params["new_dp_rank"]
         tp_size = self.worker.parallel_config.tensor_parallel_size
@@ -97,7 +105,7 @@ class WorkerSentinel:
         mgr = get_ep_all2all_manager()
         mgr.clean_buffers()
 
-        dead_ep_ranks = compute_dead_ep_ranks(removed_dp_ranks, tp_size)
+        dead_ep_ranks = compute_dead_ep_ranks(dead_dp_ranks, tp_size)
         for ep_rank in sorted(dead_ep_ranks):
             mgr.update_mask(ep_rank, masked=True)
 
