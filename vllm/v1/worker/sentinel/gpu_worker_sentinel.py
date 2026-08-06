@@ -8,7 +8,7 @@ from vllm.config import set_current_vllm_config
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
-    reinit_gloo_group,
+    reinit_gloo_pg,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -77,15 +77,19 @@ class WorkerSentinel:
                 mgr.update_mask(ep_rank, masked=True)
             world_size = self.worker.parallel_config.world_size
             port = params["new_stateless_dp_group_ports"][self.worker.rank % world_size]
-            reinit_gloo_group(
-                get_dp_group(),
-                self.data_parallel_master_ip,
-                port,
-                self.dp_rank,
-                self.dp_size,
+            dp_group = get_dp_group()
+            dp_group.cpu_group = reinit_gloo_pg(
+                dp_group.cpu_group,
+                master_ip=self.data_parallel_master_ip,
+                port=port,
+                rank=params["dp_group_rank"],
+                size=params["dp_group_size"],
             )
-            reinit_eplb_gloo_groups(params, self.data_parallel_master_ip)
-            refresh_eplb_communicator_group(self.worker.model_runner)
+            dp_group.dead_dp_ranks = set(params["dead_dp_ranks"])
+
+            if not self.worker.model_runner.eep_eplb_suppressed:
+                reinit_eplb_gloo_groups(params, self.data_parallel_master_ip)
+                refresh_eplb_communicator_group(self.worker.model_runner)
 
     def scale_down(self, ft_request: FaultToleranceRequest):
         torch.accelerator.synchronize()
@@ -97,8 +101,6 @@ class WorkerSentinel:
         # Cumulative dead set in original DP coordinates (covers ranks removed
         # by earlier scale-downs, whose masks clean_buffers wiped).
         dead_dp_ranks = params["dead_dp_ranks"]
-        new_dp_size = params["new_dp_size"]
-        new_dp_rank = params["new_dp_rank"]
         tp_size = self.worker.parallel_config.tensor_parallel_size
 
         self._clean_worker_state()
@@ -114,31 +116,24 @@ class WorkerSentinel:
 
         world_size = self.worker.parallel_config.world_size
         port = params["new_stateless_dp_group_ports"][self.worker.rank % world_size]
-        reinit_gloo_group(
-            get_dp_group(),
-            self.data_parallel_master_ip,
-            port,
-            new_dp_rank,
-            new_dp_size,
+        dp_group = get_dp_group()
+        dp_group.cpu_group = reinit_gloo_pg(
+            dp_group.cpu_group,
+            master_ip=self.data_parallel_master_ip,
+            port=port,
+            rank=params["dp_group_rank"],
+            size=params["dp_group_size"],
         )
-        self.worker.parallel_config.data_parallel_size = new_dp_size
-        self.worker.parallel_config.data_parallel_rank = new_dp_rank
-        self.dp_rank = new_dp_rank
-        self.dp_size = new_dp_size
-
-        if self.worker.use_v2_model_runner:
-            runner = cast("GPUModelRunnerV2", self.worker.model_runner)
-            runner.dp_size = new_dp_size
-            runner.dp_rank = new_dp_rank
+        dp_group.dead_dp_ranks = set(dead_dp_ranks)
 
         self.worker.model_runner.eep_eplb_suppressed = True
         self._reset_eplb_async_state()
 
         logger.info(
-            "[FT] Worker scale_down complete: dp_size=%d, dp_rank=%d, "
-            "dead_ep_ranks=%s, eplb_suppressed=True",
-            new_dp_size,
-            new_dp_rank,
+            "[FT] Worker scale_down complete: dp_group_size=%d, "
+            "dp_group_rank=%d, dead_ep_ranks=%s, eplb_suppressed=True",
+            params["dp_group_size"],
+            params["dp_group_rank"],
             sorted(dead_ep_ranks),
         )
 

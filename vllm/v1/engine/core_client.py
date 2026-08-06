@@ -999,14 +999,8 @@ class AsyncMPClient(MPClient):
         # locally-cached engine status
         self._engine_status: dict[int, dict] = {}
         if self.vllm_config.parallel_config.enable_fault_tolerance:
-            dp_size = self.vllm_config.parallel_config.data_parallel_size
             self._engine_status = {
-                rank: {
-                    "id": rank,
-                    "status": "healthy",
-                    "rank": rank,
-                    "dp_size": dp_size,
-                }
+                rank: {"id": rank, "status": "healthy"}
                 for rank in self.engine_ranks_managed
             }
         try:
@@ -1246,7 +1240,7 @@ class AsyncMPClient(MPClient):
 
     async def get_status(self):
         return {
-            "schema_version": 2,
+            "schema_version": 1,
             "total_engines": len(self.engine_ranks_managed),
             "engines": list(self._engine_status.values()),
         }

@@ -20,7 +20,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
-    reinit_gloo_group,
+    reinit_gloo_pg,
 )
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import init_logger
@@ -258,7 +258,9 @@ def reinit_eplb_gloo_groups(
         group = get_group()
         if group is None or group.cpu_group is None:
             continue
-        reinit_gloo_group(group, master_ip, port, group.rank_in_group, group.world_size)
+        group.cpu_group = reinit_gloo_pg(
+            group.cpu_group, master_ip, port, group.rank_in_group, group.world_size
+        )
         logger.info("[FT] Reinited %s Gloo group on port %d", port_key, port)
 
 
