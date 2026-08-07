@@ -240,8 +240,7 @@ class EngineCoreSentinel:
             self._recovering = False
 
     def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
-        # Workers replay masks for the cumulative dead set (original
-        # coordinates), which clean_buffers would otherwise wipe.
+        # Workers replay masks for the cumulative dead set
         ft_request.params.setdefault("dead_dp_ranks", sorted(self._dead_dp_ranks))
         return self._reinit_dp_and_dispatch_command(ft_request)
 
