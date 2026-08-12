@@ -288,6 +288,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dp_rank=self.dp_rank,
             need_eager=is_profile,
             dp_sync=dp_sync,
+            parallel_config=self.vllm_config.parallel_config,
         )
         num_tokens_across_dp = (
             prefill_batch_sync.num_tokens_across_dp
@@ -342,6 +343,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            parallel_config=self.vllm_config.parallel_config,
         )
         num_tokens_across_dp = (
             decode_batch_sync.num_tokens_across_dp
