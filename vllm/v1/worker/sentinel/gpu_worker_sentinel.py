@@ -141,9 +141,10 @@ class WorkerSentinel:
         )
 
     def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
-        """Return the current all2all active mask from the FT backend."""
-        mask = get_ep_all2all_manager().query_active_mask()
-        return {"mask": mask.tolist()}
+        """Query the mask on a side stream."""
+        with torch.cuda.stream(torch.cuda.Stream()):
+            mask = get_ep_all2all_manager().query_active_mask()
+            return {"mask": mask.tolist()}
 
     def _reinit_eplb_groups(self, params: dict, master_ip: str) -> None:
         """Reinit the EP/EPLB Gloo groups and refresh the EPLB

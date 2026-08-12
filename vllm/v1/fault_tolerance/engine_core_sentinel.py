@@ -16,6 +16,7 @@ from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.engine import (
@@ -300,12 +301,15 @@ class EngineCoreSentinel:
         num_clients: int,
     ) -> None:
         """Rebuild dp_store when the old master (rank 0) was removed."""
+        timeout = get_cpu_distributed_timeout_or_none()
+        if timeout is None:
+            timeout = timedelta(seconds=self.engine_recovery_timeout_sec)
         self.engine.dp_store = TCPStore(
             host,
             port,
             num_clients,
             is_master=is_master,
-            timeout=timedelta(seconds=self.engine_recovery_timeout_sec),
+            timeout=timeout,
         )
 
     def _reinit_dp_and_dispatch_command(
