@@ -382,6 +382,9 @@ class EngineCoreSentinel:
         worker_params["new_eplb_group_port"] = self._coordinate_ports(
             "ft_worker_eplb_port", dense_rank, recovery_round
         )[0]
+        if parallel_config.tensor_parallel_size > 1:
+            # The TP group is engine-local; no store coordination needed.
+            worker_params["new_tp_group_port"] = get_open_port()
 
         engine_port = self._coordinate_ports(
             "ft_engine_dp_port", dense_rank, recovery_round

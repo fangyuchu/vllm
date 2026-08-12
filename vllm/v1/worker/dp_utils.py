@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.config import ParallelConfig
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.ubatch_utils import (
     check_ubatch_thresholds,
@@ -148,6 +148,15 @@ def _synchronize_dp_ranks(
         cudagraph_mode=cudagraph_mode,
         parallel_config=parallel_config,
     )
+
+    # Per-step barrier over the TP cpu group: a faulted sibling stops
+    # arriving, so survivors fail here on the host instead of leaving
+    # an orphaned TP collective running on device.
+    if (
+        parallel_config.enable_fault_tolerance
+        and parallel_config.tensor_parallel_size > 1
+    ):
+        dist.barrier(group=get_tp_group().cpu_group)
 
     # Synchronize cudagraph_mode across ranks first (take min).
     # This is needed before DP padding decision since we use the synced

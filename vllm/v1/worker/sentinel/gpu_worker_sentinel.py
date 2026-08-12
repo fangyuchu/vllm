@@ -9,6 +9,7 @@ from vllm.distributed import (
     get_dp_group,
     get_ep_group,
     get_eplb_group,
+    get_tp_group,
     stateless_destroy_torch_distributed_process_group,
     stateless_init_torch_distributed_process_group,
 )
@@ -99,6 +100,17 @@ class WorkerSentinel:
                 and not self.worker.model_runner.eep_eplb_suppressed
             ):
                 self._reinit_eplb_groups(params, master_ip)
+        if self.worker.parallel_config.tensor_parallel_size > 1:
+            # The per-step TP barrier (dp_utils) leaves the group in a
+            # timed-out state on fault; rebuild it for a clean slate.
+            tp_group = get_tp_group()
+            _reinit_cpu_group(
+                tp_group,
+                "127.0.0.1",
+                params["new_tp_group_port"],
+                tp_group.rank_in_group,
+                tp_group.world_size,
+            )
 
     def scale_down(self, ft_request: FaultToleranceRequest):
         model_runner = self.worker.model_runner
