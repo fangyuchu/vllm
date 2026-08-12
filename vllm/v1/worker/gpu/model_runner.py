@@ -1460,6 +1460,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
+            parallel_config=self.parallel_config,
             max_query_len=max_query_len,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
