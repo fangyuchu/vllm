@@ -183,6 +183,7 @@ def test_wait_for_engine_startup_reports_watched_process_exit():
                 [CoreEngine()],
                 parallel_config,  # type: ignore[arg-type]
                 coordinated_dp=False,
+                send_parallel_config=False,
                 cache_config=None,  # type: ignore[arg-type]
                 launch=launch,
             )
