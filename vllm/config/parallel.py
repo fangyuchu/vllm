@@ -4,6 +4,7 @@
 import os
 import socket
 from collections.abc import Callable
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import regex as re
@@ -606,6 +607,11 @@ class ParallelConfig:
         Client manages local EngineCores in hybrid and external LB case.
         """
         return self.data_parallel_external_lb or self.data_parallel_hybrid_lb
+
+    @property
+    def cpu_distributed_timeout(self) -> timedelta | None:
+        seconds = self.cpu_distributed_timeout_seconds
+        return timedelta(seconds=seconds) if seconds is not None else None
 
     def get_next_dp_init_port(self) -> int:
         """
