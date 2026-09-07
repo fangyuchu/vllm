@@ -523,14 +523,34 @@ def get_cached_tcp_store_client(host: str, port: int) -> TCPStore:
     return TCPStore(host, port, is_master=False, wait_for_workers=False)
 
 
+# Whether this process has entered steady state — init (weight load, KV setup,
+# graph capture) is done and ranks step in lockstep.
+_steady_state_entered = False
+
+
+def enter_steady_state() -> None:
+    global _steady_state_entered
+    _steady_state_entered = True
+
+
+def steady_state_entered() -> bool:
+    return _steady_state_entered
+
+
 def get_cpu_distributed_timeout_or_none() -> timedelta | None:
     from vllm.config import get_current_vllm_config_or_none
 
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
-    timeout_seconds = vllm_config.parallel_config.cpu_distributed_timeout_seconds
-    return timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.enable_fault_tolerance and not _steady_state_entered:
+        return None
+    return parallel_config.cpu_distributed_timeout
+
+
+def set_gloo_backend_timeout(group: ProcessGroup, timeout: timedelta) -> None:
+    group._get_backend(torch.device("cpu"))._set_default_timeout(timeout)
 
 
 def get_distributed_timeout_or_none() -> timedelta | None:
@@ -582,6 +602,7 @@ def stateless_init_torch_distributed_process_group(
     group_name: str | None = None,
     return_store: bool = False,
     listen_socket: socket.socket | None = None,
+    timeout: timedelta | None = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -621,15 +642,16 @@ def stateless_init_torch_distributed_process_group(
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
-    timeout = _get_default_timeout(backend)
-    if backend == "gloo":
-        gloo_timeout = get_cpu_distributed_timeout_or_none()
-        if gloo_timeout is not None:
-            timeout = gloo_timeout
-    else:
-        device_timeout = get_distributed_timeout_or_none()
-        if device_timeout is not None:
-            timeout = device_timeout
+    if timeout is None:
+        timeout = _get_default_timeout(backend)
+        if backend == "gloo":
+            gloo_timeout = get_cpu_distributed_timeout_or_none()
+            if gloo_timeout is not None:
+                timeout = gloo_timeout
+        else:
+            device_timeout = get_distributed_timeout_or_none()
+            if device_timeout is not None:
+                timeout = device_timeout
 
     if listen_socket is not None:
         store = create_tcp_store(
