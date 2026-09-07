@@ -17,7 +17,9 @@ from torch.distributed.distributed_c10d import Backend, _get_default_timeout
 from vllm.config import set_current_vllm_config
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.distributed.utils import (
+    enter_steady_state,
     init_gloo_process_group,
+    set_gloo_backend_timeout,
 )
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
@@ -68,6 +70,28 @@ class EngineCoreSentinel:
         after a scale_down the engine never idle-pauses and keeps stepping
         dummy batches instead."""
         return bool(self._dead_dp_ranks)
+
+    def activate_steady_state_cpu_timeout(self) -> None:
+        """Set gloo cpu groups to the configured steady-state timeout.
+        Called once before the busy loop starts, after all init (weight
+        load, KV, graph capture, handshakes) is done."""
+        enter_steady_state()
+        timeout_seconds = self.parallel_config.cpu_distributed_timeout_seconds
+        if timeout_seconds is None:
+            return
+        timeout = timedelta(seconds=timeout_seconds)
+        if self._initial_dp_size > 1:
+            set_gloo_backend_timeout(
+                cast("DPEngineCoreProc", self.engine).dp_group, timeout
+            )
+        self.engine.model_executor.collective_rpc(
+            "handle_ft_command",
+            args=(
+                FaultToleranceRequest(
+                    instruction="activate_steady_state_cpu_timeout", params={}
+                ),
+            ),
+        )
 
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
         """Dispatch an FT command by instruction name."""
@@ -421,6 +445,8 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
     """Wrap the busy loop to catch faults and delegate recovery."""
 
     def run_with_fault_tolerance(self: "EngineCoreProc"):
+        if self.enable_fault_tolerance:
+            self.ft_sentinel.activate_steady_state_cpu_timeout()
         while True:
             try:
                 busy_loop_func(self)
