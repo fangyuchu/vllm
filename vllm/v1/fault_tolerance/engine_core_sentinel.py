@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 import torch
 import torch.distributed as dist
-from torch.distributed import PrefixStore, TCPStore
+from torch.distributed import PrefixStore, ProcessGroup, TCPStore
 from torch.distributed.distributed_c10d import Backend, _get_default_timeout
 
 from vllm.config import set_current_vllm_config
@@ -44,9 +44,12 @@ logger = init_logger(__name__)
 
 FT_UTILITY_METHOD = "handle_fault_tolerance"
 
-# Fixed rendezvous step for steady-state cpu timeout activation: by then,
-# sustained traffic is assumed to have reached every rank.
-STEADY_STATE_ACTIVATION_STEP = 32
+
+def _all_reduce_served_real(dp_group: ProcessGroup, served_real: bool) -> bool:
+    """SUM-reduce the served flag over the DP group; True if all ranks set it."""
+    tensor = torch.tensor([int(served_real)], dtype=torch.int32, device="cpu")
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=dp_group)
+    return tensor.item() == dp_group.size()
 
 
 class EngineCoreSentinel:
@@ -67,6 +70,7 @@ class EngineCoreSentinel:
         self._initial_dp_size = parallel_config.data_parallel_size
         self._dead_dp_ranks: set[int] = set()
         self._steady_state_activated = False
+        self._served_real_request = False
 
     @property
     def coordinator_disabled(self) -> bool:
@@ -76,13 +80,23 @@ class EngineCoreSentinel:
         dummy batches instead."""
         return bool(self._dead_dp_ranks)
 
-    def maybe_activate_steady_state_cpu_timeout(self, step_counter: int) -> None:
-        """Activate the steady-state cpu timeout once: at a fixed rendezvous step for
-        dp>1 so all engines activate together after first-request cold costs."""
+    def mark_served_real_request(self) -> None:
+        """The first real step pays a one-time cold cost; set once and never
+        reset (recovery does not re-pay it)."""
+        self._served_real_request = True
+
+    def maybe_activate_steady_state_cpu_timeout(self) -> None:
+        """Activate the steady-state cpu timeout once: for dp>1 at the first
+        DP rendezvous where all alive engines have served a real request
+        (AND-reduced over the engine DP group), so activation always lands
+        after every engine's one-time first-request cold cost. dp=1 activates
+        immediately."""
         if self._steady_state_activated:
             return
-        if self._initial_dp_size > 1 and step_counter < STEADY_STATE_ACTIVATION_STEP:
-            return
+        if self._initial_dp_size > 1:
+            dp_group = cast("DPEngineCoreProc", self.engine).dp_group
+            if not _all_reduce_served_real(dp_group, self._served_real_request):
+                return
         self._steady_state_activated = True
         enter_steady_state()
         timeout_seconds = self.parallel_config.cpu_distributed_timeout_seconds
@@ -102,9 +116,8 @@ class EngineCoreSentinel:
             ),
         )
         logger.info(
-            "[FT] Steady-state cpu timeout activated on engine %d at step %s",
+            "[FT] Steady-state cpu timeout activated on engine %d",
             self.engine_index,
-            step_counter,
         )
 
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
@@ -459,8 +472,12 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
     """Wrap the busy loop to catch faults and delegate recovery."""
 
     def run_with_fault_tolerance(self: "EngineCoreProc"):
-        if self.enable_fault_tolerance:
-            self.ft_sentinel.maybe_activate_steady_state_cpu_timeout(step_counter=1)
+        if (
+            self.enable_fault_tolerance
+            and self.vllm_config.parallel_config.data_parallel_size == 1
+        ):
+            # dp=1 has no DP rendezvous; arm before the first real step.
+            self.ft_sentinel.maybe_activate_steady_state_cpu_timeout()
         while True:
             try:
                 busy_loop_func(self)
