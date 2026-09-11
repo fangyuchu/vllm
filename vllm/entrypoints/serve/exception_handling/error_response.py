@@ -29,6 +29,7 @@ def create_error_response(
         )
 
         from vllm.exceptions import (
+            EngineFaultedError,
             VLLMClientError,
             VLLMNotFoundError,
             VLLMServerError,
@@ -52,6 +53,10 @@ def create_error_response(
             # Any other client-caused error defaults to 400.
             err_type = "BadRequestError"
             status_code = HTTPStatus.BAD_REQUEST
+            param = None
+        elif isinstance(exc, EngineFaultedError):
+            err_type = "ServiceUnavailableError"
+            status_code = exc.http_status
             param = None
         elif isinstance(exc, GenerationError):
             err_type = "InternalServerError"
