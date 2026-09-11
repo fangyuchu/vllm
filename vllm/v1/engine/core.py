@@ -2230,6 +2230,8 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.process_input_queue_block = True
 
             executed = self._process_engine_step()
+            if executed and self.enable_fault_tolerance:
+                self.ft_sentinel.mark_served_real_request()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -2302,7 +2304,7 @@ class DPEngineCoreProc(EngineCoreProc):
         )
 
         if self.enable_fault_tolerance:
-            self.ft_sentinel.maybe_activate_steady_state_cpu_timeout(self.step_counter)
+            self.ft_sentinel.maybe_activate_steady_state_cpu_timeout()
 
         if pause_consensus:
             self.ignore_start_dp_wave = True
