@@ -189,6 +189,13 @@ class MultiprocExecutor(Executor):
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
+        # Worker publishes [entered_epoch, completed_epoch] here so EngineCore
+        # can inspect a Worker blocked inside a DP metadata collective without
+        # issuing another RPC through the already-busy command queue.
+        self.elastic_ep_dp_collective_states = [
+            torch.full((2,), -1, dtype=torch.int64).share_memory_()
+            for _ in range(self.local_world_size)
+        ]
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
@@ -217,6 +224,9 @@ class MultiprocExecutor(Executor):
                         distributed_init_method=distributed_init_method,
                         input_shm_handle=scheduler_output_handle,
                         shared_worker_lock=shared_worker_lock,
+                        elastic_ep_dp_collective_state=(
+                            self.elastic_ep_dp_collective_states[local_rank]
+                        ),
                         is_driver_worker=is_driver_worker,
                         inherited_fds=inherited_fds,
                     )
@@ -383,6 +393,19 @@ class MultiprocExecutor(Executor):
 
     def execute_dummy_batch(self) -> None:
         self.collective_rpc("execute_dummy_batch", unique_reply_rank=self.output_rank)
+
+    def get_elastic_ep_dp_collective_states(self) -> list[tuple[int, int]]:
+        """Return stable snapshots of local Worker serving-DP epochs."""
+        snapshots = []
+        for state in self.elastic_ep_dp_collective_states:
+            while True:
+                entered_before = int(state[0].item())
+                completed = int(state[1].item())
+                entered_after = int(state[0].item())
+                if entered_before == entered_after and completed <= entered_after:
+                    snapshots.append((entered_after, completed))
+                    break
+        return snapshots
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         # OPTIMIZATION: Get output only from a single worker (output_rank)
@@ -703,6 +726,7 @@ class WorkerProc:
         distributed_init_method: str,
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
+        elastic_ep_dp_collective_state: torch.Tensor,
         is_driver_worker: bool,
     ):
         self.rank = rank
@@ -718,6 +742,7 @@ class WorkerProc:
             "distributed_init_method": distributed_init_method,
             "is_driver_worker": is_driver_worker,
             "shared_worker_lock": shared_worker_lock,
+            "elastic_ep_dp_collective_state": (elastic_ep_dp_collective_state),
         }
         wrapper.init_worker(all_kwargs)
         self.worker = wrapper
@@ -767,6 +792,7 @@ class WorkerProc:
         distributed_init_method: str,
         input_shm_handle,  # Receive SchedulerOutput
         shared_worker_lock: LockType,
+        elastic_ep_dp_collective_state: torch.Tensor,
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
     ) -> UnreadyWorkerProcHandle:
@@ -787,6 +813,7 @@ class WorkerProc:
             "ready_pipe": ready_writer,
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
+            "elastic_ep_dp_collective_state": elastic_ep_dp_collective_state,
             "is_driver_worker": is_driver_worker,
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],

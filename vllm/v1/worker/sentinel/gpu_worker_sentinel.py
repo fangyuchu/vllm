@@ -91,6 +91,7 @@ class WorkerSentinel:
                 "(VLLM_USE_V2_MODEL_RUNNER=1)."
             )
 
+    @torch.inference_mode()
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""
         with set_current_vllm_config(self.worker.vllm_config):

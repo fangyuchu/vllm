@@ -1503,11 +1503,17 @@ def _init_stateless_group(
     coord_store: Store,
     use_device_communicator: bool = True,
     use_all2all: bool = False,
+    global_rank: int | None = None,
+    global_world_size: int | None = None,
 ) -> "StatelessGroupCoordinator":
     """Create a StatelessGroupCoordinator with the given parameters."""
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
     world = get_world_group()
+    if global_rank is None:
+        global_rank = world.rank
+    if global_world_size is None:
+        global_world_size = world.world_size
     return StatelessGroupCoordinator(
         group_ranks=group_ranks,
         local_rank=world.local_rank,
@@ -1516,8 +1522,8 @@ def _init_stateless_group(
         group_name=group_name,
         host=host,
         coord_store=coord_store,
-        global_rank=world.rank,
-        global_world_size=world.world_size,
+        global_rank=global_rank,
+        global_world_size=global_world_size,
         use_all2all=use_all2all,
     )
 
@@ -1908,6 +1914,13 @@ def init_distributed_environment(
 
     global _WORLD, _NODE_COUNT, _INNER_DP_WORLD
     if enable_elastic_ep:
+        assert config is not None
+        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            from vllm.distributed.elastic_ep.readiness import (
+                publish_worker_dist_init_ready,
+            )
+
+            publish_worker_dist_init_ready(config.parallel_config, rank)
         _init_elastic_ep_world(config, local_rank, backend, rank, world_size)
         return
     if _WORLD is None:

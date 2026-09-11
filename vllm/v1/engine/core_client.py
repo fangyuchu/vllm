@@ -1106,7 +1106,7 @@ class AsyncMPClient(MPClient):
         self._engine_status: dict[int, dict] = {}
         if self.vllm_config.parallel_config.enable_fault_tolerance:
             self._engine_status = {
-                rank: {"id": rank, "status": "healthy"}
+                rank: {"id": rank, "dp_rank": rank, "status": "healthy"}
                 for rank in self.engine_ranks_managed
             }
         try:

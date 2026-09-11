@@ -53,6 +53,7 @@ class UniProcExecutor(Executor):
         """Initialize the worker and load the model."""
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
         distributed_init_method, rank, local_rank = self._distributed_args()
+        self.elastic_ep_dp_collective_state = torch.full((2,), -1, dtype=torch.int64)
         kwargs = dict(
             vllm_config=self.vllm_config,
             local_rank=local_rank,
@@ -60,6 +61,7 @@ class UniProcExecutor(Executor):
             distributed_init_method=distributed_init_method,
             is_driver_worker=True,
             shared_worker_lock=Lock(),
+            elastic_ep_dp_collective_state=(self.elastic_ep_dp_collective_state),
         )
 
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
@@ -143,6 +145,10 @@ class UniProcExecutor(Executor):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.collective_rpc("take_draft_token_ids", single_value=True)
+
+    def get_elastic_ep_dp_collective_states(self) -> list[tuple[int, int]]:
+        state = self.elastic_ep_dp_collective_state
+        return [(int(state[0].item()), int(state[1].item()))]
 
     def check_health(self) -> None:
         # UniProcExecutor will always be healthy as long as

@@ -308,6 +308,9 @@ class ReconfigureDistributedRequest(msgspec.Struct):
     new_data_parallel_master_port: int
     new_data_parallel_master_port_list: list[int]
     coord_store_port: int
+    # Stable identifier shared by every rank participating in one external
+    # reconfiguration. Empty for legacy/internal callers.
+    operation_id: str = ""
 
 
 class ReconfigureRankType(enum.IntEnum):

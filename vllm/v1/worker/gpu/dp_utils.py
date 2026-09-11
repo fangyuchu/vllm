@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -17,6 +21,66 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphManager,
 )
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
+
+_DP_SYNC_OVERRIDE: ContextVar[tuple[ProcessGroup, Callable[[], None] | None] | None] = (
+    ContextVar("vllm_dp_sync_override", default=None)
+)
+
+# Shared CPU tensor layout: [entered_epoch, completed_epoch]. The executor
+# owns the storage so EngineCore can observe a Worker that is blocked in the
+# normal serving DP metadata collective without issuing another Worker RPC.
+_DP_COLLECTIVE_STATE: torch.Tensor | None = None
+
+
+def configure_dp_collective_state(state: torch.Tensor | None) -> None:
+    global _DP_COLLECTIVE_STATE
+    if state is None:
+        _DP_COLLECTIVE_STATE = None
+        return
+    if state.numel() != 2 or state.dtype != torch.int64 or state.device.type != "cpu":
+        raise ValueError("DP collective state must be a two-element CPU int64 tensor")
+    state.zero_()
+    _DP_COLLECTIVE_STATE = state
+
+
+def _enter_dp_metadata_collective() -> int | None:
+    state = _DP_COLLECTIVE_STATE
+    if state is None:
+        return None
+    epoch = int(state[0].item()) + 1
+    state[0] = epoch
+    return epoch
+
+
+def _complete_dp_metadata_collective(
+    epoch: int | None, synced_epoch: int | None = None
+) -> None:
+    if epoch is None:
+        return
+    state = _DP_COLLECTIVE_STATE
+    if state is None:
+        return
+    completed_epoch = epoch if synced_epoch is None else synced_epoch
+    state[0] = completed_epoch
+    state[1] = completed_epoch
+
+
+@contextmanager
+def override_dp_sync_group(
+    group: ProcessGroup,
+    before_all_reduce: Callable[[], None] | None = None,
+) -> Iterator[None]:
+    """Temporarily route DP graph-metadata collectives to another group.
+
+    Platform backends can use this while preparing a future DP topology. The
+    context is local to the current execution context and does not affect
+    normal serving threads.
+    """
+    token = _DP_SYNC_OVERRIDE.set((group, before_all_reduce))
+    try:
+        yield
+    finally:
+        _DP_SYNC_OVERRIDE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -62,24 +126,41 @@ def sync_cudagraph_and_dp_padding(
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    group = get_dp_group().cpu_group
-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
+    sync_override = _DP_SYNC_OVERRIDE.get()
+    if sync_override is None:
+        group = get_dp_group().cpu_group
+        before_all_reduce = None
+    else:
+        group, before_all_reduce = sync_override
+    # Capture-only collectives use an override group and must not advance the
+    # serving epoch. Normal serving collectives carry the epoch as a seventh row
+    # so ranks introduced by a previous scale-up converge to the same value.
+    collective_epoch = (
+        _enter_dp_metadata_collective() if sync_override is None else None
+    )
+    metadata_rows = 7 if collective_epoch is not None else 6
+    tensor = torch.zeros(metadata_rows, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
-    if should_skip_dp_coordination():
+    if collective_epoch is not None:
+        tensor[6][dp_rank] = collective_epoch
+    if before_all_reduce is not None:
+        before_all_reduce()
+    if should_skip_dp_coordination() and sync_override is None:
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
         dist.all_reduce(tensor, group=group)
+    synced_epoch = int(tensor[6].max().item()) if collective_epoch is not None else None
+    _complete_dp_metadata_collective(collective_epoch, synced_epoch)
 
-    # Full width, dead slots included: returned in DPSyncState, whose
-    # consumers index it by original dp_rank.
+    # Keep original-rank indexing for forward-context token counts.
     num_tokens_across_dp_full = tensor[0]
 
-    if parallel_config.enable_fault_tolerance:
+    if sync_override is None and parallel_config.enable_fault_tolerance:
         # Per-step barrier over the TP cpu group: a faulted sibling stops
         # arriving, so survivors fail here on the host instead of leaving
         # an orphaned TP collective running on device.
