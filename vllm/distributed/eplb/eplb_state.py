@@ -38,6 +38,7 @@ from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
+    get_dp_group,
     get_ep_group,
     get_eplb_group,
     get_node_count,
@@ -424,21 +425,29 @@ class EplbState:
             if self.parallel_config.enable_elastic_ep
             else model.num_redundant_experts + 1
         )
-        logical_to_physical_map = torch.full(
-            (model.num_logical_experts, max_slots_per_logical_expert),
-            -1,
+        # Build the inverse mapping on CPU and transfer each completed tensor
+        # once. Indexing a device tensor with device scalar values in this
+        # initialization loop serializes hundreds of accelerator operations
+        # and can stall an independently launched Elastic EP rank.
+        logical_to_physical_map_list = [
+            [-1] * max_slots_per_logical_expert
+            for _ in range(model.num_logical_experts)
+        ]
+        logical_replica_count_list = [0] * model.num_logical_experts
+        for physical_idx, logical_idx in enumerate(physical_to_logical_map_list):
+            replica_idx = logical_replica_count_list[logical_idx]
+            logical_to_physical_map_list[logical_idx][replica_idx] = physical_idx
+            logical_replica_count_list[logical_idx] += 1
+
+        logical_to_physical_map = torch.tensor(
+            logical_to_physical_map_list,
             device=self.device,
         )
-        logical_replica_count = torch.zeros(
-            (model.num_logical_experts,),
+        logical_replica_count = torch.tensor(
+            logical_replica_count_list,
             device=self.device,
             dtype=torch.long,
         )
-
-        for i in range(model.num_physical_experts):
-            logical_idx = physical_to_logical_map[i]
-            logical_to_physical_map[logical_idx, logical_replica_count[logical_idx]] = i
-            logical_replica_count[logical_idx] += 1
 
         # Duplicate initial mapping for all layers
         physical_to_logical_map = (
@@ -613,7 +622,13 @@ class EplbState:
             - `balancedness`: The ratio of average load to maximum load.
 
         """
-        ep_group = get_ep_group().device_group
+        # Elastic backends may preserve a larger physical EP group after a
+        # graph-preserving scale-down. EPLB state follows the live ranks.
+        ep_group = get_eplb_group().device_group
+        if is_profile:
+            self.rearrange(is_profile=True)
+            return
+
         if is_dummy:
             # Do not record load metrics for dummy steps
             for eplb_model_state in self.model_states.values():
@@ -634,7 +649,7 @@ class EplbState:
             # Sync the expert load pass for each model (main and drafter).
             # expert_load_pass: (num_moe_layers, num_physical_experts)
             expert_load_pass_list = self._sync_load_pass()
-            ep_group = get_ep_group().device_group
+            ep_group = get_eplb_group().device_group
             if ep_group.rank() == 0:
                 stats: list[tuple[str, torch.Tensor]] = []
                 for expert_load_pass, eplb_model_state in zip(
@@ -827,7 +842,7 @@ class EplbState:
             use_last_expert_load: Use the last reshuffle's logical-expert totals.
 
         """
-        ep_group = get_ep_group().device_group
+        ep_group = get_eplb_group().device_group
         ep_rank = ep_group.rank()
 
         start_event = None
@@ -890,7 +905,7 @@ class EplbState:
             # NOTE(yongji): scale down, we need to rebalance the experts on
             # remaining GPUs, transfer the experts while we haven't shutdown
             # the GPUs to be released.
-            coordinator = get_ep_group()
+            coordinator = get_eplb_group()
             assert isinstance(coordinator, StatelessGroupCoordinator)
             tcp_store_group = coordinator.tcp_store_group
             num_nodes = _node_count_with_rank_mapping(tcp_store_group, rank_mapping)
@@ -1052,10 +1067,9 @@ class EplbState:
         async worker can proceed, but the transferred weights are intentionally
         NOT applied — a full rearrange is expected to follow.
 
-        Ranks are kept in lockstep via _all_ranks_result_ready (all_reduce
-        on the EP CPU group).  The async worker's coordinated-stop collectives
-        use the separate EPLB group, so the two sets of collectives do not
-        interfere.
+        Ranks are kept in lockstep via _all_ranks_result_ready. The main
+        thread deliberately uses a different CPU group from the async worker,
+        so their collectives cannot be matched in a different order.
 
         No-op when no async cycle is in progress (rebalanced=False).
         """
@@ -1094,7 +1108,10 @@ class EplbState:
             device="cpu",
         )
         # cpu_all_reduce_ only sums, so count failed and pending ranks.
-        get_ep_group().cpu_all_reduce_(flags)
+        parallel_state = (
+            get_dp_group() if self.parallel_config.enable_elastic_ep else get_ep_group()
+        )
+        parallel_state.cpu_all_reduce_(flags)
         num_failed, num_pending = flags.tolist()
         if num_failed:
             raise RuntimeError(
@@ -1103,8 +1120,12 @@ class EplbState:
         return num_pending == 0
 
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
-        """All-reduce a list of tensors."""
-        ep_group = get_ep_group().device_group
+        """
+        All-reduce a list of tensors.
+        """
+        # Do not use the physical EP group here: it may still contain removed
+        # ranks when an elastic backend keeps that group for captured graphs.
+        ep_group = get_eplb_group().device_group
         if len(tensor_list) == 1:
             all_reduce(tensor_list[0], group=ep_group)
             return tensor_list
