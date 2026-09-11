@@ -29,6 +29,7 @@ def create_error_response(
         )
 
         from vllm.exceptions import (
+            EngineFaultedError,
             VLLMClientError,
             VLLMNotFoundError,
             VLLMServerError,
@@ -55,6 +56,10 @@ def create_error_response(
             param = None
         elif isinstance(exc, GenerationError):
             err_type = "InternalServerError"
+            status_code = exc.status_code
+            param = None
+        elif isinstance(exc, EngineFaultedError):
+            err_type = HTTPStatus.SERVICE_UNAVAILABLE.phrase
             status_code = exc.status_code
             param = None
         elif isinstance(exc, VLLMServerError):
