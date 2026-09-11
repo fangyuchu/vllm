@@ -312,10 +312,7 @@ class EngineCoreSentinel:
         # rank/size are dense over sorted(alive), while parallel_config keeps
         # the frozen original values.
         alive = sorted(set(range(self._initial_dp_size)) - dead)
-        master_ip = (
-            self.parallel_config.data_parallel_master_ip
-            or self.parallel_config.master_addr
-        )
+        master_ip = self.parallel_config.data_parallel_master_ip
         if dead_ranks is not None:
             # The lowest alive rank hosts the TCPStore master; rebuild the
             # store if that rank was just removed.
@@ -339,13 +336,13 @@ class EngineCoreSentinel:
         if self._initial_dp_size == 1:
             # dp=1 has no dp_store/dp_group; the engine still hosts the
             # recovery store for its own workers' TP group reinit.
-            params["recovery_store_port"] = self._create_recovery_store(
-                recovery_round, dense_rank=None
+            params["recovery_store_port"] = self._coordinate_recovery_store_port(
+                master_ip, recovery_round, is_master=True
             )
             return
 
-        params["recovery_store_port"] = self._create_recovery_store(
-            recovery_round, dense_rank=params["dp_group_rank"]
+        params["recovery_store_port"] = self._coordinate_recovery_store_port(
+            master_ip, recovery_round, is_master=(params["dp_group_rank"] == 0)
         )
         with set_current_vllm_config(engine.vllm_config):
             self._reinit_engine_groups(
@@ -429,28 +426,22 @@ class EngineCoreSentinel:
         stateless_destroy_torch_distributed_process_group(engine.dp_group)
         engine.dp_group = new_group
 
-    def _create_recovery_store(
-        self, recovery_round: str, dense_rank: int | None
+    def _coordinate_recovery_store_port(
+        self, master_ip: str, recovery_round: str, is_master: bool
     ) -> int:
-        """Create (dense rank 0) or discover (others) the per-round TCPStore
-        that workers use to coordinate group reinit ports. Bound via port 0
-        and held by the engine, so its port cannot be stolen."""
-        master_ip = (
-            self.parallel_config.data_parallel_master_ip
-            or self.parallel_config.master_addr
-        )
-        if dense_rank in (0, None):
+        """Create (is_master) or look up (others) the per-round TCPStore
+        that workers use to coordinate reinit ports; return its port."""
+        if is_master:
             store = create_tcp_store(
                 master_ip, 0, is_master=True, world_size=-1, wait_for_workers=False
             )
             self._recovery_store = store
-            port = store.port
-            if dense_rank is not None:
+            if self._initial_dp_size > 1:
                 key = f"ft_recovery_store_port_{recovery_round}"
                 cast("DPEngineCoreProc", self.engine).dp_store.set(
-                    key, str(port).encode()
+                    key, str(store.port).encode()
                 )
-            return port
+            return store.port
         key = f"ft_recovery_store_port_{recovery_round}"
         return int(cast("DPEngineCoreProc", self.engine).dp_store.get(key).decode())
 

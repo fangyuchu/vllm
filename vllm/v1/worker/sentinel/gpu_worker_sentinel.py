@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import socket
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 
@@ -17,7 +16,9 @@ from vllm.distributed import (
     stateless_init_torch_distributed_process_group,
 )
 from vllm.distributed.utils import (
+    allocate_group_ports,
     enter_steady_state,
+    fetch_group_ports,
     get_cached_tcp_store_client,
     set_gloo_backend_timeout,
 )
@@ -50,32 +51,23 @@ FT_BACKEND_SET = frozenset({"deepep_low_latency", "nixl_ep"})
 
 def _reinit_cpu_group(
     group: "GroupCoordinator",
-    master_ip: str,
-    port: int,
+    store: TCPStore,
+    key: str,
+    host: str,
     rank: int,
     size: int,
-    listen_socket: socket.socket | None = None,
 ) -> None:
-    """Destroy and rebuild a group's Gloo cpu_group in place."""
-    stateless_destroy_torch_distributed_process_group(group.cpu_group)
-    group.cpu_group = stateless_init_torch_distributed_process_group(
-        master_ip, port, rank, size, backend="gloo", listen_socket=listen_socket
+    """Rebuild a group's Gloo cpu_group over a port coordinated via ``store``"""
+    if rank == 0:
+        ports, socks = allocate_group_ports(store, key, host, 1)
+        port, listen_socket = ports[0], socks[0]
+    else:
+        port, listen_socket = fetch_group_ports(store, key, 1)[0], None
+    new_group = stateless_init_torch_distributed_process_group(
+        host, port, rank, size, backend="gloo", listen_socket=listen_socket
     )
-
-
-def _coord_group_port(
-    store: TCPStore, key: str, host: str, is_master: bool
-) -> tuple[int, socket.socket | None]:
-    """Master binds a fresh port (held until group init) and publishes it to
-    the recovery store; others block-read the port number."""
-    if is_master:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind((host, 0))
-        s.listen()
-        port = s.getsockname()[1]
-        store.set(key, str(port).encode())
-        return port, s
-    return int(store.get(key).decode()), None
+    stateless_destroy_torch_distributed_process_group(group.cpu_group)
+    group.cpu_group = new_group
 
 
 class WorkerSentinel:
@@ -129,19 +121,13 @@ class WorkerSentinel:
             get_ep_all2all_manager().clean_buffers()
             world_size = self.worker.parallel_config.world_size
             dp_index = self.worker.rank % world_size
-            port, sock = _coord_group_port(
+            _reinit_cpu_group(
+                get_dp_group(),
                 store,
                 f"ft_dp_port_{round_key}_{dp_index}",
                 master_ip,
-                is_master=(dp_group_rank == 0),
-            )
-            _reinit_cpu_group(
-                get_dp_group(),
-                master_ip,
-                port,
                 dp_group_rank,
                 dp_group_size,
-                listen_socket=sock,
             )
             get_dp_group().dead_dp_ranks = set(params["dead_dp_ranks"])
 
@@ -162,19 +148,13 @@ class WorkerSentinel:
             # The per-step TP barrier (dp_utils) leaves the group in a
             # timed-out state on fault; rebuild it for a clean slate.
             tp_group = get_tp_group()
-            port, sock = _coord_group_port(
+            _reinit_cpu_group(
+                tp_group,
                 store,
                 f"ft_tp_port_{round_key}_{dp_group_rank}",
                 self.worker.parallel_config.master_addr,
-                is_master=(tp_group.rank_in_group == 0),
-            )
-            _reinit_cpu_group(
-                tp_group,
-                self.worker.parallel_config.master_addr,
-                port,
                 tp_group.rank_in_group,
                 tp_group.world_size,
-                listen_socket=sock,
             )
 
     def scale_down(self, ft_request: FaultToleranceRequest):
@@ -229,21 +209,15 @@ class WorkerSentinel:
             ("eplb", get_eplb_group),
         ]:
             group = get_group()
-            port, sock = _coord_group_port(
+            _reinit_cpu_group(
+                group,
                 store,
                 f"ft_{key_suffix}_port_{round_key}",
                 master_ip,
-                is_master=(group.rank_in_group == 0),
-            )
-            _reinit_cpu_group(
-                group,
-                master_ip,
-                port,
                 group.rank_in_group,
                 group.world_size,
-                listen_socket=sock,
             )
-            logger.info("[FT] Reinited %s Gloo group on port %d", key_suffix, port)
+            logger.info("[FT] Reinited %s Gloo group", key_suffix)
 
         eplb_state = self.worker.model_runner.eplb_state
         assert eplb_state is not None
