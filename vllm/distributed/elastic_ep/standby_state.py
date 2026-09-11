@@ -44,6 +44,7 @@ def create_standby_groups(
     use_all2all: bool,
     enable_eplb: bool = True,
     backend: str | None = None,
+    new_global_rank: int | None = None,
 ) -> None:
     global \
         _STANDBY_WORLD, \
@@ -69,6 +70,8 @@ def create_standby_groups(
         backend,
         use_device_communicator=False,
         coord_store=coord_store,
+        global_rank=new_global_rank,
+        global_world_size=new_world_size_across_dp,
     )
     _STANDBY_WORLD_NODE_COUNT = _node_count(_STANDBY_WORLD.tcp_store_group)
 
@@ -85,7 +88,9 @@ def create_standby_groups(
     # Deferred to commit so the warm-up runs while the engine is paused.
     with defer_comm_warmup_on_rocm():
         _STANDBY_DP = _init_stateless_group(
-            standby_dp_ranks, "dp", master_ip, backend, coord_store=coord_store
+            standby_dp_ranks, "dp", master_ip, backend, coord_store=coord_store,
+            global_rank=new_global_rank,
+            global_world_size=new_world_size_across_dp,
         )
 
         standby_ep_ranks = (
@@ -101,6 +106,8 @@ def create_standby_groups(
             backend,
             coord_store,
             use_all2all=use_all2all,
+            global_rank=new_global_rank,
+            global_world_size=new_world_size_across_dp,
         )
 
         if enable_eplb:
@@ -110,6 +117,8 @@ def create_standby_groups(
                 master_ip,
                 backend,
                 coord_store=coord_store,
+                global_rank=new_global_rank,
+                global_world_size=new_world_size_across_dp,
             )
 
 

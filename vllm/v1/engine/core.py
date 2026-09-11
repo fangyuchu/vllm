@@ -116,6 +116,7 @@ logger = init_logger(__name__)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
+DP_STATE_SYNC_INTERVAL = 32
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -677,6 +678,10 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+
+        if getattr(self, "_eep_drain_batch_queue", False):
+            return {}, False
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -736,9 +741,10 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        drain_batch_queue = getattr(self, "_eep_drain_batch_queue", False)
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if self.scheduler.has_requests() and not drain_batch_queue:
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -1283,6 +1289,16 @@ class EngineCoreProc(EngineCore):
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
+            )
+            ft_config = vllm_config.parallel_config.fault_tolerance_config
+            logger.info(
+                "[FT_DIAG] EngineCore initialized: engine_index=%s, "
+                "dp_rank=%s, enable_fault_tolerance=%s, "
+                "engine_recovery_timeout_sec=%s",
+                self.engine_index,
+                vllm_config.parallel_config.data_parallel_rank,
+                self.enable_fault_tolerance,
+                ft_config.engine_recovery_timeout_sec,
             )
             if self.enable_fault_tolerance:
                 self.ft_sentinel = EngineCoreSentinel(
@@ -2419,6 +2435,8 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
+        self._eep_drain_batch_queue = False
+        self._eep_force_dummy_batch = False
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -2607,9 +2625,14 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
+                skip_dummy_batch = (
+                    self.eep_scaling_state is not None
+                    and self.eep_scaling_state.should_skip_dummy_batch()
+                )
                 # Execute a dummy pass when no ready requests ran, unless the
-                # engine is sleeping.
-                elif not self.model_executor.is_sleeping:
+                # engine is sleeping or the Elastic EP drain is waiting for
+                # queued work/peer epoch publication.
+                if not skip_dummy_batch and not self.model_executor.is_sleeping:
                     with self.capture_iteration_details(None) as iteration_details:
                         self.execute_dummy_batch()
                     if iteration_details is not None and not self.has_coordinator:
@@ -2659,6 +2682,15 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        if (
+            self.eep_scaling_state is not None
+            and self.eep_scaling_state.should_defer_dp_state_sync()
+        ):
+            # Preparation keeps serving through Worker-level metadata
+            # collectives. Avoid crossing any of them with the regular
+            # EngineCore DP-state all-reduce until PREPARE has finished.
+            return True
+
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
         self.step_counter += 1
         if self.step_counter != 1 and self.step_counter % self.dp_sync_interval != 0:
