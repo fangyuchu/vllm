@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -17,6 +21,66 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphManager,
 )
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
+
+_DP_SYNC_OVERRIDE: ContextVar[tuple[ProcessGroup, Callable[[], None] | None] | None] = (
+    ContextVar("vllm_dp_sync_override", default=None)
+)
+
+# Shared CPU tensor layout: [entered_epoch, completed_epoch]. The executor
+# owns the storage so EngineCore can observe a Worker that is blocked in the
+# normal serving DP metadata collective without issuing another Worker RPC.
+_DP_COLLECTIVE_STATE: torch.Tensor | None = None
+
+
+def configure_dp_collective_state(state: torch.Tensor | None) -> None:
+    global _DP_COLLECTIVE_STATE
+    if state is None:
+        _DP_COLLECTIVE_STATE = None
+        return
+    if state.numel() != 2 or state.dtype != torch.int64 or state.device.type != "cpu":
+        raise ValueError("DP collective state must be a two-element CPU int64 tensor")
+    state.zero_()
+    _DP_COLLECTIVE_STATE = state
+
+
+def _enter_dp_metadata_collective() -> int | None:
+    state = _DP_COLLECTIVE_STATE
+    if state is None:
+        return None
+    epoch = int(state[0].item()) + 1
+    state[0] = epoch
+    return epoch
+
+
+def _complete_dp_metadata_collective(
+    epoch: int | None, synced_epoch: int | None = None
+) -> None:
+    if epoch is None:
+        return
+    state = _DP_COLLECTIVE_STATE
+    if state is None:
+        return
+    completed_epoch = epoch if synced_epoch is None else synced_epoch
+    state[0] = completed_epoch
+    state[1] = completed_epoch
+
+
+@contextmanager
+def override_dp_sync_group(
+    group: ProcessGroup,
+    before_all_reduce: Callable[[], None] | None = None,
+) -> Iterator[None]:
+    """Temporarily route DP graph-metadata collectives to another group.
+
+    Platform backends can use this while preparing a future DP topology. The
+    context is local to the current execution context and does not affect
+    normal serving threads.
+    """
+    token = _DP_SYNC_OVERRIDE.set((group, before_all_reduce))
+    try:
+        yield
+    finally:
+        _DP_SYNC_OVERRIDE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -77,8 +141,7 @@ def sync_cudagraph_and_dp_padding(
     else:
         get_dp_group().cpu_all_reduce_(tensor)
 
-    # Full width, dead slots included: returned in DPSyncState, whose
-    # consumers index it by original dp_rank.
+    # Keep original-rank indexing for forward-context token counts.
     num_tokens_across_dp_full = tensor[0]
 
     if parallel_config is not None and parallel_config.enable_fault_tolerance:
