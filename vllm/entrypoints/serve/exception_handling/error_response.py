@@ -2,11 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from http import HTTPStatus
 
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorInfo,
-    ErrorResponse,
-    GenerationError,
-)
+from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.logger import init_logger
 
 from .utils import sanitize_message
@@ -53,14 +49,11 @@ def create_error_response(
             err_type = "BadRequestError"
             status_code = HTTPStatus.BAD_REQUEST
             param = None
-        elif isinstance(exc, GenerationError):
-            err_type = "InternalServerError"
-            status_code = exc.status_code
-            param = None
         elif isinstance(exc, VLLMServerError):
-            # Any other server-caused error defaults to 500.
+            # Server-caused error; honors an explicit status_code (e.g. 503
+            # for admission/FT rejections), defaulting to 500.
             err_type = "InternalServerError"
-            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            status_code = getattr(exc, "status_code", HTTPStatus.INTERNAL_SERVER_ERROR)
             param = None
         # Fallback for raw exceptions not yet migrated to VLLMError.
         # TODO(zqzten): remove these fallback handlers after migration to VLLMError

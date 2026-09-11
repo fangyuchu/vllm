@@ -3,6 +3,7 @@
 
 """Custom exceptions for vLLM."""
 
+from http import HTTPStatus
 from typing import Any
 
 
@@ -116,3 +117,18 @@ class VLLMUnprocessableEntityError(VLLMClientError):
         if self.value is not None:
             extras.append(f"value={self.value}")
         return f"{base} ({', '.join(extras)})" if extras else base
+
+
+class EngineFaultedError(VLLMServerError):
+    """Raised when the engine has faulted and is awaiting FT recovery.
+
+    Carries HTTP 503 (Service Unavailable) so that load balancers and
+    client SDKs retry the request on a different instance.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "The engine has faulted and cannot accept new requests. "
+            "Please try again later or on a different instance.",
+        )
+        self.status_code = HTTPStatus.SERVICE_UNAVAILABLE
