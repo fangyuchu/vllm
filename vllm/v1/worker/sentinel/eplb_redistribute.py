@@ -16,9 +16,11 @@ from itertools import zip_longest
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
+from vllm.distributed.eplb.eplb_state import compute_logical_maps
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -59,21 +61,6 @@ def mark_dead_expert_slots_inplace(
         physical_to_logical_map.shape[0], -1, num_local_experts
     )
     slots_by_rank[:, sorted(dead_ep_ranks)] = -1
-
-
-def check_redundancy_sufficient(
-    num_logical: int,
-    num_local_experts: int,
-    ep_world_size: int,
-    dead_ep_ranks: set[int],
-) -> None:
-    """Fail fast if the surviving slots cannot host every logical expert."""
-    alive_slots = (ep_world_size - len(dead_ep_ranks)) * num_local_experts
-    if alive_slots < num_logical:
-        raise RuntimeError(
-            f"scale_down would leave {alive_slots} expert slot(s) for "
-            f"{num_logical} logical experts. EPLB redundancy insufficient."
-        )
 
 
 def redistribute_expert_placement(
@@ -163,33 +150,22 @@ def rebuild_logical_expert_maps(
     logical_replica_count: torch.Tensor,
 ) -> None:
     """Rebuild logical_to_physical_map and logical_replica_count from
-    physical_to_logical_map, in place.
-
-    Layouts:
-    - physical_to_logical_map: [num_layers, num_physical]
-    - logical_to_physical_map: [num_layers, num_logical, max_replicas]
-    - logical_replica_count: [num_layers, num_logical]
-    """
-    num_layers = physical_to_logical_map.shape[0]
-    physical_to_logical_cpu = physical_to_logical_map.cpu()
-    replica_count_cpu = torch.zeros_like(logical_replica_count, device="cpu")
-    logical_to_physical_cpu = torch.full_like(logical_to_physical_map, -1, device="cpu")
-    for layer_idx in range(num_layers):
-        layer_p2l = physical_to_logical_cpu[layer_idx].tolist()
-        for phys_idx, logical_id in enumerate(layer_p2l):
-            if logical_id < 0:
-                continue
-            count = int(replica_count_cpu[layer_idx, logical_id])
-            if count < logical_to_physical_cpu.shape[2]:
-                logical_to_physical_cpu[layer_idx, logical_id, count] = phys_idx
-            replica_count_cpu[layer_idx, logical_id] += 1
-    logical_replica_count.copy_(replica_count_cpu)
-    logical_to_physical_map.copy_(logical_to_physical_cpu)
+    physical_to_logical_map, in place."""
+    new_l2p, new_lrc = compute_logical_maps(
+        physical_to_logical_map.cpu(), logical_replica_count.shape[1]
+    )
+    logical_replica_count.copy_(new_lrc)
+    # Replica counts only shrink on scale-down, so the existing
+    # max_replicas width is always sufficient.
+    pad = logical_to_physical_map.shape[2] - new_l2p.shape[2]
+    assert pad >= 0
+    logical_to_physical_map.copy_(F.pad(new_l2p, (0, pad), value=-1))
 
 
 def rebuild_model_expert_maps(
     model: torch.nn.Module,
     physical_to_logical_map: torch.Tensor,
+    num_local_experts: int,
 ) -> None:
     """Rebuild each FusedMoE layer's model-side _expert_map from
     physical_to_logical_map."""
@@ -201,15 +177,11 @@ def rebuild_model_expert_maps(
         expert_map = getattr(routed, "_expert_map", None)
         if expert_map is None:
             continue
-        num_local = (
-            physical_to_logical_map.shape[1]
-            // layer.moe_config.moe_parallel_config.ep_size
-        )
-        local_start = ep_rank * num_local
+        local_start = ep_rank * num_local_experts
         p2l_row = physical_to_logical_map[layer_idx].cpu()
 
         new_map = torch.full_like(expert_map, -1)
-        for local_idx in range(num_local):
+        for local_idx in range(num_local_experts):
             lid = int(p2l_row[local_start + local_idx].item())
             if 0 <= lid < new_map.shape[0]:
                 new_map[lid] = local_idx
@@ -220,18 +192,15 @@ def reload_experts_from_disk(
     model: torch.nn.Module,
     vllm_config: VllmConfig,
     reload_set: set[tuple[int, int]],
-) -> int:
+) -> None:
     """Reload specific (moe_layer_idx, logical_expert) weights from disk.
 
     Args:
         reload_set: {(moe_layer_idx, logical_expert_id), ...} from
         redistribute_expert_placement.
-
-    Returns:
-        Number of parameter names loaded.
     """
     if not reload_set:
-        return 0
+        return
 
     from vllm.model_executor.model_loader import get_model_loader
 
@@ -304,7 +273,6 @@ def reload_experts_from_disk(
         "[FT] Expert weight reload complete: loaded=%d tensors.",
         len(loaded) if loaded else 0,
     )
-    return len(loaded) if loaded else 0
 
 
 def reset_eplb_async_state(model_runner: GPUModelRunner) -> None:
