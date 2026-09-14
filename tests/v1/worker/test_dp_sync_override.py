@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import (
     override_dp_sync_group,
@@ -81,3 +82,43 @@ def test_capture_override_does_not_consult_faulted_serving_groups():
             parallel_config=config,
         )
     barrier.assert_not_called()
+
+
+def test_fresh_elastic_group_supports_fault_tolerant_dp_sync():
+    # Elastic groups bypass GroupCoordinator.__init__, but must expose the
+    # same FT topology state before the first profiling/model step.
+    with (
+        patch("vllm.distributed.parallel_state._WORLD", None),
+        patch(
+            "vllm.distributed.stateless_coordinator._allocate_group_ports",
+            return_value=([12301, 12302, 12303], []),
+        ),
+        patch(
+            "vllm.distributed.stateless_coordinator."
+            "stateless_init_torch_distributed_process_group"
+        ),
+        patch("vllm.distributed.stateless_coordinator.StatelessProcessGroup.create"),
+    ):
+        group = StatelessGroupCoordinator(
+            [[0, 1]], 0, "gloo", False, MagicMock(), group_name="dp"
+        )
+
+    descriptor = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE, num_tokens=1, num_reqs=1
+    )
+    with (
+        patch("vllm.v1.worker.gpu.dp_utils.get_dp_group", return_value=group),
+        patch("vllm.v1.worker.gpu.dp_utils.dist.all_reduce"),
+    ):
+        sync_cudagraph_and_dp_padding(
+            None,
+            descriptor,
+            num_tokens=1,
+            num_reqs=1,
+            uniform_token_count=None,
+            dp_size=2,
+            dp_rank=0,
+            parallel_config=SimpleNamespace(
+                enable_fault_tolerance=True, tensor_parallel_size=1
+            ),
+        )
