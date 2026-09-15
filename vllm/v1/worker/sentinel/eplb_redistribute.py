@@ -16,11 +16,9 @@ from itertools import zip_longest
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
-from vllm.distributed.eplb.eplb_state import compute_logical_maps
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -142,24 +140,6 @@ def redistribute_expert_placement(
         )
 
     return reassignments
-
-
-def rebuild_logical_expert_maps(
-    physical_to_logical_map: torch.Tensor,
-    logical_to_physical_map: torch.Tensor,
-    logical_replica_count: torch.Tensor,
-) -> None:
-    """Rebuild logical_to_physical_map and logical_replica_count from
-    physical_to_logical_map, in place."""
-    new_l2p, new_lrc = compute_logical_maps(
-        physical_to_logical_map.cpu(), logical_replica_count.shape[1]
-    )
-    logical_replica_count.copy_(new_lrc)
-    # Replica counts only shrink on scale-down, so the existing
-    # max_replicas width is always sufficient.
-    pad = logical_to_physical_map.shape[2] - new_l2p.shape[2]
-    assert pad >= 0
-    logical_to_physical_map.copy_(F.pad(new_l2p, (0, pad), value=-1))
 
 
 def rebuild_model_expert_maps(
