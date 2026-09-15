@@ -49,8 +49,7 @@ def sync_cudagraph_and_dp_padding(
     max_query_len: int | None = None,
     num_active_loras: int = 0,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
-    """
-    Coordinates the batch descriptor and DP padding across all ranks.
+    """Coordinates the batch descriptor and DP padding across all ranks.
 
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
