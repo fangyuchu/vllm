@@ -300,6 +300,11 @@ class EngineCoreSentinel:
         recovery_round = ft_request.request_id
         params["recovery_round"] = recovery_round
         if self._initial_dp_size == 1:
+            # dp=1 has no dp_store/dp_group; the engine still hosts the
+            # recovery store for its own workers' TP group reinit.
+            params["recovery_store_port"] = self._coordinate_recovery_store_port(
+                master_ip, recovery_round, is_master=True
+            )
             return
 
         store = cast("DPEngineCoreProc", self.engine).dp_store
@@ -350,9 +355,8 @@ class EngineCoreSentinel:
         params = ft_request.params
         recovery_round = params["recovery_round"]
         master_ip = params["dp_master_ip"]
-        is_master = self._initial_dp_size == 1 or params["dp_group_rank"] == 0
         params["recovery_store_port"] = self._coordinate_recovery_store_port(
-            master_ip, recovery_round, is_master=is_master
+            master_ip, recovery_round, is_master=params["dp_group_rank"] == 0
         )
         with set_current_vllm_config(engine.vllm_config):
             self._reinit_engine_groups(
