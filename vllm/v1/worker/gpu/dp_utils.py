@@ -41,7 +41,7 @@ def sync_cudagraph_and_dp_padding(
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     dist.all_reduce(tensor, group=group)
 
-    # Full width, dead slots included: returned in DPSyncState, whose
+    # Full width, dead slots included: returned to callers, whose
     # consumers index it by original dp_rank.
     num_tokens_across_dp_full = tensor[0]
 
