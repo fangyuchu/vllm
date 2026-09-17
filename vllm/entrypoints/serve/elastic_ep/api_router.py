@@ -5,9 +5,14 @@
 import json
 from http import HTTPStatus
 
+import msgspec
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from vllm.distributed.elastic_ep.external_elastic_ep import (
+    ExternalElasticEPScaleConflict,
+    ExternalElasticEPScaleStatus,
+)
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.elastic_ep.middleware import get_scaling_elastic_ep
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
@@ -24,12 +29,31 @@ def engine_client(request: Request) -> EngineClient:
 router = APIRouter()
 
 
+def _optional_identifier(body: dict, name: str) -> str | None:
+    value = body.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be a non-empty string of at most 256 characters",
+        )
+    return value
+
+
+def _status_payload(status: ExternalElasticEPScaleStatus) -> dict:
+    payload = msgspec.to_builtins(status)
+    payload["is_scaling_elastic_ep"] = status.active
+    return payload
+
+
 @router.post(
     "/scale_elastic_ep",
     dependencies=[Depends(validate_json_request)],
     responses={
         HTTPStatus.OK.value: {"model": dict},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.CONFLICT.value: {"model": ErrorResponse},
         HTTPStatus.REQUEST_TIMEOUT.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
@@ -42,6 +66,8 @@ async def scale_elastic_ep(raw_request: Request):
 
     new_data_parallel_size = body.get("new_data_parallel_size")
     drain_timeout = body.get("drain_timeout", 120)  # Default 2 minutes
+    operation_id = _optional_identifier(body, "operation_id")
+    expected_instance_id = _optional_identifier(body, "expected_instance_id")
 
     if new_data_parallel_size is None:
         raise HTTPException(
@@ -61,12 +87,28 @@ async def scale_elastic_ep(raw_request: Request):
 
     client = engine_client(raw_request)
     try:
-        await client.scale_elastic_ep(new_data_parallel_size, drain_timeout)
-        return JSONResponse(
-            {
-                "message": f"Scaled to {new_data_parallel_size} data parallel engines",
-            }
+        status = await client.scale_elastic_ep(
+            new_data_parallel_size,
+            drain_timeout,
+            operation_id,
+            expected_instance_id,
         )
+        if status is None:
+            return JSONResponse(
+                {
+                    "message": (
+                        f"Scaled to {new_data_parallel_size} data parallel engines"
+                    )
+                }
+            )
+        payload = _status_payload(status)
+        payload["message"] = (
+            f"Elastic EP operation is {status.phase.value} for data parallel "
+            f"size {new_data_parallel_size}"
+        )
+        return JSONResponse(payload)
+    except ExternalElasticEPScaleConflict as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except TimeoutError as e:
         raise HTTPException(
             status_code=408,
@@ -85,20 +127,19 @@ async def is_scaling_elastic_ep(raw_request: Request):
     # External operation status comes from the shared store. Middleware gating
     # remains process-local, so scaling requests must reach every old-rank API.
     try:
-        phase = await engine_client(raw_request).get_external_elastic_ep_phase()
+        status = await engine_client(raw_request).get_external_elastic_ep_status()
     except Exception as e:
         logger.warning("Failed to query external Elastic EP phase: %s", e)
         raise HTTPException(
             status_code=503,
             detail="External Elastic EP status is temporarily unavailable",
         ) from e
-    if phase is None:
+    if status is None:
         # Non-external EEP modes retain the process-local middleware state.
         is_scaling = get_scaling_elastic_ep()
         phase = "committing" if is_scaling else "idle"
-    else:
-        is_scaling = phase in ("preparing", "committing")
-    return JSONResponse({"is_scaling_elastic_ep": is_scaling, "phase": phase})
+        return JSONResponse({"is_scaling_elastic_ep": is_scaling, "phase": phase})
+    return JSONResponse(_status_payload(status))
 
 
 def attach_router(app: FastAPI):
