@@ -23,6 +23,9 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 
 if TYPE_CHECKING:
+    from vllm.distributed.elastic_ep.external_elastic_ep import (
+        ExternalElasticEPScaleStatus,
+    )
     from vllm.v1.engine import PauseMode
 
 
@@ -245,13 +248,19 @@ class EngineClient(ABC):
         ...
 
     async def scale_elastic_ep(
-        self, new_data_parallel_size: int, drain_timeout: int = 300
-    ) -> None:
+        self,
+        new_data_parallel_size: int,
+        drain_timeout: int = 300,
+        operation_id: str | None = None,
+        expected_instance_id: str | None = None,
+    ) -> "ExternalElasticEPScaleStatus | None":
         """Scale the engine."""
         raise NotImplementedError
 
-    async def get_external_elastic_ep_phase(self) -> str | None:
-        """Return the shared external Elastic EP operation phase, if enabled."""
+    async def get_external_elastic_ep_status(
+        self,
+    ) -> "ExternalElasticEPScaleStatus | None":
+        """Return shared external Elastic EP operation status, if enabled."""
         return None
 
     async def collective_rpc(
