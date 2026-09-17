@@ -388,14 +388,13 @@ class EngineCoreSentinel:
         """Reinit the engine DP group (dp>1) and host the recovery store."""
         if self._initial_dp_size == 1:
             return
-        engine = self.engine
         params = ft_request.params
         recovery_round = params["recovery_round"]
         master_ip = params["dp_master_ip"]
         params["recovery_store_port"] = self._coordinate_recovery_store_port(
             master_ip, recovery_round, is_master=params["dp_group_rank"] == 0
         )
-        with set_current_vllm_config(engine.vllm_config):
+        with set_current_vllm_config(self.engine.vllm_config):
             self._reinit_engine_groups(
                 params["dp_group_rank"], params["dp_group_size"], recovery_round
             )
