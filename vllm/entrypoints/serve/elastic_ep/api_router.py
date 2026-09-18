@@ -85,20 +85,24 @@ async def is_scaling_elastic_ep(raw_request: Request):
     # External operation status comes from the shared store. Middleware gating
     # remains process-local, so scaling requests must reach every old-rank API.
     try:
-        phase = await engine_client(raw_request).get_external_elastic_ep_phase()
+        status = await engine_client(raw_request).get_external_elastic_ep_status()
     except Exception as e:
-        logger.warning("Failed to query external Elastic EP phase: %s", e)
+        logger.warning("Failed to query external Elastic EP status: %s", e)
         raise HTTPException(
             status_code=503,
             detail="External Elastic EP status is temporarily unavailable",
         ) from e
-    if phase is None:
+    if status is None:
         # Non-external EEP modes retain the process-local middleware state.
         is_scaling = get_scaling_elastic_ep()
-        phase = "committing" if is_scaling else "idle"
+        status = {
+            "phase": "committing" if is_scaling else "idle",
+            "epoch": None,
+            "error": None,
+        }
     else:
-        is_scaling = phase in ("preparing", "committing")
-    return JSONResponse({"is_scaling_elastic_ep": is_scaling, "phase": phase})
+        is_scaling = status["phase"] in ("preparing", "committing")
+    return JSONResponse({"is_scaling_elastic_ep": is_scaling, **status})
 
 
 def attach_router(app: FastAPI):
