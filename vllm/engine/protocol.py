@@ -250,8 +250,10 @@ class EngineClient(ABC):
         """Scale the engine."""
         raise NotImplementedError
 
-    async def get_external_elastic_ep_phase(self) -> str | None:
-        """Return the shared external Elastic EP operation phase, if enabled."""
+    async def get_external_elastic_ep_status(
+        self,
+    ) -> dict[str, str | None] | None:
+        """Return shared external Elastic EP operation status, if enabled."""
         return None
 
     async def collective_rpc(
