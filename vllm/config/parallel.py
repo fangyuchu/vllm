@@ -902,7 +902,9 @@ class ParallelConfig:
                     "or data_parallel_hybrid_lb. Elastic EP relies on a single API "
                     "server and core client to coordinate scale up/down."
                 )
-            if self.eplb_config.use_async:
+            # NIXL is only required by the CUDA async-EPLB path; other
+            # platforms route elastic EP to their own communicators.
+            if self.eplb_config.use_async and current_platform.is_cuda_alike():
                 from vllm.distributed.nixl_utils import is_nixl_available
 
                 if not is_nixl_available():
