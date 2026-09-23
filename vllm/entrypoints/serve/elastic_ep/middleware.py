@@ -11,7 +11,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 # available for health and scaling-status queries until its orchestrator exits it.
 _scaling_elastic_ep = False
 _elastic_ep_rank_retired = False
-_SCALING_OBSERVABILITY_PATHS = frozenset({"/health", "/is_scaling_elastic_ep"})
+_SCALING_OBSERVABILITY_PATHS = frozenset(
+    {"/health", "/is_scaling_elastic_ep", "/resume_elastic_ep"}
+)
 
 
 def get_scaling_elastic_ep():

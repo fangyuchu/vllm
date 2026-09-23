@@ -283,6 +283,10 @@ class EngineClient(ABC):
         """Scale the engine."""
         raise NotImplementedError
 
+    async def resume_elastic_ep(self, epoch: str) -> None:
+        """Resume the current manually paused external scale operation."""
+        raise NotImplementedError
+
     async def get_external_elastic_ep_status(
         self,
     ) -> dict[str, str | int | None] | None:
