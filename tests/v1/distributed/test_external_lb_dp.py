@@ -47,6 +47,7 @@ class DictStore:
         self.values[key] = value
 
 
+@pytest.mark.skip_global_cleanup
 def test_external_elastic_ep_visible_epoch_has_bootstrap_and_phase(monkeypatch):
     client = SimpleNamespace(
         vllm_config=SimpleNamespace(
@@ -76,6 +77,41 @@ def test_external_elastic_ep_visible_epoch_has_bootstrap_and_phase(monkeypatch):
             coordinator, "_get_reconfig_store", lambda store=store: store
         )
         assert coordinator.get_status()["requested_data_parallel_size"] == 3
+
+
+@pytest.mark.parametrize(
+    "markers,expected_phase,expected_error",
+    [
+        ({"phase": b"preparing"}, "preparing", None),
+        ({"phase": b"committing"}, "committing", None),
+        ({"phase": b"committing", "completed": b"1"}, "completed", None),
+        ({"completed": b"1", "error": b"commit failed"}, "failed", "commit failed"),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_external_elastic_ep_status_reads_shared_epoch(
+    monkeypatch, markers, expected_phase, expected_error
+):
+    coordinator = ExternalElasticEPScaleCoordinator(
+        cast("DPAsyncMPClient", SimpleNamespace())
+    )
+    store = DictStore({})
+    monkeypatch.setattr(coordinator, "_get_reconfig_store", lambda: store)
+    assert coordinator.get_status() == {
+        "phase": "idle",
+        "epoch": None,
+        "error": None,
+        "requested_data_parallel_size": None,
+    }
+    store.set(coordinator.key("current_epoch"), b"remote-epoch")
+    for name, value in markers.items():
+        store.set(coordinator.key("remote-epoch", name), value)
+    assert coordinator.get_status() == {
+        "phase": expected_phase,
+        "epoch": "remote-epoch",
+        "error": expected_error,
+        "requested_data_parallel_size": None,
+    }
 
 
 def test_external_elastic_ep_calculates_target_expert_redundancy():
