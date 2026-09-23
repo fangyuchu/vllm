@@ -279,6 +279,9 @@ class EngineCoreClient(ABC):
     async def abort_external_elastic_ep(self, error: str) -> None:
         raise NotImplementedError
 
+    async def resume_elastic_ep(self, epoch: str) -> None:
+        raise NotImplementedError
+
     async def get_external_elastic_ep_status(
         self,
     ) -> dict[str, str | int | None] | None:
@@ -1742,6 +1745,8 @@ class DPAsyncMPClient(AsyncMPClient):
 
     async def abort_external_elastic_ep(self, error: str) -> None:
         self._get_external_eep_coordinator().abort(error)
+    async def resume_elastic_ep(self, epoch: str) -> None:
+        self._get_external_eep_coordinator().resume(epoch)
 
     async def get_external_elastic_ep_status(
         self,

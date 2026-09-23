@@ -81,6 +81,36 @@ async def scale_elastic_ep(raw_request: Request):
         raise HTTPException(status_code=500, detail="Scale failed") from e
 
 
+@router.post("/resume_elastic_ep", dependencies=[Depends(validate_json_request)])
+async def resume_elastic_ep(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("epoch"), str)
+        or not body["epoch"]
+    ):
+        raise HTTPException(status_code=400, detail="A non-empty epoch is required")
+    epoch = body["epoch"]
+    try:
+        await engine_client(raw_request).resume_elastic_ep(epoch)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=400, detail="Manual resume requires external Elastic EP"
+        ) from e
+    return JSONResponse(
+        {
+            "message": "Resume requested; poll /is_scaling_elastic_ep for completion",
+            "epoch": epoch,
+        },
+        status_code=202,
+    )
+
+
 @router.post("/is_scaling_elastic_ep")
 async def is_scaling_elastic_ep(raw_request: Request):
     # External operation status comes from the shared store. Middleware gating
@@ -109,6 +139,7 @@ async def is_scaling_elastic_ep(raw_request: Request):
     else:
         is_scaling = status["phase"] in (
             ExternalElasticEPScalePhase.PREPARING.value,
+            ExternalElasticEPScalePhase.PAUSED.value,
             ExternalElasticEPScalePhase.COMMITTING.value,
         )
     return JSONResponse({"is_scaling_elastic_ep": is_scaling, **status})

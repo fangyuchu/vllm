@@ -1388,6 +1388,9 @@ class AsyncLLM(EngineClient):
             if commit_succeeded:
                 set_scaling_elastic_ep(False)
 
+    async def resume_elastic_ep(self, epoch: str) -> None:
+        await self.engine_core.resume_elastic_ep(epoch)
+
     async def get_external_elastic_ep_status(
         self,
     ) -> dict[str, str | int | None] | None:
