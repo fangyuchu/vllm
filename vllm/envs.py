@@ -314,6 +314,7 @@ if TYPE_CHECKING:
     making the server model-name agnostic. Useful for proxy/gateway scenarios."""
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+    VLLM_ELASTIC_EP_PAUSE_BEFORE_COMMIT: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
@@ -2102,6 +2103,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scaling command in elastic EP.
     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
         int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
+    ),
+    # Pause external scale-up after preparation, while old ranks keep serving.
+    # Rank 0 publishes this setting for the whole operation. Resume explicitly
+    # with POST /resume_elastic_ep and the current epoch.
+    "VLLM_ELASTIC_EP_PAUSE_BEFORE_COMMIT": lambda: bool(
+        int(os.getenv("VLLM_ELASTIC_EP_PAUSE_BEFORE_COMMIT", "0"))
     ),
     # If set to 1, enable CUDA graph memory estimation during memory profiling.
     # This profiles CUDA graph memory usage to provide more accurate KV cache

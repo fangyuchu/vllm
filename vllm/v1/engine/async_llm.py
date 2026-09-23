@@ -1251,8 +1251,13 @@ class AsyncLLM(EngineClient):
                 set_elastic_ep_rank_retired(False)
             set_scaling_elastic_ep(False)
 
-    async def get_external_elastic_ep_phase(self) -> str | None:
-        return await self.engine_core.get_external_elastic_ep_phase()
+    async def resume_elastic_ep(self, epoch: str) -> None:
+        await self.engine_core.resume_elastic_ep(epoch)
+
+    async def get_external_elastic_ep_status(
+        self,
+    ) -> dict[str, str | int | None] | None:
+        return await self.engine_core.get_external_elastic_ep_status()
 
     async def handle_fault(
         self, fault_tolerance_request: FaultToleranceRequest
