@@ -13,6 +13,7 @@ import msgspec
 import msgspec.msgpack
 import zmq
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.engine import (
@@ -42,6 +43,7 @@ class ExternalElasticEPScalePhase(str, enum.Enum):
 
     IDLE = "idle"
     PREPARING = "preparing"
+    PAUSED = "paused"
     COMMITTING = "committing"
     FAILED = "failed"
     COMPLETED = "completed"
@@ -320,21 +322,101 @@ class ExternalElasticEPScaleCoordinator:
             return None
         return store.get(error_key).decode()
 
-    def get_phase(self) -> ExternalElasticEPScalePhase:
+    def get_status(self) -> dict[str, str | int | None]:
         store = self._get_reconfig_store()
         current_epoch_key = self.key("current_epoch")
         if not store.check([current_epoch_key]):
-            return ExternalElasticEPScalePhase.IDLE
+            return {
+                "phase": ExternalElasticEPScalePhase.IDLE.value,
+                "epoch": None,
+                "error": None,
+                "requested_data_parallel_size": None,
+            }
 
         epoch = store.get(current_epoch_key).decode()
-        if self._get_error(store, epoch) is not None:
-            return ExternalElasticEPScalePhase.FAILED
-        if store.check([self.key(epoch, "completed")]):
-            return ExternalElasticEPScalePhase.COMPLETED
-        phase_key = self.key(epoch, "phase")
-        if store.check([phase_key]):
-            return ExternalElasticEPScalePhase(store.get(phase_key).decode())
-        return ExternalElasticEPScalePhase.IDLE
+        error = self._get_error(store, epoch)
+        if error is not None:
+            phase = ExternalElasticEPScalePhase.FAILED
+        elif store.check([self.key(epoch, "completed")]):
+            phase = ExternalElasticEPScalePhase.COMPLETED
+        elif store.check([self.key(epoch, "phase")]):
+            phase = ExternalElasticEPScalePhase(
+                store.get(self.key(epoch, "phase")).decode()
+            )
+        else:
+            phase = ExternalElasticEPScalePhase.IDLE
+        requested_dp_size = None
+        bootstrap_key = self.key(epoch, "bootstrap")
+        if store.check([bootstrap_key]):
+            bootstrap = msgspec.msgpack.decode(
+                store.get(bootstrap_key), type=ReconfigureDistributedRequest
+            )
+            requested_dp_size = bootstrap.new_data_parallel_size
+        return {
+            "phase": phase.value,
+            "epoch": epoch,
+            "error": error,
+            "requested_data_parallel_size": requested_dp_size,
+        }
+
+    def resume(self, epoch: str) -> None:
+        from vllm.distributed.utils import get_cached_tcp_store_client
+
+        store = self._get_reconfig_store()
+        current_epoch_key = self.key("current_epoch")
+        if (
+            not store.check([current_epoch_key])
+            or store.get(current_epoch_key).decode() != epoch
+        ):
+            raise ValueError("The requested epoch is not the current scale operation.")
+        bootstrap = msgspec.msgpack.decode(
+            store.get(self.key(epoch, "bootstrap")), type=ReconfigureDistributedRequest
+        )
+        # Another API process may still point at the old control store.
+        # Every resume must reach the target store used by the waiting ranks.
+        store = get_cached_tcp_store_client(
+            bootstrap.new_data_parallel_master_ip, bootstrap.coord_store_port
+        )
+        if store.get(current_epoch_key).decode() != epoch:
+            raise ValueError("The requested epoch is not the current scale operation.")
+        error = self._get_error(store, epoch)
+        if error is not None:
+            raise ValueError(f"Cannot resume failed scale operation: {error}")
+        resume_key = self.key(epoch, "resume")
+        if store.check([resume_key]):
+            return
+        if store.get(self.key(epoch, "phase")) != b"paused":
+            raise ValueError("The current scale operation is not paused.")
+        store.set(resume_key, b"1")
+
+    async def _wait_for_manual_resume(
+        self, prepared: _PreparedExternalElasticEPScale
+    ) -> None:
+        store = prepared.reconfig_store
+        pause_key = self.key(prepared.epoch, "pause_before_commit")
+        if not prepared.scale_up or not store.check([pause_key]):
+            return
+        if prepared.dp_rank == 0:
+            for target in (prepared.control_store, store):
+                self._set_phase(
+                    target, prepared.epoch, ExternalElasticEPScalePhase.PAUSED
+                )
+            logger.info(
+                "[Elastic EP] Scale-up paused before commit; old ranks keep serving. "
+                "Resume epoch %s with POST /resume_elastic_ep.",
+                prepared.epoch,
+            )
+        resume_key = self.key(prepared.epoch, "resume")
+        backoff_step = 0
+        while True:
+            if prepared.handshake_server is not None:
+                prepared.handshake_server.raise_if_failed()
+            error = self._get_error(store, prepared.epoch)
+            if error is not None:
+                raise RuntimeError(error)
+            if store.check([resume_key]):
+                return
+            backoff_step = await self._sleep_with_backoff(backoff_step)
 
     def _set_phase(
         self, store: Any, epoch: str, phase: ExternalElasticEPScalePhase
@@ -431,9 +513,15 @@ class ExternalElasticEPScaleCoordinator:
         if self.reconfig_store_ref is not None:
             stores.append(self.reconfig_store_ref)
         for target_store in stores:
-            target_store.set(current_epoch_key, epoch.encode())
             target_store.set(bootstrap_key, bootstrap_payload)
+            if (
+                new_data_parallel_size > cur_data_parallel_size
+                and envs.VLLM_ELASTIC_EP_PAUSE_BEFORE_COMMIT
+            ):
+                target_store.set(self.key(epoch, "pause_before_commit"), b"1")
             self._set_phase(target_store, epoch, ExternalElasticEPScalePhase.PREPARING)
+            # Publish the epoch only after its metadata is ready for readers.
+            target_store.set(current_epoch_key, epoch.encode())
         return epoch, bootstrap
 
     def _start_scale_up_handshake_server(
@@ -728,7 +816,9 @@ class ExternalElasticEPScaleCoordinator:
                 scale_up=scale_up,
                 handshake_server=handshake_server,
             )
+            await self._wait_for_manual_resume(self.prepared_scale)
         except Exception as e:
+            self.prepared_scale = None
             if epoch is not None:
                 error_key = self.key(epoch, "error")
                 error_payload = str(e).encode()
@@ -771,6 +861,10 @@ class ExternalElasticEPScaleCoordinator:
                 mode="keep" if remaining else "abort",
                 clear_cache=False,
             )
+            if prepared.scale_up and prepared.dp_rank == 0:
+                prepared.reconfig_store.set(
+                    self.key(prepared.epoch, "commit_started"), b"1"
+                )
             if remaining:
                 await self.client.call_utility_async("commit_prepared_elastic_ep")
             else:

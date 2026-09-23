@@ -519,6 +519,7 @@ class ElasticEPScalingState:
                     "elastic_ep_execute", args=("warmup_new_worker",)
                 )
             self._mark_ready_for_switch()
+            self._wait_for_external_scale_commit()
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
             torch.distributed.all_reduce(
                 tensor,
@@ -536,6 +537,31 @@ class ElasticEPScalingState:
         else:
             assert self.state == ScaleUpNewEngineState.COMPLETE
             return True
+
+    def _wait_for_external_scale_commit(self) -> None:
+        parallel = self.new_parallel_config
+        if not parallel.data_parallel_external_lb:
+            return
+        from vllm.distributed.elastic_ep.external_elastic_ep import (
+            ExternalElasticEPScaleCoordinator,
+        )
+
+        store = get_cached_tcp_store_client(
+            parallel.data_parallel_master_ip, parallel._coord_store_port
+        )
+        key = ExternalElasticEPScaleCoordinator.key
+        epoch = self._operation_id or store.get(key("current_epoch")).decode()
+        if not store.check([key(epoch, "pause_before_commit")]):
+            return
+        # Old ranks still serve on the original group. Do not enter the new
+        # group's all-reduce until their schedulers have collectively paused.
+        while True:
+            error_key = key(epoch, "error")
+            if store.check([error_key]):
+                raise RuntimeError(store.get(error_key).decode())
+            if store.check([key(epoch, "commit_started")]):
+                return
+            time.sleep(0.1)
 
     def _progress_remaining_engine(self) -> bool:
         state = self.state

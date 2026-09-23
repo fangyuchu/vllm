@@ -8,6 +8,7 @@ from http import HTTPStatus
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from vllm.distributed.elastic_ep.external_elastic_ep import ExternalElasticEPScalePhase
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.elastic_ep.middleware import get_scaling_elastic_ep
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
@@ -80,25 +81,68 @@ async def scale_elastic_ep(raw_request: Request):
         raise HTTPException(status_code=500, detail="Scale failed") from e
 
 
+@router.post("/resume_elastic_ep", dependencies=[Depends(validate_json_request)])
+async def resume_elastic_ep(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("epoch"), str)
+        or not body["epoch"]
+    ):
+        raise HTTPException(status_code=400, detail="A non-empty epoch is required")
+    epoch = body["epoch"]
+    try:
+        await engine_client(raw_request).resume_elastic_ep(epoch)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=400, detail="Manual resume requires external Elastic EP"
+        ) from e
+    return JSONResponse(
+        {
+            "message": "Resume requested; poll /is_scaling_elastic_ep for completion",
+            "epoch": epoch,
+        },
+        status_code=202,
+    )
+
+
 @router.post("/is_scaling_elastic_ep")
 async def is_scaling_elastic_ep(raw_request: Request):
     # External operation status comes from the shared store. Middleware gating
     # remains process-local, so scaling requests must reach every old-rank API.
     try:
-        phase = await engine_client(raw_request).get_external_elastic_ep_phase()
+        status = await engine_client(raw_request).get_external_elastic_ep_status()
     except Exception as e:
-        logger.warning("Failed to query external Elastic EP phase: %s", e)
+        logger.warning("Failed to query external Elastic EP status: %s", e)
         raise HTTPException(
             status_code=503,
             detail="External Elastic EP status is temporarily unavailable",
         ) from e
-    if phase is None:
+    if status is None:
         # Non-external EEP modes retain the process-local middleware state.
         is_scaling = get_scaling_elastic_ep()
-        phase = "committing" if is_scaling else "idle"
+        status = {
+            "phase": (
+                ExternalElasticEPScalePhase.COMMITTING.value
+                if is_scaling
+                else ExternalElasticEPScalePhase.IDLE.value
+            ),
+            "epoch": None,
+            "error": None,
+            "requested_data_parallel_size": None,
+        }
     else:
-        is_scaling = phase in ("preparing", "committing")
-    return JSONResponse({"is_scaling_elastic_ep": is_scaling, "phase": phase})
+        is_scaling = status["phase"] in (
+            ExternalElasticEPScalePhase.PREPARING.value,
+            ExternalElasticEPScalePhase.PAUSED.value,
+            ExternalElasticEPScalePhase.COMMITTING.value,
+        )
+    return JSONResponse({"is_scaling_elastic_ep": is_scaling, **status})
 
 
 def attach_router(app: FastAPI):
