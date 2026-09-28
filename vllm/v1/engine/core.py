@@ -2348,9 +2348,8 @@ class DPEngineCoreProc(EngineCoreProc):
             self.eep_scaling_state is not None
             and self.eep_scaling_state.should_defer_dp_state_sync()
         ):
-            # Preparation keeps serving through Worker-level metadata
-            # collectives. Avoid crossing any of them with the regular
-            # EngineCore DP-state all-reduce until PREPARE has finished.
+            # All old ranks agreed to drain at the same DP-state sync.
+            # Use only drain progress collectives until PREPARE has finished.
             return True
 
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
@@ -2358,11 +2357,22 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter != 1 and self.step_counter % self.dp_sync_interval != 0:
             return True
 
-        has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
-            self.dp_group,
-            has_unfinished=local_unfinished,
-            pending_pause=self.pending_pause,
+        scaling_state = self.eep_scaling_state
+        has_unfinished, pause_consensus, prepare_consensus = (
+            ParallelConfig.sync_dp_state(
+                self.dp_group,
+                has_unfinished=local_unfinished,
+                pending_pause=self.pending_pause,
+                prepare_ready=(
+                    scaling_state is not None
+                    and scaling_state.is_precommit_prepare_ready()
+                ),
+            )
         )
+
+        if prepare_consensus:
+            assert scaling_state is not None
+            scaling_state.begin_prepare_quiesce()
 
         if pause_consensus:
             self.ignore_start_dp_wave = True
