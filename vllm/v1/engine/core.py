@@ -702,6 +702,14 @@ class EngineCore:
             # is non-empty.
             return None, False
 
+        if drain_batch_queue:
+            scaling_state = getattr(self, "eep_scaling_state", None)
+            assert scaling_state is not None
+            # A peer may need another progress exchange before it can issue
+            # the dummy batch that completes our pending DP collective.
+            if not scaling_state.poll_pending_batch(batch_queue[-1][0]):
+                return None, False
+
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
@@ -2281,13 +2289,19 @@ class DPEngineCoreProc(EngineCoreProc):
                 # engine is sleeping or the Elastic EP drain is waiting for
                 # queued work/peer epoch publication.
                 if not skip_dummy_batch and not self.model_executor.is_sleeping:
-                    with self.capture_iteration_details(None) as iteration_details:
-                        self.execute_dummy_batch()
-                    if iteration_details is not None and not self.has_coordinator:
-                        stats = self._make_iteration_details_stats(iteration_details)
-                        self.output_queue.put_nowait(
-                            (0, EngineCoreOutputs(scheduler_stats=stats))
-                        )
+                    if self._eep_drain_batch_queue:
+                        assert self.eep_scaling_state is not None
+                        self.eep_scaling_state.start_catch_up_dummy_batch()
+                    else:
+                        with self.capture_iteration_details(None) as iteration_details:
+                            self.execute_dummy_batch()
+                        if iteration_details is not None and not self.has_coordinator:
+                            stats = self._make_iteration_details_stats(
+                                iteration_details
+                            )
+                            self.output_queue.put_nowait(
+                                (0, EngineCoreOutputs(scheduler_stats=stats))
+                            )
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(

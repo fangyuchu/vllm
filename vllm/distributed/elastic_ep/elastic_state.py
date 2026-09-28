@@ -98,6 +98,8 @@ class ElasticEPScalingState:
             max_workers=1, thread_name_prefix="ElasticEPPrepare"
         )
         self._prepare_future: Future[Any] | None = None
+        self._drain_future: Future[Any] | None = None
+        self._drain_dummy_future: Future[Any] | None = None
         self._prepare_workers_complete = False
         self._prepare_workers_ready_published = False
         self._prepare_workers_synchronized = False
@@ -281,16 +283,44 @@ class ElasticEPScalingState:
             self.engine_core.engines_running = True
             return False
 
+    def poll_pending_batch(self, future: Future[Any]) -> bool:
+        """Receive a queued batch without blocking EngineCore progress exchange."""
+        if self._drain_future is None:
+            # Multiproc FutureWrapper receives RPC replies lazily in result().
+            # Its done() alone cannot make progress. The prepare thread is idle
+            # here, and only the oldest batch may read executor replies.
+            self._drain_future = self._prepare_executor.submit(future.result)
+        if not self._drain_future.done():
+            return False
+        completed = self._drain_future
+        self._drain_future = None
+        completed.result()
+        return True
+
+    def start_catch_up_dummy_batch(self) -> None:
+        """Run one catch-up batch while EngineCore continues exchanging epochs."""
+        if self._drain_dummy_future is None:
+            self._drain_dummy_future = self._prepare_executor.submit(
+                self.model_executor.execute_dummy_batch
+            )
+
     def _progress_prepare_quiesce(self) -> bool:
         """Drain at a common Worker DP collective boundary."""
         assert self.old_dp_group is not None
         self._prepare_quiesce_started = True
 
+        if self._drain_dummy_future is not None and self._drain_dummy_future.done():
+            self._drain_dummy_future.result()
+            self._drain_dummy_future = None
+
         batch_queue = getattr(self.engine_core, "batch_queue", None)
+        # Include submitted dummy work even before its Worker publishes an epoch.
+        # This prevents duplicate catch-up batches and premature finalization.
+        local_pending = bool(batch_queue) or self._drain_dummy_future is not None
         self.engine_core._eep_drain_batch_queue = True
         entered_epoch, completed_epoch = self._get_local_dp_collective_state()
         local_state = torch.tensor(
-            [entered_epoch, completed_epoch, int(bool(batch_queue))],
+            [entered_epoch, completed_epoch, int(local_pending)],
             dtype=torch.int64,
         )
         gathered_states = [
@@ -304,7 +334,6 @@ class ElasticEPScalingState:
 
         states = [state.tolist() for state in gathered_states]
         target_epoch = max(state[0] for state in states)
-        local_pending = bool(batch_queue)
         needs_catch_up = not local_pending and entered_epoch < target_epoch
         self.engine_core._eep_force_dummy_batch = needs_catch_up
         if needs_catch_up:
