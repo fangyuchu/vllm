@@ -4,7 +4,6 @@ import enum
 import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch.distributed
@@ -16,7 +15,7 @@ from vllm.distributed import (
 from vllm.distributed.elastic_ep.readiness import (
     new_worker_dist_init_ready_keys,
 )
-from vllm.distributed.utils import get_cached_tcp_store_client, sched_yield
+from vllm.distributed.utils import get_cached_tcp_store_client
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EEPNotificationType,
@@ -32,10 +31,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 WorkerType = Literal["existing", "new", "removing"]
-
-
-class _BarrierTimeoutError(RuntimeError):
-    """First-stage timeout used by the retryable EngineCore barrier."""
 
 
 class ScaleUpExistingEngineState(enum.IntEnum):
@@ -101,7 +96,6 @@ class ElasticEPScalingState:
         self._drain_future: Future[Any] | None = None
         self._drain_dummy_future: Future[Any] | None = None
         self._prepare_workers_complete = False
-        self._prepare_workers_ready_published = False
         self._prepare_workers_synchronized = False
         self._new_dp_sync: tuple[object, Any] | None = None
         self._precommit_capture_enabled: bool | None = None
@@ -163,125 +157,29 @@ class ElasticEPScalingState:
             )
         return states[0]
 
-    @property
-    def _prepare_workers_ready_prefix(self) -> str:
-        assert self.old_dp_group is not None
+    def is_precommit_prepare_ready(self) -> bool:
         return (
-            "elastic_ep/background_prepare_ready/"
-            f"{self._operation_id}/{self.old_dp_group.size()}"
+            self.scale_type == "scale_up"
+            and self.worker_type == "existing"
+            and self.state is ScaleUpExistingEngineState.PREPARE
+            and self._prepare_workers_complete
+            and self._precommit_capture_enabled is True
+            and not self._prepare_workers_synchronized
         )
 
-    def _prepare_workers_ready_keys(self) -> list[str]:
-        assert self.old_dp_group is not None
-        prefix = self._prepare_workers_ready_prefix
-        return [f"{prefix}/{rank}" for rank in range(self.old_dp_group.size())]
-
-    def _all_existing_prepare_workers_ready(self) -> bool:
-        """Keep serving until background preparation completes on every rank."""
-        assert self.old_dp_group is not None and self.old_dp_store is not None
-        ready_keys = self._prepare_workers_ready_keys()
-        rank = self.old_dp_group.rank()
-        if not self._prepare_workers_ready_published:
-            self.old_dp_store.set(ready_keys[rank], b"1")
-            self._prepare_workers_ready_published = True
-            logger.info(
-                "[Elastic EP] Published background prepare ready: "
-                "operation_id=%s, rank=%s/%s",
-                self._operation_id,
-                rank,
-                self.old_dp_group.size(),
-            )
-
-        if not self.old_dp_store.check(ready_keys):
-            return False
-
-        logger.info_once(
-            "[Elastic EP] All old ranks completed background preparation; "
-            "aligning EngineCore loops before inference drain"
+    def begin_prepare_quiesce(self) -> None:
+        """Enter drain after all old ranks agree in the regular DP-state sync."""
+        assert self.is_precommit_prepare_ready()
+        self._prepare_workers_synchronized = True
+        self._prepare_quiesce_started = True
+        self.engine_core._eep_drain_batch_queue = True
+        self.engine_core._eep_force_dummy_batch = False
+        logger.info(
+            "[Elastic EP] All old ranks reached prepare consensus; "
+            "starting inference drain: operation_id=%s, dp_step=%s",
+            self._operation_id,
+            self.engine_core.step_counter,
         )
-        return True
-
-    def _clear_prepare_workers_ready(self) -> None:
-        assert self.old_dp_group is not None and self.old_dp_store is not None
-        if self.old_dp_group.rank() != 0:
-            return
-        for key in self._prepare_workers_ready_keys():
-            self.old_dp_store.delete_key(key)
-
-    def _execute_tcp_store_barrier(
-        self,
-        group_rank: int,
-        group_size: int,
-        barrier_id: str,
-        timeout: timedelta | None = None,
-    ) -> None:
-        assert self.old_dp_store is not None
-        arrival_key = f"arrival_{barrier_id}_{group_rank}"
-        self.old_dp_store.set(arrival_key, b"1")
-
-        start_time = time.time()
-        arrived: set[int] = set()
-        while len(arrived) < group_size:
-            if (
-                timeout is not None
-                and time.time() - start_time > timeout.total_seconds()
-            ):
-                raise _BarrierTimeoutError(
-                    f"Barrier timed out after {timeout.total_seconds()} seconds"
-                )
-            for rank in range(group_size):
-                if rank not in arrived and self.old_dp_store.check(
-                    [f"arrival_{barrier_id}_{rank}"]
-                ):
-                    arrived.add(rank)
-            if len(arrived) < group_size:
-                sched_yield()
-
-    def _staged_old_dp_barrier(
-        self,
-        barrier_name: str,
-        first_stage_timeout: timedelta | None = None,
-    ) -> bool:
-        """Align old EngineCore loops without abandoning a peer model step.
-
-        This is the migration-source two-stage protocol. On the first pass a
-        rank may time out and return to the busy loop for one more model step,
-        satisfying a peer that already entered the serving DP collective. The
-        TCPStore sync key makes the next pass wait without a timeout.
-        """
-        assert self.old_dp_group is not None and self.old_dp_store is not None
-        group_rank = self.old_dp_group.rank()
-        group_size = self.old_dp_group.size()
-        barrier_id = f"eep_barrier_{self._operation_id}_{barrier_name}"
-        sync_key = f"{barrier_id}_sync"
-        timeout = (
-            None
-            if self.old_dp_store.check([sync_key])
-            else first_stage_timeout or timedelta(seconds=5)
-        )
-        try:
-            self._execute_tcp_store_barrier(
-                group_rank,
-                group_size,
-                barrier_id,
-                timeout=timeout,
-            )
-            torch.distributed.barrier(self.old_dp_group)
-            if group_rank == 0:
-                self.old_dp_store.delete_key(sync_key)
-                for rank in range(group_size):
-                    self.old_dp_store.delete_key(f"arrival_{barrier_id}_{rank}")
-            return True
-        except _BarrierTimeoutError as exc:
-            if timeout is None:
-                raise RuntimeError("Unexpected staged barrier timeout") from exc
-            self.old_dp_store.compare_set(sync_key, "", b"1")
-            # The current busy loop skips dummy execution when its local wave
-            # is idle. The migration-source barrier contract requires exactly
-            # one more model step after this timeout, so keep the old DP wave
-            # active even when this rank has no local request.
-            self.engine_core.engines_running = True
-            return False
 
     def poll_pending_batch(self, future: Future[Any]) -> bool:
         """Receive a queued batch without blocking EngineCore progress exchange."""
@@ -439,28 +337,17 @@ class ElasticEPScalingState:
             # execution immediately before this collective phase.
             if self._uses_precommit_graph_capture():
                 if not self._prepare_workers_synchronized:
-                    # Local background completion is not sufficient: a faster
-                    # old rank must keep serving until every old Worker is
-                    # ready. Then use the migration-source staged barrier so a
-                    # peer already inside model forward is never abandoned in
-                    # its serving DP collective.
-                    if not self._all_existing_prepare_workers_ready():
-                        return False
-                    if not self._staged_old_dp_barrier(
-                        "background_prepare_ready",
-                        first_stage_timeout=timedelta(seconds=1),
-                    ):
-                        return False
-                    self._prepare_workers_synchronized = True
-                    self._clear_prepare_workers_ready()
+                    # Idle ranks must also run dummy steps to reach the regular
+                    # DP-state sync. Keep serving until that sync grants every
+                    # old rank permission to drain in the same round.
+                    self.engine_core.engines_running = True
+                    return False
 
                 if not self._prepare_quiesce_complete:
                     if not self._progress_prepare_quiesce():
                         return False
-                    if not self._staged_old_dp_barrier(
-                        "precommit_finalize",
-                    ):
-                        return False
+                    # The progress all-gather already establishes a common
+                    # quiescent boundary; no additional staged barrier is needed.
                     self._prepare_quiesce_complete = True
                 try:
                     self._collective_rpc(
