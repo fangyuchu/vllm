@@ -6,6 +6,7 @@ import contextlib
 import enum
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 
@@ -214,6 +215,8 @@ class ExternalElasticEPScaleCoordinator:
         self.control_store_ref: Any | None = None
         self.reconfig_store_ref: Any | None = None
         self.active_epoch: str | None = None
+        self._ft_store_key: tuple[str, int, str, bool] | None = None
+        self._ft_store: Any | None = None
         self.prepared_scale: _PreparedExternalElasticEPScale | None = None
 
     @staticmethod
@@ -274,6 +277,60 @@ class ExternalElasticEPScaleCoordinator:
                 "the target topology cannot retain all model experts."
             )
         return num_redundant_experts
+
+    async def migrate_coord_store(
+        self, master_ip: str, port: int, rank: int, size: int, request_id: str
+    ) -> None:
+        """Rehome the frontend control store after its owning rank is removed."""
+        from vllm.distributed.utils import (
+            create_tcp_store,
+            get_cached_tcp_store_client,
+        )
+
+        is_master = rank == 0 and self.client.client_index == 0
+        store_key = (master_ip, port, request_id, is_master)
+        if self._ft_store_key != store_key:
+            store = await asyncio.to_thread(
+                create_tcp_store,
+                master_ip,
+                port,
+                is_master=is_master,
+                world_size=-1,
+                wait_for_workers=False,
+                timeout=timedelta(seconds=60),
+            )
+            # Retain the server even if the readiness barrier needs a retry.
+            self._ft_store = store
+            self._ft_store_key = store_key
+        store = self._ft_store
+        ready_keys = [self.key("ft", request_id, "ready", r) for r in range(size)]
+        await asyncio.to_thread(store.set, ready_keys[rank], b"1")
+        await asyncio.to_thread(store.wait, ready_keys, timedelta(seconds=60))
+
+        if self.prepared_scale is not None:
+            await asyncio.to_thread(
+                self._stop_handshake_server,
+                self.prepared_scale.handshake_server,
+                True,
+            )
+        self.prepared_scale = None
+        self.active_epoch = None
+        self.active_reconfig_store = None
+        self.control_store_ref = None
+        self.reconfig_store_ref = None
+        self.client._coord_store = store
+        # A later recovery may reuse the same address with a new server.
+        get_cached_tcp_store_client.cache_clear()
+        parallel = self.client.vllm_config.parallel_config
+        parallel.data_parallel_master_ip = master_ip
+        parallel._coord_store_port = port
+        logger.info(
+            "[FT] Frontend coordination store migrated: %s:%d, rank=%d/%d",
+            master_ip,
+            port,
+            rank,
+            size,
+        )
 
     def _get_reconfig_store(self):
         from vllm.distributed.utils import get_cached_tcp_store_client
@@ -718,7 +775,8 @@ class ExternalElasticEPScaleCoordinator:
             raise RuntimeError(
                 "External Elastic EP requires a runtime coordination store port."
             )
-        control_store = get_cached_tcp_store_client(
+        control_store = await asyncio.to_thread(
+            get_cached_tcp_store_client,
             parallel_config.data_parallel_master_ip,
             parallel_config._coord_store_port,
         )
@@ -766,7 +824,7 @@ class ExternalElasticEPScaleCoordinator:
                 bootstrap.new_data_parallel_master_ip,
                 bootstrap.coord_store_port,
             )
-            reconfig_store = self._get_reconfig_store()
+            reconfig_store = await asyncio.to_thread(self._get_reconfig_store)
             reconfig_store.set(self.key("current_epoch"), epoch.encode())
             self._set_phase(
                 reconfig_store, epoch, ExternalElasticEPScalePhase.PREPARING
@@ -942,7 +1000,7 @@ class ExternalElasticEPScaleCoordinator:
             return
 
         epoch = self.active_epoch
-        reconfig_store = self._get_reconfig_store()
+        reconfig_store = await asyncio.to_thread(self._get_reconfig_store)
         if epoch is None:
             current_epoch_key = self.key("current_epoch")
             if not reconfig_store.check([current_epoch_key]):

@@ -264,6 +264,11 @@ class EngineCoreClient(ABC):
     async def resume_elastic_ep(self, epoch: str) -> None:
         raise NotImplementedError
 
+    async def migrate_elastic_ep_coord_store(
+        self, master_ip: str, port: int, rank: int, size: int, request_id: str
+    ) -> None:
+        raise NotImplementedError
+
     async def get_external_elastic_ep_status(
         self,
     ) -> dict[str, str | int | None] | None:
@@ -1625,14 +1630,25 @@ class DPAsyncMPClient(AsyncMPClient):
     async def commit_elastic_ep(self) -> None:
         await self._get_external_eep_coordinator().commit()
 
+    async def migrate_elastic_ep_coord_store(
+        self, master_ip: str, port: int, rank: int, size: int, request_id: str
+    ) -> None:
+        await self._get_external_eep_coordinator().migrate_coord_store(
+            master_ip, port, rank, size, request_id
+        )
+
     async def resume_elastic_ep(self, epoch: str) -> None:
-        self._get_external_eep_coordinator().resume(epoch)
+        await asyncio.to_thread(self._get_external_eep_coordinator().resume, epoch)
 
     async def get_external_elastic_ep_status(
         self,
     ) -> dict[str, str | int | None] | None:
         coordinator = self.external_eep_coordinator
-        return None if coordinator is None else coordinator.get_status()
+        return (
+            None
+            if coordinator is None
+            else await asyncio.to_thread(coordinator.get_status)
+        )
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):
