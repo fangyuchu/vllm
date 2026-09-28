@@ -279,19 +279,27 @@ class ElasticEPScalingState:
             and self._prepare_quiesce_started
         )
 
+    def _wait_for_async_workers(self, done_keys: list[str]) -> None:
+        assert self.reconfig_request is not None
+        # TCPStore.wait holds the connection lock. Use a dedicated connection
+        # so EngineCore's readiness checks can continue during preparation.
+        # Connect on this background thread to keep it off the serving loop.
+        coord_store = torch.distributed.TCPStore(
+            self.reconfig_request.new_data_parallel_master_ip,
+            self.reconfig_request.coord_store_port,
+            is_master=False,
+            wait_for_workers=False,
+        )
+        coord_store.wait(done_keys)
+
     def _execute_async(self, execute_method: str, *args) -> bool:
         if self._prepare_future is None:
             done_keys = self._collective_rpc(
                 "elastic_ep_execute",
                 args=("start_async", execute_method, *args),
             )
-            assert self.reconfig_request is not None
-            coord_store = get_cached_tcp_store_client(
-                self.reconfig_request.new_data_parallel_master_ip,
-                self.reconfig_request.coord_store_port,
-            )
             self._prepare_future = self._prepare_executor.submit(
-                coord_store.wait, done_keys
+                self._wait_for_async_workers, done_keys
             )
         if not self._prepare_future.done():
             return False
