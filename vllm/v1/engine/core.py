@@ -2272,9 +2272,13 @@ class DPEngineCoreProc(EngineCoreProc):
             if self.ignore_start_dp_wave:
                 return
             new_wave, exclude_eng_index = request
-            if exclude_eng_index != self.engine_index and (
-                new_wave >= self.current_wave
-            ):
+            # External frontends retain their IPC engine identities after FT
+            # compaction. A new rank can reuse a survivor's engine_index, so
+            # excluding that identity would also leave the new rank asleep.
+            external_lb = self.vllm_config.parallel_config.data_parallel_external_lb
+            if (
+                external_lb or exclude_eng_index != self.engine_index
+            ) and new_wave >= self.current_wave:
                 self.current_wave = new_wave
                 if not self.engines_running:
                     logger.debug(
