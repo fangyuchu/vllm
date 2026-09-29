@@ -1630,6 +1630,32 @@ class DPAsyncMPClient(AsyncMPClient):
     async def commit_elastic_ep(self) -> None:
         await self._get_external_eep_coordinator().commit()
 
+    async def reconnect_dp_coordinator(
+        self, input_address: str, output_address: str, stats_address: str
+    ) -> None:
+        await asyncio.wait_for(
+            self.call_utility_async(
+                "reconnect_dp_coordinator",
+                input_address,
+                output_address,
+                stats_address,
+            ),
+            timeout=60,
+        )
+        if self.stats_update_address != stats_address:
+            task = self.resources.stats_update_task
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            self.resources.stats_update_task = None
+            self.resources.stats_update_socket = None
+            self.resources.first_req_rcv_socket = None
+            self.stats_update_address = stats_address
+            self._ensure_stats_update_task()
+        self.coordinator_input_address = input_address
+        self.coordinator_output_address = output_address
+
     async def migrate_elastic_ep_coord_store(
         self, master_ip: str, port: int, rank: int, size: int, request_id: str
     ) -> None:
