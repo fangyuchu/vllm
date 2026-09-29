@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import copy
 import enum
 import uuid
 from dataclasses import dataclass
@@ -218,6 +219,7 @@ class ExternalElasticEPScaleCoordinator:
         self.active_epoch: str | None = None
         self._ft_store_key: tuple[str, int, str, bool] | None = None
         self._ft_store: Any | None = None
+        self._ft_coordinator_key: tuple[str, int, str, bool] | None = None
         self.prepared_scale: _PreparedExternalElasticEPScale | None = None
 
     @staticmethod
@@ -304,6 +306,46 @@ class ExternalElasticEPScaleCoordinator:
             self._ft_store = store
             self._ft_store_key = store_key
         store = self._ft_store
+        if self.client.vllm_config.needs_dp_coordinator:
+            from vllm.v1.engine.coordinator import DPCoordinator
+
+            address_key = self.key("ft", request_id, "dp_coordinator")
+            if is_master and self._ft_coordinator_key != store_key:
+                parallel = copy.copy(self.client.vllm_config.parallel_config)
+                parallel.data_parallel_master_ip = master_ip
+                parallel.data_parallel_size = size
+                parallel.data_parallel_rank = rank
+                coordinator = await asyncio.to_thread(
+                    DPCoordinator,
+                    parallel,
+                    enable_wave_coordination=self.client.vllm_config.model_config.is_moe,
+                )
+                previous = self.client.resources.coordinator
+                self.client.resources.coordinator = coordinator
+                self._ft_coordinator_key = store_key
+                if previous is not None:
+                    await asyncio.to_thread(previous.shutdown)
+                logger.info(
+                    "[FT] Started replacement DP Coordinator (PID: %d), size=%d",
+                    coordinator.proc.pid,
+                    size,
+                )
+            if is_master:
+                coordinator = self.client.resources.coordinator
+                assert coordinator is not None
+                addresses = (
+                    *coordinator.get_engine_socket_addresses(),
+                    coordinator.get_stats_publish_address(),
+                )
+                await asyncio.to_thread(
+                    store.set, address_key, msgspec.msgpack.encode(addresses)
+                )
+            await asyncio.to_thread(store.wait, [address_key], timedelta(seconds=60))
+            addresses = msgspec.msgpack.decode(
+                await asyncio.to_thread(store.get, address_key)
+            )
+            await self.client.reconnect_dp_coordinator(*addresses)
+
         ready_keys = [self.key("ft", request_id, "ready", r) for r in range(size)]
         await asyncio.to_thread(store.set, ready_keys[rank], b"1")
         await asyncio.to_thread(store.wait, ready_keys, timedelta(seconds=60))
