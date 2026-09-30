@@ -22,6 +22,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 
+DP_SYNC_METADATA_ROWS = 6
+
 _DP_SYNC_OVERRIDE: ContextVar[tuple[ProcessGroup, Callable[[], None] | None] | None] = (
     ContextVar("vllm_dp_sync_override", default=None)
 )
@@ -138,7 +140,7 @@ def sync_cudagraph_and_dp_padding(
     collective_epoch = (
         _enter_dp_metadata_collective() if sync_override is None else None
     )
-    metadata_rows = 7 if collective_epoch is not None else 6
+    metadata_rows = DP_SYNC_METADATA_ROWS + int(collective_epoch is not None)
     tensor = torch.zeros(metadata_rows, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
@@ -150,7 +152,7 @@ def sync_cudagraph_and_dp_padding(
         tensor[6][dp_rank] = collective_epoch
     if before_all_reduce is not None:
         before_all_reduce()
-    if should_skip_dp_coordination() and sync_override is None:
+    if sync_override is None and should_skip_dp_coordination():
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
         dist.all_reduce(tensor, group=group)

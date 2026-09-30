@@ -1124,9 +1124,12 @@ class EplbState:
         expanded_physical_to_logical: torch.Tensor,
     ) -> None:
         eplb_model_state = self.model_states[model_config.compute_hash()]
-        eplb_model_state.physical_to_logical_map_buffer.copy_(
-            expanded_physical_to_logical
-        )
+        # Platform bootstrap mappings may cover only the target active slots.
+        # Keep the preallocated capacity and its captured address unchanged.
+        buffer = eplb_model_state.physical_to_logical_map_buffer
+        width = expanded_physical_to_logical.shape[1]
+        buffer[:, :width].copy_(expanded_physical_to_logical)
+        buffer[:, width:].fill_(-1)
         eplb_model_state.expert_load_pass.zero_()
         physical_to_logical_map = eplb_model_state.physical_to_logical_map
 

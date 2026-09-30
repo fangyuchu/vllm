@@ -474,8 +474,11 @@ class ElasticEPScalingExecutor:
         )
         physical_to_logical = torch.nn.functional.pad(
             physical_to_logical,
-            (0, eplb_model_state.physical_to_logical_map_buffer.shape[1]
-             - physical_to_logical.shape[1]),
+            (
+                0,
+                eplb_model_state.physical_to_logical_map_buffer.shape[1]
+                - physical_to_logical.shape[1],
+            ),
             value=-1,
         )
         broadcast_expert_mapping(
@@ -563,7 +566,6 @@ class ElasticEPScalingExecutor:
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
         old_dp_group = get_dp_group()
         old_dp_size = get_active_dp_size(old_dp_group)
-        old_ep_size = get_ep_group().world_size // old_dp_group.world_size * old_dp_size
 
         if not self._can_reuse_fused_moe_kernel():
             self._release_cuda_graphs()
@@ -621,18 +623,19 @@ class ElasticEPScalingExecutor:
         if old_dp_size != old_dp_group.world_size:
             # FT leaves holes at the original rank positions. The standby
             # groups use dense survivor ranks, so align maps and load history.
-            for name in (
-                "physical_to_logical_map",
-                "expert_load_pass",
-                "expert_load_window",
+            for name, fill_value in (
+                ("physical_to_logical_map", -1),
+                ("expert_load_pass", 0),
             ):
-                setattr(
-                    eplb_model_state,
-                    name,
-                    compact_active_expert_tensor(
-                        getattr(eplb_model_state, name), old_dp_group
-                    ),
+                compacted = compact_active_expert_tensor(
+                    getattr(eplb_model_state, name), old_dp_group
                 )
+                buffer = getattr(eplb_model_state, f"{name}_buffer")
+                buffer[:, : compacted.shape[1]].copy_(compacted)
+                buffer[:, compacted.shape[1] :].fill_(fill_value)
+            eplb_model_state.expert_load_window = compact_active_expert_tensor(
+                eplb_model_state.expert_load_window, old_dp_group
+            )
 
         num_physical_experts = num_local_experts * new_ep_size
         num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
