@@ -4,6 +4,7 @@ import enum
 import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch.distributed
@@ -15,7 +16,10 @@ from vllm.distributed import (
 from vllm.distributed.elastic_ep.readiness import (
     new_worker_dist_init_ready_keys,
 )
-from vllm.distributed.utils import get_cached_tcp_store_client
+from vllm.distributed.utils import (
+    get_cached_tcp_store_client,
+    set_gloo_backend_timeout,
+)
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EEPNotificationType,
@@ -690,6 +694,11 @@ class ElasticEPScalingState:
         self.engine_core.engines_running = bool(data[0])
         self.engine_core.current_wave = int(data[1])
         self.engine_core.step_counter = int(data[2])
+        # Preparation may use the default long timeout. Once the replacement
+        # group is active, restore fault detection before resuming inference.
+        timeout_seconds = self.new_parallel_config.cpu_distributed_timeout_seconds
+        if timeout_seconds is not None:
+            set_gloo_backend_timeout(new_dp_group, timedelta(seconds=timeout_seconds))
         if new_dp_group.rank() == 0:
             logger.info("[Elastic EP] Switched to new setup")
 
