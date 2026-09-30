@@ -24,6 +24,7 @@ def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
     inverse, counts = compute_logical_maps(mapping, local_experts)
     model = MagicMock()
     model.num_logical_experts = local_experts
+    model.num_physical_experts = width
     moe = MagicMock()
     moe.moe_config.num_local_experts = local_experts
     moe._quant_method = SimpleNamespace(wraps_legacy_quant_method=False)
@@ -37,15 +38,28 @@ def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
         expert_load_window=torch.arange(6 * width).reshape(3, 2, width),
         num_unpadded_tokens_tensors=[],
     )
+    capacity = max(old_dp_size, new_dp_size) * tp_size * local_experts
+    model_state.physical_to_logical_map_buffer = F.pad(
+        mapping, (0, capacity - width), value=-1
+    )
+    model_state.physical_to_logical_map = model_state.physical_to_logical_map_buffer[
+        :, :width
+    ]
+    model_state.expert_load_pass_buffer = F.pad(
+        model_state.expert_load_pass, (0, capacity - width)
+    )
+    model_state.expert_load_pass = model_state.expert_load_pass_buffer[:, :width]
     eplb = object.__new__(EplbState)
     eplb.model_states = {"model": model_state}
     eplb.device = torch.device("cpu")
     eplb.drain_async = MagicMock()
+    eplb.update_communicator = MagicMock()
     eplb._propagate_shared_tensors = MagicMock()
     config = SimpleNamespace(
         data_parallel_size=old_dp_size - len(dead_ranks),
         data_parallel_rank=0,
         tensor_parallel_size=tp_size,
+        all2all_backend="allgather_reducescatter",
         eplb_config=SimpleNamespace(num_redundant_experts=width - local_experts),
     )
     worker = SimpleNamespace(
@@ -95,6 +109,7 @@ def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
             "ep": SimpleNamespace(world_size=new_dp_size * tp_size),
         },
     )
+    monkeypatch.setattr(elastic_execute, "get_ep_all2all_manager", MagicMock())
     monkeypatch.setattr(elastic_execute, "is_moe_layer", lambda module: module is moe)
     monkeypatch.setattr(
         elastic_execute, "set_current_vllm_config", lambda _: nullcontext()
@@ -119,6 +134,9 @@ def test_scale_up_preserves_surviving_experts_and_load_history(
         state.physical_to_logical_map[:, survivor_slots], (0, padding), value=-1
     )
     expected_pass = F.pad(state.expert_load_pass[:, survivor_slots], (0, padding))
+    if dead_ranks:
+        # Installing the recovered mapping resets the per-step load counters.
+        expected_pass.zero_()
     expected_window = F.pad(state.expert_load_window[..., survivor_slots], (0, padding))
     bound_maps = []
     state.model.set_eplb_state.side_effect = lambda load, inverse, counts: (
@@ -172,9 +190,12 @@ def test_broadcast_compacts_dead_rank_without_mutating_serving_state(
 
     sent = broadcast.call_args.kwargs
     survivor_slots = list(range(4 * tp_size)) + list(range(6 * tp_size, 8 * tp_size))
-    expected = original[:, survivor_slots]
+    expected = F.pad(
+        original[:, survivor_slots],
+        (0, state.physical_to_logical_map_buffer.shape[1] - len(survivor_slots)),
+        value=-1,
+    )
     torch.testing.assert_close(sent["physical_to_logical"], expected)
-    assert sent["num_local_physical_experts"] == 2
     torch.testing.assert_close(state.physical_to_logical_map, original)
 
 

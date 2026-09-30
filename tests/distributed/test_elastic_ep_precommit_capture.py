@@ -78,10 +78,15 @@ def _commit_state_after_fault(old_rank, new_rank, new_size=4):
         engine_index=old_rank,
         vllm_config=SimpleNamespace(parallel_config=parallel_config),
         output_queue=Queue(),
+        dp_store=MagicMock(),
     )
     sentinel = engine.ft_sentinel = EngineCoreSentinel(engine, parallel_config)
     sentinel._recover_and_vote = MagicMock()
-    sentinel.scale_down(FaultToleranceRequest("scale_down", {"removed_dp_ranks": [2]}))
+    sentinel.scale_down(
+        FaultToleranceRequest(
+            "scale_down", {"removed_dp_ranks": [2]}, request_id="shrink-1"
+        )
+    )
     engine.output_queue.get_nowait()
     sentinel._dp_reinit_epoch = 1
 
@@ -118,7 +123,9 @@ def test_scale_up_rebases_fault_state_for_the_next_failure(
 
     state, sentinel = _commit_state_after_fault(old_rank, new_rank, new_size)
     assert state._progress_existing_engine()
-    request = FaultToleranceRequest("scale_down", {"removed_dp_ranks": [removed_rank]})
+    request = FaultToleranceRequest(
+        "scale_down", {"removed_dp_ranks": [removed_rank]}, request_id="shrink-2"
+    )
     sentinel.scale_down(request)
 
     # A replacement may reuse a previously dead rank. Only this cycle's
@@ -150,6 +157,8 @@ def test_scale_up_does_not_allow_removing_the_survivor_at_its_new_rank():
 
     state, sentinel = _commit_state_after_fault(3, 2)
     state._progress_existing_engine()
-    request = FaultToleranceRequest("scale_down", {"removed_dp_ranks": [2]})
+    request = FaultToleranceRequest(
+        "scale_down", {"removed_dp_ranks": [2]}, request_id="shrink-1"
+    )
     with pytest.raises(ValueError, match=r"dp_rank=2, dead_dp_ranks=\[\]"):
         sentinel.scale_down(request)
