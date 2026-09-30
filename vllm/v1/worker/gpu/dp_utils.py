@@ -22,6 +22,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 
+DP_SYNC_METADATA_ROWS = 6
+
 _DP_SYNC_OVERRIDE: ContextVar[tuple[ProcessGroup, Callable[[], None] | None] | None] = (
     ContextVar("vllm_dp_sync_override", default=None)
 )
