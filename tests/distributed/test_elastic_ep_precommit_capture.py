@@ -135,7 +135,7 @@ def test_scale_up_rebases_fault_state_for_the_next_failure(
     _, output = sentinel.engine.output_queue.get_nowait()
     assert output.engine_index == old_rank
     assert output.utility_output.result.result == {
-        "id": old_rank,
+        "id": new_rank,
         "dp_rank": new_rank,
         "status": "healthy",
     }
