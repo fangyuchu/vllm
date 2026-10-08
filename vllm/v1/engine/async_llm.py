@@ -125,7 +125,7 @@ class AsyncLLM(EngineClient):
         self._elastic_ep_lock = asyncio.Lock()
         self._ft_frontend_sync_status: dict[str, Any] | None = None
         self._ft_pending_scale_down: tuple[Any, FaultToleranceResult] | None = None
-        self._ft_completed_scale_down: tuple[Any, FaultToleranceResult] | None = None
+        self._ft_completed_scale_down: dict[Any, FaultToleranceResult] = {}
         parallel_config = vllm_config.parallel_config
         # Fault-tolerance scale-down keeps original rank coordinates inside
         # EngineCore until the next Elastic EP reconfiguration. Track that
@@ -1276,12 +1276,34 @@ class AsyncLLM(EngineClient):
             )
             if (
                 fault_tolerance_request.request_id
-                and self._ft_completed_scale_down is not None
-                and self._ft_completed_scale_down[0] == key
+                and key in self._ft_completed_scale_down
             ):
-                return self._ft_completed_scale_down[1]
+                return self._ft_completed_scale_down[key]
+            # The public API uses current logical ranks. EngineCore and workers
+            # keep the pre-shrink rank space until the next Elastic EP commit.
+            # Check completed requests first: replaying one after another shrink
+            # must not remove a different rank through the updated mapping.
+            removed_dp_ranks = fault_tolerance_request.params["removed_dp_ranks"]
+            if any(
+                type(rank) is not int or not 0 <= rank < len(self._ft_active_dp_ranks)
+                for rank in removed_dp_ranks
+            ):
+                raise ValueError(
+                    f"Invalid logical removed_dp_ranks {removed_dp_ranks} "
+                    f"for current DP size {len(self._ft_active_dp_ranks)}"
+                )
+            internal_request = FaultToleranceRequest(
+                instruction="scale_down",
+                params={
+                    **fault_tolerance_request.params,
+                    "removed_dp_ranks": [
+                        self._ft_active_dp_ranks[rank] for rank in removed_dp_ranks
+                    ],
+                },
+                request_id=fault_tolerance_request.request_id,
+            )
             try:
-                result = await self._handle_scale_down(fault_tolerance_request, key)
+                result = await self._handle_scale_down(internal_request, key)
             except Exception as exc:
                 if self._ft_frontend_sync_status is not None:
                     self._ft_frontend_sync_status.update(
@@ -1289,7 +1311,8 @@ class AsyncLLM(EngineClient):
                     )
                 raise
             if result.success:
-                self._ft_completed_scale_down = (key, result)
+                if fault_tolerance_request.request_id:
+                    self._ft_completed_scale_down[key] = result
                 self._ft_pending_scale_down = None
                 self._ft_frontend_sync_status = None
             elif self._ft_frontend_sync_status is not None:

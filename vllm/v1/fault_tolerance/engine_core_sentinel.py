@@ -238,9 +238,13 @@ class EngineCoreSentinel:
 
     def _push_status(self, mask: list[int] | None = None):
         """Push current health to the client so it can refresh its cache."""
+        # Public ranks are dense after a successful shrink. Keep engine_index
+        # unchanged for IPC and keep the baseline rank for subsequent recovery.
+        alive = sorted(set(range(self._initial_dp_size)) - self._dead_dp_ranks)
+        logical_rank = alive.index(self.parallel_config.data_parallel_rank)
         payload = {
-            "id": self.engine_index,
-            "dp_rank": self.parallel_config.data_parallel_rank,
+            "id": logical_rank,
+            "dp_rank": logical_rank,
             "status": self.status_type.name.lower(),
         }
         if self.status_type == EngineStatusType.UNHEALTHY:
