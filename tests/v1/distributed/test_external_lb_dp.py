@@ -114,7 +114,8 @@ def test_external_elastic_ep_status_reads_shared_epoch(
     }
 
 
-def test_external_elastic_ep_calculates_target_expert_redundancy():
+@pytest.mark.parametrize("old_size,new_size,expected", [(2, 3, 64), (4, 3, None)])
+def test_external_elastic_ep_expert_capacity(old_size, new_size, expected):
     client = SimpleNamespace(
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(get_num_experts=lambda: 128),
@@ -125,22 +126,13 @@ def test_external_elastic_ep_calculates_target_expert_redundancy():
     )
     coordinator = ExternalElasticEPScaleCoordinator(cast("DPAsyncMPClient", client))
 
-    assert coordinator._calculate_num_redundant_experts(2, 3) == 64
-
-
-def test_external_elastic_ep_rejects_insufficient_expert_capacity():
-    client = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(get_num_experts=lambda: 128),
-            parallel_config=SimpleNamespace(
-                eplb_config=SimpleNamespace(num_redundant_experts=0)
-            ),
+    if expected is None:
+        with pytest.raises(ValueError, match="cannot retain all model experts"):
+            coordinator._calculate_num_redundant_experts(old_size, new_size)
+    else:
+        assert (
+            coordinator._calculate_num_redundant_experts(old_size, new_size) == expected
         )
-    )
-    coordinator = ExternalElasticEPScaleCoordinator(cast("DPAsyncMPClient", client))
-
-    with pytest.raises(ValueError, match="cannot retain all model experts"):
-        coordinator._calculate_num_redundant_experts(4, 3)
 
 
 @pytest.mark.asyncio
