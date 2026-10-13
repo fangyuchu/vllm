@@ -104,7 +104,6 @@ class ElasticEPScalingState:
         self._new_dp_sync: tuple[object, Any] | None = None
         self._precommit_capture_enabled: bool | None = None
         self._precommit_operation_id = ""
-        self._prepare_quiesce_started = False
         self._prepare_quiesce_complete = False
         self.state: EngineState
         if scale_type == "scale_up":
@@ -175,7 +174,6 @@ class ElasticEPScalingState:
         """Enter drain after all old ranks agree in the regular DP-state sync."""
         assert self.is_precommit_prepare_ready()
         self._prepare_workers_synchronized = True
-        self._prepare_quiesce_started = True
         self.engine_core._eep_drain_batch_queue = True
         self.engine_core._eep_force_dummy_batch = False
         logger.info(
@@ -209,7 +207,6 @@ class ElasticEPScalingState:
     def _progress_prepare_quiesce(self) -> bool:
         """Drain at a common Worker DP collective boundary."""
         assert self.old_dp_group is not None
-        self._prepare_quiesce_started = True
 
         if self._drain_dummy_future is not None and self._drain_dummy_future.done():
             self._drain_dummy_future.result()
@@ -280,7 +277,7 @@ class ElasticEPScalingState:
             self.scale_type == "scale_up"
             and self.worker_type == "existing"
             and self.state == ScaleUpExistingEngineState.PREPARE
-            and self._prepare_quiesce_started
+            and self._prepare_workers_synchronized
         )
 
     def _wait_for_async_workers(self, done_keys: list[str]) -> None:
@@ -342,11 +339,8 @@ class ElasticEPScalingState:
                     return False
                 self._prepare_workers_complete = True
 
-            # Most platforms finish preparation entirely on the background
-            # Worker thread. Ascend's V3 fast path has a second phase with NPU
-            # mapping/MC2 collectives. Match the migration-source ordering:
-            # background groups and weights first, then drain old-rank model
-            # execution immediately before this collective phase.
+            # Drain serving work before finalizing the mapping and communication
+            # context used for precommit capture.
             if self._uses_precommit_graph_capture():
                 if not self._prepare_workers_synchronized:
                     # Idle ranks must also run dummy steps to reach the regular
@@ -443,9 +437,7 @@ class ElasticEPScalingState:
                     args=("capture_new_rank_graphs", self._operation_id),
                 )
             else:
-                self._collective_rpc(
-                    "elastic_ep_execute", args=("warmup_new_worker",)
-                )
+                self._collective_rpc("elastic_ep_execute", args=("warmup_new_worker",))
             self._mark_ready_for_switch()
             self._wait_for_external_scale_commit()
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
