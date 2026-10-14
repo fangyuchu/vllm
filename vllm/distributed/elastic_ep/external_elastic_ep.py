@@ -631,18 +631,24 @@ class ExternalElasticEPScaleCoordinator:
         # No engine may enter the collective pause until all old API ranks
         # have finished draining; a drain failure must reach waiting peers.
         store = prepared.reconfig_store
-        store.set(self.key(prepared.epoch, "commit_ready", prepared.dp_rank), b"1")
+        await asyncio.to_thread(
+            store.set, self.key(prepared.epoch, "commit_ready", prepared.dp_rank), b"1"
+        )
         keys = [
             self.key(prepared.epoch, "commit_ready", rank)
             for rank in range(prepared.cur_data_parallel_size)
         ]
-        start = asyncio.get_running_loop().time()
-        backoff_step = 0
-        while True:
+
+        def is_ready() -> bool:
             error = self._get_error(prepared.control_store, prepared.epoch)
             if error is not None:
                 raise RuntimeError(error)
-            if store.check(keys):
+            return store.check(keys)
+
+        start = asyncio.get_running_loop().time()
+        backoff_step = 0
+        while True:
+            if await asyncio.to_thread(is_ready):
                 return
             if asyncio.get_running_loop().time() - start > timeout_s:
                 raise TimeoutError("Timed out waiting for external Elastic EP drains.")
