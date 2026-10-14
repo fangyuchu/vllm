@@ -21,6 +21,7 @@ from vllm.distributed.utils import (
     enter_steady_state,
     fetch_group_ports,
     get_cached_tcp_store_client,
+    get_cpu_distributed_timeout_or_none,
     set_gloo_backend_timeout,
 )
 from vllm.logger import init_logger
@@ -63,7 +64,13 @@ def _reinit_cpu_group(
     else:
         port, listen_socket = fetch_group_ports(store, key, 1)[0], None
     new_group = stateless_init_torch_distributed_process_group(
-        host, port, rank, size, backend="gloo", listen_socket=listen_socket
+        host,
+        port,
+        rank,
+        size,
+        backend="gloo",
+        listen_socket=listen_socket,
+        timeout=get_cpu_distributed_timeout_or_none(),
     )
     stateless_destroy_torch_distributed_process_group(group.cpu_group)
     group.cpu_group = new_group
