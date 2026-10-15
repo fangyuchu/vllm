@@ -173,6 +173,50 @@ class ElasticEPScalingExecutor:
             self.worker.vllm_config.parallel_config,
         )
 
+    def _batch_transfer_weights(
+        self,
+        model: nn.Module,
+        is_sender: bool,
+        peer_rank: int,
+        dp_group: StatelessGroupCoordinator,
+        expert_weights: Sequence[Iterable[torch.Tensor]],
+    ) -> None:
+        """Backend hook: transfer the non-expert weights to a scale-up peer."""
+        batch_transfer_weights(
+            model=model,
+            is_sender=is_sender,
+            peer_rank=peer_rank,
+            dp_group=dp_group,
+            expert_weights=expert_weights,
+        )
+
+    def _create_backend_standby_groups(
+        self,
+        reconfig_request: ReconfigureDistributedRequest,
+        new_dp_size: int,
+        new_world_size_across_dp: int,
+    ) -> None:
+        """Backend hook: create backend-specific standby groups.
+
+        Called right after the upstream world/dp/ep/eplb standby groups so the
+        rendezvous order matches the new worker's boot order.
+        """
+
+    def _expert_load_view(self, eplb_model_state) -> torch.Tensor:
+        """Backend hook: load tensor handed to ``model.set_eplb_state``."""
+        return eplb_model_state.expert_load_pass_buffer
+
+    def _on_topology_switched(
+        self,
+        retired_groups: tuple[GroupCoordinator | None, ...],
+        moe_modules: list[nn.Module],
+    ) -> tuple[GroupCoordinator | None, ...]:
+        """Backend hook: run after the standby groups become active."""
+        return retired_groups
+
+    def _after_scale_down_reshuffle(self) -> None:
+        """Backend hook: run after the scale-down EPLB reshuffle."""
+
     @contextmanager
     def _suppress_eplb(self) -> Iterator[None]:
         # A rank warming up alone must not advance the EPLB step counter.
@@ -288,6 +332,9 @@ class ElasticEPScalingExecutor:
             use_all2all=use_all2all,
             enable_eplb=parallel_config.enable_eplb,
         )
+        self._create_backend_standby_groups(
+            reconfig_request, new_dp_size, new_world_size_across_dp
+        )
         standby_ep_group = get_standby_ep_group()
         assert standby_ep_group is not None
         all2all_manager = get_ep_all2all_manager(standby_ep_group)
@@ -351,7 +398,7 @@ class ElasticEPScalingExecutor:
 
         model = self.worker.model_runner.get_model()
         for new_worker_rank in sorted(ranks_to_send):
-            batch_transfer_weights(
+            self._batch_transfer_weights(
                 model=model,
                 is_sender=True,
                 peer_rank=new_worker_rank,
@@ -537,7 +584,7 @@ class ElasticEPScalingExecutor:
         model.expert_weights = []
         with set_current_vllm_config(self.worker.vllm_config):
             model.set_eplb_state(
-                eplb_model_state.expert_load_pass_buffer,
+                self._expert_load_view(eplb_model_state),
                 eplb_model_state.logical_to_physical_map,
                 eplb_model_state.logical_replica_count,
             )
@@ -559,7 +606,7 @@ class ElasticEPScalingExecutor:
         eplb_state.update_communicator(model_config, self._prepared_eplb_communicator)
         self._prepared_eplb_communicator = None
 
-        return retired_groups
+        return self._on_topology_switched(retired_groups, moe_modules)
 
     def _perform_eplb_reshuffle(
         self,
@@ -613,6 +660,7 @@ class ElasticEPScalingExecutor:
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
         self.perform_scale_down_eplb_reshuffle(new_dp_size)
+        self._after_scale_down_reshuffle()
         if removing:
             self.switch_and_remove()
         else:
@@ -670,7 +718,7 @@ class ElasticEPScalingExecutor:
             for module in model.modules()
             if is_moe_layer(module)
         ]
-        batch_transfer_weights(
+        self._batch_transfer_weights(
             model=model,
             is_sender=False,
             peer_rank=sender_rank,
