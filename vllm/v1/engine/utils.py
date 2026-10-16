@@ -1146,7 +1146,11 @@ def get_engine_zmq_bind_addresses(
     )
     # NOTE(yongji): handling scaling from intra-node to inter-node
     if parallel_config.enable_elastic_ep and (
-        not local_engines_only or parallel_config.data_parallel_rank == 0
+        not local_engines_only
+        or (
+            parallel_config.data_parallel_rank == 0
+            and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+        )
     ):
         client_local_only = False
 
@@ -1233,7 +1237,10 @@ def launch_core_engines(
     # 1. Internal/hybrid LB: collecting and publishing queue stats for load balancing
     # 2. MoE models: wave coordination in addition to stats
     run_coordinator = (
-        vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
+        vllm_config.needs_dp_coordinator
+        and not offline_mode
+        and dp_rank == 0
+        and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
     )
 
     coord_store = None
@@ -1243,6 +1250,7 @@ def launch_core_engines(
         and parallel_config.data_parallel_backend != "ray"
         and dp_rank == 0
         and not parallel_config._coord_store_port
+        and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
     )
 
     if create_coord_store:
@@ -1316,7 +1324,7 @@ def launch_core_engines(
     if offline_mode:
         assert local_engine_count == 1
         engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
-    elif dp_rank == 0:
+    elif dp_rank == 0 and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
         # Rank 0 holds Coordinator, so it handshakes with all Cores
         # in both external dplb and internal dplb mode.
         # Note this also covers the case where we have zero local engines
@@ -1351,7 +1359,7 @@ def launch_core_engines(
         parallel_config.data_parallel_rpc_port,
     )
 
-    if local_engines_only and dp_rank > 0:
+    if local_engines_only and (dp_rank > 0 or envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH):
         assert not handshake_local_only
         local_handshake_address = get_open_zmq_ipc_path()
         client_handshake_address = local_handshake_address
@@ -1553,6 +1561,9 @@ def wait_for_engine_startup(
             coord_store_port = msg.get("coord_store_port")
             if coord_store_port is not None and local:
                 parallel_config._coord_store_port = coord_store_port
+                parallel_config._data_parallel_master_rank = msg.get(
+                    "data_parallel_master_rank", 0
+                )
             num_redundant_experts = msg.get("num_redundant_experts")
             if num_redundant_experts is not None and local:
                 parallel_config.eplb_config.num_redundant_experts = (

@@ -273,7 +273,12 @@ class EngineCoreClient(ABC):
     async def commit_elastic_ep(self) -> None:
         raise NotImplementedError
 
-    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
+    async def prepare_elastic_ep(
+        self,
+        new_data_parallel_size: int,
+        *,
+        existing_dp_ranks: list[int] | None = None,
+    ) -> None:
         raise NotImplementedError
 
     async def abort_external_elastic_ep(self, error: str) -> None:
@@ -929,6 +934,7 @@ class MPClient(EngineCoreClient):
 
         parallel_config = vllm_config.parallel_config
         if response.coord_store_port:
+            parallel_config._data_parallel_master_rank = response.data_parallel_master_rank
             if parallel_config._coord_store_port:
                 assert response.coord_store_port == parallel_config._coord_store_port
             else:
@@ -1734,7 +1740,12 @@ class DPAsyncMPClient(AsyncMPClient):
         assert coordinator is not None
         return coordinator
 
-    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
+    async def prepare_elastic_ep(
+        self,
+        new_data_parallel_size: int,
+        *,
+        existing_dp_ranks: list[int] | None = None,
+    ) -> None:
         cur_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
 
         assert new_data_parallel_size != cur_data_parallel_size, (
@@ -1742,7 +1753,9 @@ class DPAsyncMPClient(AsyncMPClient):
             f"different from cur_data_parallel_size {cur_data_parallel_size}"
         )
         await self._get_external_eep_coordinator().prepare(
-            cur_data_parallel_size, new_data_parallel_size
+            cur_data_parallel_size,
+            new_data_parallel_size,
+            existing_dp_ranks=existing_dp_ranks,
         )
 
     async def commit_elastic_ep(self) -> None:
@@ -2022,7 +2035,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         )
         self._prepared_elastic_ep = None
 
-    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
+    async def prepare_elastic_ep(
+        self,
+        new_data_parallel_size: int,
+        *,
+        existing_dp_ranks: list[int] | None = None,
+    ) -> None:
         """Prepare elastic EP scaling without routing requests to new engines."""
         if (prepared := self._prepared_elastic_ep) is not None:
             if prepared[0] == new_data_parallel_size:

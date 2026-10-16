@@ -403,6 +403,11 @@ class ParallelConfig:
     Set to be private as it's not intended to be configured by users.
     """
 
+    _data_parallel_master_rank: int = 0
+    """Owner of the coordination stores; independent of communication rank 0."""
+    _eep_existing_dp_ranks: list[int] | None = None
+    """Surviving DP identities in the current external scale-up operation."""
+
     _coord_store_port: int = 0
     """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
@@ -713,7 +718,7 @@ class ParallelConfig:
     def _pick_stateless_dp_port(self) -> tuple[int, socket.socket | None]:
         """Return ``(port, listen_socket)`` for DP group init.
 
-        With a coord store, rank 0 binds a socket and publishes the port;
+        With a coord store, its owning rank binds and publishes the port;
         others read it.  Without one, pops a pre-allocated port and
         returns ``listen_socket=None``.
         """
@@ -727,7 +732,7 @@ class ParallelConfig:
         )
 
         key = "dp_master_port"
-        if self.data_parallel_rank == 0:
+        if self.data_parallel_rank == self._data_parallel_master_rank:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.bind((self.data_parallel_master_ip, 0))
             s.listen()
@@ -780,6 +785,7 @@ class ParallelConfig:
                     return_store=return_store,
                     listen_socket=listen_socket,
                     timeout=timeout,
+                    store_master_rank=self._data_parallel_master_rank,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.
@@ -970,6 +976,8 @@ class ParallelConfig:
             "data_parallel_master_port",
             "_data_parallel_master_port_list",
             "_coord_store_port",
+            "_data_parallel_master_rank",
+            "_eep_existing_dp_ranks",
             "data_parallel_rpc_port",
             "rank",
             "master_addr",
