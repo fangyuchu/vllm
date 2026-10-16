@@ -64,9 +64,12 @@ def _reinit_cpu_group(
         store.set(f"{key}_host", get_ip())
     host = store.get(f"{key}_host").decode()
     if rank == 0:
+        host = get_ip()
+        store.set(f"{key}/host", host.encode())
         ports, socks = allocate_group_ports(store, key, host, 1)
         port, listen_socket = ports[0], socks[0]
     else:
+        host = store.get(f"{key}/host").decode()
         port, listen_socket = fetch_group_ports(store, key, 1)[0], None
     new_group = stateless_init_torch_distributed_process_group(
         host,
