@@ -83,6 +83,8 @@ def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
         new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
         new_data_parallel_master_ip="127.0.0.1",
         new_data_parallel_master_port=29500,
+        data_parallel_master_rank=0,
+        existing_dp_ranks=None,
     )
     executor._prepared_eplb_communicator = object()
     executor._release_cuda_graphs = MagicMock()
