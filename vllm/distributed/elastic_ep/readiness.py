@@ -41,7 +41,9 @@ def new_worker_dist_init_ready_keys(
             operation_scope,
             dp_rank * worker_world_size + worker_rank,
         )
-        for dp_rank in range(old_dp_size, new_dp_size)
+        for dp_rank in range(new_dp_size)
+        if dp_rank
+        not in (parallel_config._eep_existing_dp_ranks or list(range(old_dp_size)))
         for worker_rank in range(worker_world_size)
     ]
 
