@@ -628,6 +628,7 @@ def stateless_init_torch_distributed_process_group(
     group_name: str | None = None,
     return_store: bool = False,
     listen_socket: socket.socket | None = None,
+    store_master_rank: int = 0,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -677,13 +678,13 @@ def stateless_init_torch_distributed_process_group(
         if device_timeout is not None:
             timeout = device_timeout
 
-    if listen_socket is not None:
+    if listen_socket is not None or store_master_rank != 0:
         store = create_tcp_store(
             host,
             port,
             listen_socket=listen_socket,
             world_size=world_size,
-            is_master=True,
+            is_master=rank == store_master_rank,
             timeout=timeout,
             multi_tenant=True,
         )

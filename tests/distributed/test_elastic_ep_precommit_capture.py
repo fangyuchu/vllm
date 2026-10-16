@@ -45,9 +45,9 @@ def test_existing_engine_waits_for_precommit_capture_before_commit(precommit_cap
     state._mark_ready_for_switch.assert_called_once_with()
 
 
-def test_ready_keys_use_dense_ranks_after_fault_tolerance_scale_down():
+def test_ready_keys_preserve_rank_slots_after_fault_tolerance_scale_down():
     keys = []
-    for old_rank, new_rank in [(0, 0), (1, 1), (3, 2), (3, 3)]:
+    for old_rank, new_rank in [(0, 0), (1, 1), (2, 2), (3, 3)]:
         state = object.__new__(ElasticEPScalingState)
         engine_core = SimpleNamespace(dp_rank=old_rank)
         state.engine_core_ref = lambda engine_core=engine_core: engine_core
@@ -65,6 +65,7 @@ def _commit_state_after_fault(old_rank, new_rank, new_size=4):
         data_parallel_rank=old_rank,
         data_parallel_size=4,
         data_parallel_master_ip="127.0.0.1",
+        _data_parallel_master_rank=0,
         fault_tolerance_config=SimpleNamespace(engine_recovery_timeout_sec=300),
     )
     engine = SimpleNamespace(
@@ -98,6 +99,8 @@ def _commit_state_after_fault(old_rank, new_rank, new_size=4):
         new_data_parallel_master_port=29860,
         new_data_parallel_master_port_list=[],
         coord_store_port=29861,
+        existing_dp_ranks=[0, 1, 3],
+        data_parallel_master_rank=0,
     )
     state._commit_new_dp_group = MagicMock()
     state._collective_rpc = MagicMock()
@@ -107,7 +110,7 @@ def _commit_state_after_fault(old_rank, new_rank, new_size=4):
 
 @pytest.mark.parametrize(
     "old_rank,new_rank,new_size,removed_rank",
-    [(3, 2, 4, 3), (0, 0, 4, 2), (3, 2, 5, 4)],
+    [(3, 3, 4, 2), (0, 0, 4, 2), (3, 3, 5, 4)],
 )
 def test_scale_up_rebases_fault_state_for_the_next_failure(
     old_rank, new_rank, new_size, removed_rank
@@ -128,14 +131,14 @@ def test_scale_up_rebases_fault_state_for_the_next_failure(
     _, output = sentinel.engine.output_queue.get_nowait()
     assert output.engine_index == old_rank
     assert output.utility_output.result.result == {
-        "id": new_rank,
+        "id": old_rank,
         "dp_rank": new_rank,
         "status": "healthy",
     }
 
 
 def test_failed_scale_up_keeps_fault_state():
-    state, sentinel = _commit_state_after_fault(3, 2)
+    state, sentinel = _commit_state_after_fault(3, 3)
     state._collective_rpc.side_effect = RuntimeError("worker commit failed")
     with pytest.raises(RuntimeError, match="worker commit failed"):
         state._progress_existing_engine()
@@ -145,13 +148,13 @@ def test_failed_scale_up_keeps_fault_state():
     assert sentinel.engine.output_queue.empty()
 
 
-def test_scale_up_does_not_allow_removing_the_survivor_at_its_new_rank():
+def test_scale_up_does_not_allow_removing_the_survivor_itself():
     from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 
-    state, sentinel = _commit_state_after_fault(3, 2)
+    state, sentinel = _commit_state_after_fault(3, 3)
     state._progress_existing_engine()
     request = FaultToleranceRequest(
-        "scale_down", {"removed_dp_ranks": [2]}, request_id="shrink-1"
+        "scale_down", {"removed_dp_ranks": [3]}, request_id="shrink-1"
     )
-    with pytest.raises(ValueError, match=r"dp_rank=2, dead_dp_ranks=\[\]"):
+    with pytest.raises(ValueError, match=r"dp_rank=3, dead_dp_ranks=\[\]"):
         sentinel.scale_down(request)

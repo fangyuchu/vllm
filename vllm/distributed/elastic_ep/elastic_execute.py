@@ -104,6 +104,21 @@ def get_active_dp_size(dp_group: GroupCoordinator | None = None) -> int:
     return active_dp_size
 
 
+def scale_up_source_rank(
+    existing_ranks: list[int], new_ranks: list[int], rank: int
+) -> int:
+    """Pair joiners with survivors, balancing contiguous receiver slices."""
+    index = new_ranks.index(rank)
+    count, remainder = divmod(len(new_ranks), len(existing_ranks))
+    larger_span = remainder * (count + 1)
+    sender_index = (
+        index // (count + 1)
+        if index < larger_span
+        else remainder + (index - larger_span) // count
+    )
+    return existing_ranks[sender_index]
+
+
 def compact_active_expert_tensor(
     tensor: torch.Tensor, dp_group: GroupCoordinator
 ) -> torch.Tensor:
@@ -389,43 +404,35 @@ class ElasticEPScalingExecutor:
             model_runner.model_config, eplb_group
         )
 
+    def scale_up_members(
+        self, old_dp_size: int, new_dp_size: int
+    ) -> tuple[list[int], list[int]]:
+        request = self.reconfig_request
+        existing = request.existing_dp_ranks if request is not None else None
+        if request is None:
+            existing = self.worker.vllm_config.parallel_config._eep_existing_dp_ranks
+        if existing is None:
+            existing = list(range(old_dp_size))
+        return existing, [rank for rank in range(new_dp_size) if rank not in existing]
+
+    def _mapping_source_rank(self) -> int:
+        request = self.reconfig_request
+        existing = request.existing_dp_ranks if request is not None else None
+        if request is None:
+            existing = self.worker.vllm_config.parallel_config._eep_existing_dp_ranks
+        return existing[0] if existing else 0
+
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
-        # Broadcast old_dp_size to all workers in standby group
-        if standby_dp_group.rank_in_group < old_dp_size:
-            old_dp_size_tensor = torch.tensor(
-                [old_dp_size], dtype=torch.int64, device="cpu"
-            )
-        else:
-            old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
-        old_dp_size_tensor = standby_dp_group.tcp_store_group.broadcast(
-            old_dp_size_tensor, 0
+        existing, new = self.scale_up_members(old_dp_size, new_dp_size)
+        standby_dp_group.tcp_store_group.broadcast(
+            torch.tensor([old_dp_size], dtype=torch.int64, device="cpu"), existing[0]
         )
-
-        num_new_workers = new_dp_size - old_dp_size
-        # Use the rank in the target topology. After fault-tolerance shrink the
-        # Worker config intentionally retains its original physical DP rank,
-        # which can differ from the dense rank assigned to the standby group.
         dp_rank = standby_dp_group.rank_in_group
-
-        # Sender-receiver pairing: the first new_workers % old_dp_size
-        # senders get (k+1) contiguous receivers, the rest get k
-        # receivers.
-        num_dst_per_sender = num_new_workers // old_dp_size
-        remainder = num_new_workers % old_dp_size
-
-        if dp_rank < remainder:
-            recv_begin = dp_rank * (num_dst_per_sender + 1)
-            recv_end = recv_begin + num_dst_per_sender + 1
-        else:
-            recv_begin = (
-                remainder * (num_dst_per_sender + 1)
-                + (dp_rank - remainder) * num_dst_per_sender
-            )
-            recv_end = recv_begin + num_dst_per_sender
-
-        ranks_to_send = list(range(old_dp_size + recv_begin, old_dp_size + recv_end))
+        ranks_to_send = [
+            rank for rank in new if scale_up_source_rank(existing, new, rank) == dp_rank
+        ]
 
         model = self.worker.model_runner.get_model()
         for new_worker_rank in sorted(ranks_to_send):
@@ -469,9 +476,14 @@ class ElasticEPScalingExecutor:
         assert eplb_state is not None
         eplb_state.drain_async()
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
-        physical_to_logical = compact_active_expert_tensor(
-            eplb_model_state.physical_to_logical_map, get_dp_group()
-        )
+        physical_to_logical = eplb_model_state.physical_to_logical_map
+        if (
+            self.reconfig_request is None
+            or self.reconfig_request.existing_dp_ranks is None
+        ):
+            physical_to_logical = compact_active_expert_tensor(
+                physical_to_logical, get_dp_group()
+            )
         physical_to_logical = torch.nn.functional.pad(
             physical_to_logical,
             (
@@ -484,7 +496,7 @@ class ElasticEPScalingExecutor:
         broadcast_expert_mapping(
             physical_to_logical=physical_to_logical,
             dp_group=standby_dp_group,
-            src_rank=0,
+            src_rank=self._mapping_source_rank(),
             device=self.worker.device,
         )
 
@@ -593,6 +605,10 @@ class ElasticEPScalingExecutor:
         parallel_config.data_parallel_master_ip = (
             reconfig_request.new_data_parallel_master_ip
         )
+        parallel_config._data_parallel_master_rank = (
+            reconfig_request.data_parallel_master_rank
+        )
+        parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
         parallel_config.data_parallel_master_port = (
             reconfig_request.new_data_parallel_master_port
         )
@@ -620,7 +636,10 @@ class ElasticEPScalingExecutor:
         model_config = self.worker.model_runner.model_config
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
 
-        if old_dp_size != old_dp_group.world_size:
+        if (
+            old_dp_size != old_dp_group.world_size
+            and reconfig_request.existing_dp_ranks is None
+        ):
             # FT leaves holes at the original rank positions. The standby
             # groups use dense survivor ranks, so align maps and load history.
             for name, fill_value in (
@@ -644,7 +663,10 @@ class ElasticEPScalingExecutor:
         )
         eplb_state.reconfigure_physical_expert_slots(model_config, num_physical_experts)
 
-        if old_dp_size != old_dp_group.world_size:
+        if (
+            old_dp_size != old_dp_group.world_size
+            and reconfig_request.existing_dp_ranks is None
+        ):
             # Rebuild inverse maps before layers cache their routing tables.
             eplb_state.update_mapping(
                 model_config, eplb_model_state.physical_to_logical_map
@@ -773,23 +795,13 @@ class ElasticEPScalingExecutor:
 
         # Receive old_dp_size broadcasted during transfer_weights
         old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
-        old_dp_size_tensor = dp_group.tcp_store_group.broadcast(old_dp_size_tensor, 0)
+        old_dp_size_tensor = dp_group.tcp_store_group.broadcast(
+            old_dp_size_tensor, self._mapping_source_rank()
+        )
         old_dp_size = int(old_dp_size_tensor[0].item())
 
-        # Calculate which existing worker will send to this new worker
-        num_new_workers = new_dp_size - old_dp_size
-        new_worker_idx = dp_rank - old_dp_size
-        num_dst_per_sender = num_new_workers // old_dp_size
-        remainder = num_new_workers % old_dp_size
-
-        if new_worker_idx < remainder * (num_dst_per_sender + 1):
-            sender_rank = new_worker_idx // (num_dst_per_sender + 1)
-        else:
-            sender_rank = (
-                remainder
-                + (new_worker_idx - remainder * (num_dst_per_sender + 1))
-                // num_dst_per_sender
-            )
+        existing, new = self.scale_up_members(old_dp_size, new_dp_size)
+        sender_rank = scale_up_source_rank(existing, new, dp_rank)
 
         model = self.worker.model_runner.get_model()
         expert_weights = [
@@ -817,7 +829,7 @@ class ElasticEPScalingExecutor:
         return broadcast_expert_mapping(
             physical_to_logical=None,
             dp_group=dp_group,
-            src_rank=0,
+            src_rank=self._mapping_source_rank(),
             device=self.worker.device,
         )
 

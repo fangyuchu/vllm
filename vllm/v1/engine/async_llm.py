@@ -127,10 +127,8 @@ class AsyncLLM(EngineClient):
         self._ft_pending_scale_down: tuple[Any, FaultToleranceResult] | None = None
         self._ft_completed_scale_down: dict[Any, FaultToleranceResult] = {}
         parallel_config = vllm_config.parallel_config
-        # Fault-tolerance scale-down keeps original rank coordinates inside
-        # EngineCore until the next Elastic EP reconfiguration. Track that
-        # mapping in the frontend so repeated FT scale-downs can still expose
-        # the dense, currently serving topology to the Elastic EP API.
+        # Keep the same recovery rank space as EngineCore after FT scale-down.
+        # Scale-up fills missing slots without renumbering these survivors.
         self._ft_original_dp_rank = parallel_config.data_parallel_rank
         self._ft_active_dp_ranks = list(range(parallel_config.data_parallel_size))
         self.model_config = vllm_config.model_config
@@ -1203,7 +1201,14 @@ class AsyncLLM(EngineClient):
             )
             return
 
-        await self.engine_core.prepare_elastic_ep(new_data_parallel_size)
+        target_dp_rank = parallel_config.data_parallel_rank
+        if parallel_config.data_parallel_external_lb:
+            await self.engine_core.prepare_elastic_ep(
+                new_data_parallel_size,
+                existing_dp_ranks=self._ft_active_dp_ranks.copy(),
+            )
+        else:
+            await self.engine_core.prepare_elastic_ep(new_data_parallel_size)
 
         # recreate stat loggers
         if new_data_parallel_size > old_data_parallel_size and self.log_stats:
@@ -1229,7 +1234,7 @@ class AsyncLLM(EngineClient):
         rank_will_retire = (
             parallel_config.data_parallel_external_lb
             and new_data_parallel_size < old_data_parallel_size
-            and parallel_config.data_parallel_rank >= new_data_parallel_size
+            and target_dp_rank >= new_data_parallel_size
         )
         if rank_will_retire:
             set_elastic_ep_rank_retired(True)
@@ -1279,31 +1284,8 @@ class AsyncLLM(EngineClient):
                 and key in self._ft_completed_scale_down
             ):
                 return self._ft_completed_scale_down[key]
-            # The public API uses current logical ranks. EngineCore and workers
-            # keep the pre-shrink rank space until the next Elastic EP commit.
-            # Check completed requests first: replaying one after another shrink
-            # must not remove a different rank through the updated mapping.
-            removed_dp_ranks = fault_tolerance_request.params["removed_dp_ranks"]
-            if any(
-                type(rank) is not int or not 0 <= rank < len(self._ft_active_dp_ranks)
-                for rank in removed_dp_ranks
-            ):
-                raise ValueError(
-                    f"Invalid logical removed_dp_ranks {removed_dp_ranks} "
-                    f"for current DP size {len(self._ft_active_dp_ranks)}"
-                )
-            internal_request = FaultToleranceRequest(
-                instruction="scale_down",
-                params={
-                    **fault_tolerance_request.params,
-                    "removed_dp_ranks": [
-                        self._ft_active_dp_ranks[rank] for rank in removed_dp_ranks
-                    ],
-                },
-                request_id=fault_tolerance_request.request_id,
-            )
             try:
-                result = await self._handle_scale_down(internal_request, key)
+                result = await self._handle_scale_down(fault_tolerance_request, key)
             except Exception as exc:
                 if self._ft_frontend_sync_status is not None:
                     self._ft_frontend_sync_status.update(
@@ -1329,7 +1311,7 @@ class AsyncLLM(EngineClient):
         migrate_store = (
             parallel_config.enable_elastic_ep
             and parallel_config.data_parallel_external_lb
-            and self._ft_active_dp_ranks[0] in params["removed_dp_ranks"]
+            and parallel_config._data_parallel_master_rank in params["removed_dp_ranks"]
         )
         if migrate_store:
             self._ft_frontend_sync_status = {
@@ -1412,6 +1394,7 @@ class AsyncLLM(EngineClient):
                     len(active_dp_ranks),
                     fault_tolerance_request.request_id,
                 )
+                parallel_config._data_parallel_master_rank = active_dp_ranks[0]
                 parallel_config.data_parallel_master_ip = params["dp_master_ip"]
                 parallel_config._coord_store_port = params["coord_store_port"]
             if old_num_redundant_experts is not None:
@@ -1419,9 +1402,6 @@ class AsyncLLM(EngineClient):
                     new_num_redundant_experts
                 )
             parallel_config.data_parallel_size = len(active_dp_ranks)
-            parallel_config.data_parallel_rank = active_dp_ranks.index(
-                self._ft_original_dp_rank
-            )
             self._ft_active_dp_ranks = active_dp_ranks
             logger.info(
                 "[FT] Synchronized frontend DP config after scale_down: "

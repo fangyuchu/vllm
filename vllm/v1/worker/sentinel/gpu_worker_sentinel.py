@@ -25,6 +25,7 @@ from vllm.distributed.utils import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.utils.network_utils import get_ip
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.sentinel.eplb_redistribute import (
@@ -58,9 +59,12 @@ def _reinit_cpu_group(
 ) -> None:
     """Rebuild a group's Gloo cpu_group over a port coordinated via ``store``"""
     if rank == 0:
+        host = get_ip()
+        store.set(f"{key}/host", host.encode())
         ports, socks = allocate_group_ports(store, key, host, 1)
         port, listen_socket = ports[0], socks[0]
     else:
+        host = store.get(f"{key}/host").decode()
         port, listen_socket = fetch_group_ports(store, key, 1)[0], None
     new_group = stateless_init_torch_distributed_process_group(
         host, port, rank, size, backend="gloo", listen_socket=listen_socket

@@ -1275,6 +1275,9 @@ class EngineCoreProc(EngineCore):
                 ready_msg["coord_store_port"] = (
                     vllm_config.parallel_config._coord_store_port
                 )
+                ready_msg["data_parallel_master_rank"] = (
+                    vllm_config.parallel_config._data_parallel_master_rank
+                )
                 ready_msg["num_redundant_experts"] = (
                     vllm_config.parallel_config.eplb_config.num_redundant_experts
                 )
@@ -1732,6 +1735,7 @@ class EngineCoreProc(EngineCore):
                 else 0
             ),
             coord_store_port=parallel_config._coord_store_port,
+            data_parallel_master_rank=parallel_config._data_parallel_master_rank,
             coordinator_input_address=self.addresses.coordinator_input,
             coordinator_output_address=self.addresses.coordinator_output,
             kv_events_config=self.scheduler.get_kv_event_publisher_config(),
@@ -2485,6 +2489,10 @@ class DPEngineCoreProc(EngineCoreProc):
             reconfig_request.new_data_parallel_master_port_list
         )
         new_parallel_config._coord_store_port = reconfig_request.coord_store_port
+        new_parallel_config._data_parallel_master_rank = (
+            reconfig_request.data_parallel_master_rank
+        )
+        new_parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
 
         is_scale_down = reconfig_request.new_data_parallel_size < old_dp_size
         is_shutdown = (
