@@ -2,14 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
 
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -23,10 +19,6 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 
 DP_SYNC_METADATA_ROWS = 6
-
-_DP_SYNC_OVERRIDE: ContextVar[tuple[ProcessGroup, Callable[[], None] | None] | None] = (
-    ContextVar("vllm_dp_sync_override", default=None)
-)
 
 # Shared CPU tensor layout: [entered_epoch, completed_epoch]. The executor
 # owns the storage so EngineCore can observe a Worker that is blocked in the
@@ -65,24 +57,6 @@ def _complete_dp_metadata_collective(
     completed_epoch = epoch if synced_epoch is None else synced_epoch
     state[0] = completed_epoch
     state[1] = completed_epoch
-
-
-@contextmanager
-def override_dp_sync_group(
-    group: ProcessGroup,
-    before_all_reduce: Callable[[], None] | None = None,
-) -> Iterator[None]:
-    """Temporarily route DP graph-metadata collectives to another group.
-
-    Platform backends can use this while preparing a future DP topology. The
-    context is local to the current execution context and does not affect
-    normal serving threads.
-    """
-    token = _DP_SYNC_OVERRIDE.set((group, before_all_reduce))
-    try:
-        yield
-    finally:
-        _DP_SYNC_OVERRIDE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -128,18 +102,10 @@ def sync_cudagraph_and_dp_padding(
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    sync_override = _DP_SYNC_OVERRIDE.get()
-    if sync_override is None:
-        group = get_dp_group().cpu_group
-        before_all_reduce = None
-    else:
-        group, before_all_reduce = sync_override
-    # Capture-only collectives use an override group and must not advance the
-    # serving epoch. Normal serving collectives carry the epoch as a seventh row
-    # so ranks introduced by a previous scale-up converge to the same value.
-    collective_epoch = (
-        _enter_dp_metadata_collective() if sync_override is None else None
-    )
+    skip_coordination = should_skip_dp_coordination()
+    # Local capture must not advance the serving collective epoch. The first
+    # real DP collective after commit synchronizes it with the surviving ranks.
+    collective_epoch = None if skip_coordination else _enter_dp_metadata_collective()
     metadata_rows = DP_SYNC_METADATA_ROWS + int(collective_epoch is not None)
     tensor = torch.zeros(metadata_rows, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
@@ -150,19 +116,17 @@ def sync_cudagraph_and_dp_padding(
     tensor[5][dp_rank] = num_reqs
     if collective_epoch is not None:
         tensor[6][dp_rank] = collective_epoch
-    if before_all_reduce is not None:
-        before_all_reduce()
-    if sync_override is None and should_skip_dp_coordination():
+    if skip_coordination:
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
-        dist.all_reduce(tensor, group=group)
+        dist.all_reduce(tensor, group=get_dp_group().cpu_group)
     synced_epoch = int(tensor[6].max().item()) if collective_epoch is not None else None
     _complete_dp_metadata_collective(collective_epoch, synced_epoch)
 
     # Keep original-rank indexing for forward-context token counts.
     num_tokens_across_dp_full = tensor[0]
 
-    if sync_override is None and parallel_config.enable_fault_tolerance:
+    if not skip_coordination and parallel_config.enable_fault_tolerance:
         # Per-step barrier over the TP cpu group: a faulted sibling stops
         # arriving, so survivors fail here on the host instead of leaving
         # an orphaned TP collective running on device.
