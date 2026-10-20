@@ -2,14 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
 
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -23,10 +19,6 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 
 DP_SYNC_METADATA_ROWS = 6
-
-_DP_SYNC_OVERRIDE: ContextVar[tuple[ProcessGroup, Callable[[], None] | None] | None] = (
-    ContextVar("vllm_dp_sync_override", default=None)
-)
 
 # Shared CPU tensor layout: [entered_epoch, completed_epoch]. The executor
 # owns the storage so EngineCore can observe a Worker that is blocked in the
@@ -65,24 +57,6 @@ def _complete_dp_metadata_collective(
     completed_epoch = epoch if synced_epoch is None else synced_epoch
     state[0] = completed_epoch
     state[1] = completed_epoch
-
-
-@contextmanager
-def override_dp_sync_group(
-    group: ProcessGroup,
-    before_all_reduce: Callable[[], None] | None = None,
-) -> Iterator[None]:
-    """Temporarily route DP graph-metadata collectives to another group.
-
-    Platform backends can use this while preparing a future DP topology. The
-    context is local to the current execution context and does not affect
-    normal serving threads.
-    """
-    token = _DP_SYNC_OVERRIDE.set((group, before_all_reduce))
-    try:
-        yield
-    finally:
-        _DP_SYNC_OVERRIDE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -146,7 +120,7 @@ def sync_cudagraph_and_dp_padding(
     # Keep original-rank indexing for forward-context token counts.
     num_tokens_across_dp_full = tensor[0]
 
-    if parallel_config is not None and parallel_config.enable_fault_tolerance:
+    if not should_skip_dp_coordination() and parallel_config is not None and parallel_config.enable_fault_tolerance:
         # Per-step barrier over the TP cpu group: a faulted sibling stops
         # arriving, so survivors fail here on the host instead of leaving
         # an orphaned TP collective running on device.

@@ -12,37 +12,41 @@ from vllm.distributed.elastic_ep.elastic_state import (
 )
 
 
-@pytest.mark.parametrize("precommit_capture", [False, True])
-def test_existing_engine_waits_for_precommit_capture_before_commit(precommit_capture):
+def test_existing_engine_is_ready_without_capture_companion():
     state = object.__new__(ElasticEPScalingState)
     state.state = ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE
     state.old_dp_group = object()
-    state.reconfig_request = SimpleNamespace(operation_id="scale-1")
     state._sync_kv_cache_memory_size = MagicMock(return_value=True)
-    state._uses_precommit_graph_capture = MagicMock(return_value=precommit_capture)
-    state._execute_async = MagicMock(side_effect=[False, True])
+    state._execute_async = MagicMock(
+        side_effect=AssertionError("capture companion started")
+    )
     state._mark_ready_for_switch = MagicMock()
-
-    assert state._progress_existing_engine()
-    if not precommit_capture:
-        assert state.state is ScaleUpExistingEngineState.COMMIT_SCALE_UP
-        state._mark_ready_for_switch.assert_called_once_with()
-        state._execute_async.assert_not_called()
-        return
-    assert state.state is ScaleUpExistingEngineState.CAPTURE_NEW_RANKS
-    state._mark_ready_for_switch.assert_not_called()
-
-    assert not state._progress_existing_engine()
-    assert state.state is ScaleUpExistingEngineState.CAPTURE_NEW_RANKS
-    state._mark_ready_for_switch.assert_not_called()
+    state._commit_new_dp_group = MagicMock()
+    state.commit_requested = False
 
     assert state._progress_existing_engine()
     assert state.state is ScaleUpExistingEngineState.COMMIT_SCALE_UP
-    state._execute_async.assert_called_with(
-        "run_new_rank_capture_companion",
-        "scale-1",
-    )
     state._mark_ready_for_switch.assert_called_once_with()
+    # Publishing local readiness does not switch groups before all new ranks
+    # have captured and the frontend requests commit.
+    assert not state._progress_existing_engine()
+    state._commit_new_dp_group.assert_not_called()
+    state._execute_async.assert_not_called()
+
+
+def test_new_engine_capture_failure_does_not_publish_readiness():
+    from vllm.distributed.elastic_ep.elastic_state import ScaleUpNewEngineState
+
+    state = object.__new__(ElasticEPScalingState)
+    state.state = ScaleUpNewEngineState.PREPARE
+    state.new_dp_group = state.new_dp_store = object()
+    state.reconfig_request = SimpleNamespace(operation_id="restore")
+    state._uses_precommit_graph_capture = MagicMock(return_value=True)
+    state._collective_rpc = MagicMock(side_effect=RuntimeError("capture failed"))
+    state._mark_ready_for_switch = MagicMock()
+    with pytest.raises(RuntimeError, match="capture failed"):
+        state._progress_new_engine()
+    state._mark_ready_for_switch.assert_not_called()
 
 
 def test_ready_keys_preserve_rank_slots_after_fault_tolerance_scale_down():
