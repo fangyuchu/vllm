@@ -475,9 +475,6 @@ class ElasticEPScalingExecutor:
         """Whether this worker prepared a platform fast-capture path."""
         return False
 
-    def run_new_rank_capture_companion(self, operation_id: str) -> None:
-        """Match collectives issued while new ranks capture graphs."""
-
     def capture_new_rank_graphs(self, operation_id: str) -> None:
         """Platform hook for graph capture before the topology commit."""
 

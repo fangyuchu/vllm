@@ -40,9 +40,8 @@ WorkerType = Literal["existing", "new", "removing"]
 class ScaleUpExistingEngineState(enum.IntEnum):
     PREPARE = 0
     SYNC_KV_CACHE_MEMORY_SIZE = 1
-    CAPTURE_NEW_RANKS = 2
-    COMMIT_SCALE_UP = 3  # Blocks forward passes.
-    COMPLETE = 4
+    COMMIT_SCALE_UP = 2  # Waits for commit_requested before switching.
+    COMPLETE = 3
 
 
 class ScaleUpNewEngineState(enum.IntEnum):
@@ -371,19 +370,9 @@ class ElasticEPScalingState:
         elif state == ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE:
             if not self._sync_kv_cache_memory_size():
                 return False
-            if self._uses_precommit_graph_capture():
-                self.state = ScaleUpExistingEngineState.CAPTURE_NEW_RANKS
-            else:
-                self.state = ScaleUpExistingEngineState.COMMIT_SCALE_UP
-                self._mark_ready_for_switch()
-            return True
-
-        elif state == ScaleUpExistingEngineState.CAPTURE_NEW_RANKS:
-            if not self._execute_async(
-                "run_new_rank_capture_companion",
-                self._operation_id,
-            ):
-                return False
+            # New workers capture locally and publish their own readiness.
+            # Existing workers keep serving until the frontend sees every
+            # target rank ready and requests the coordinated commit pause.
             self.state = ScaleUpExistingEngineState.COMMIT_SCALE_UP
             self._mark_ready_for_switch()
             return True

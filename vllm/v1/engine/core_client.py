@@ -1732,6 +1732,12 @@ class DPAsyncMPClient(AsyncMPClient):
             self.resources.stats_update_task = None
             self.resources.stats_update_socket = None
             self.resources.first_req_rcv_socket = None
+            # Replacing only the receiver leaves the PAIR sender on its old pipe.
+            self.first_req_send_socket.close(linger=0)
+            self.first_req_sock_addr = get_open_zmq_inproc_path()
+            self.first_req_send_socket = self.resources.first_req_send_socket = (
+                make_zmq_socket(self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=True)
+            )
             self.stats_update_address = stats_address
             self._ensure_stats_update_task()
         self.coordinator_input_address = input_address
