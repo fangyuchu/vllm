@@ -103,9 +103,6 @@ class EngineCoreSentinel:
         self.parallel_config = self.engine.vllm_config.parallel_config
         self._initial_dp_size = self.parallel_config.data_parallel_size
         self._dead_dp_ranks.clear()
-        # Scale-up installs a fresh DP store, shared with new engines whose
-        # recovery epoch starts at zero.
-        self._dp_reinit_epoch = 0
         self.fault_info = None
         self._push_status()
         logger.info(
@@ -251,11 +248,7 @@ class EngineCoreSentinel:
 
     def _push_status(self, mask: list[int] | None = None):
         """Push current health to the client so it can refresh its cache."""
-        payload = {
-            "id": self.engine_index,
-            "dp_rank": self.parallel_config.data_parallel_rank,
-            "status": self.status_type.name.lower(),
-        }
+        payload = {"id": self.engine_index, "status": self.status_type.name.lower()}
         if self.status_type == EngineStatusType.UNHEALTHY:
             payload["fault_info"] = self.fault_info
             if mask is not None:
@@ -544,22 +537,7 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
             except SystemExit:
                 raise
             except Exception as exc:
-                enable_fault_tolerance = getattr(self, "enable_fault_tolerance", False)
-                has_ft_sentinel = hasattr(self, "ft_sentinel")
-                logger.error(
-                    "[FT_DIAG] Busy loop exception: engine_index=%s, "
-                    "exception=%s, enable_fault_tolerance=%s, "
-                    "has_ft_sentinel=%s",
-                    getattr(self, "engine_index", None),
-                    type(exc).__name__,
-                    enable_fault_tolerance,
-                    has_ft_sentinel,
-                )
-                if not enable_fault_tolerance:
-                    logger.error(
-                        "[FT_DIAG] Fault recovery bypassed because the "
-                        "EngineCore effective FT flag is false."
-                    )
+                if not self.enable_fault_tolerance:
                     raise
                 self.ft_sentinel.on_fault(exc)
                 recovered = self.ft_sentinel.resumed.wait(

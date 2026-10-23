@@ -342,9 +342,6 @@ class WorkerWrapperBase:
             )
 
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
-        elastic_ep_dp_collective_state = kwargs.pop(
-            "elastic_ep_dp_collective_state", None
-        )
         self.mm_receiver_cache = worker_receiver_cache_from_config(
             vllm_config,
             shared_worker_lock,
@@ -354,13 +351,6 @@ class WorkerWrapperBase:
             # To make vLLM config available during worker initialization
             self.worker = worker_class(**kwargs)
             self._worker_extension_cls = worker_extension_cls
-
-        if elastic_ep_dp_collective_state is not None:
-            set_collective_state = getattr(
-                self.worker, "set_elastic_ep_dp_collective_state", None
-            )
-            if set_collective_state is not None:
-                set_collective_state(elastic_ep_dp_collective_state)
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
         kv_cache_config = kv_cache_configs[self.global_rank]

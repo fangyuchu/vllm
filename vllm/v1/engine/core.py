@@ -117,7 +117,6 @@ logger = init_logger(__name__)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
-DP_STATE_SYNC_INTERVAL = 32
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -679,10 +678,6 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
-        if getattr(self, "_eep_drain_batch_queue", False):
-            return {}, False
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -742,10 +737,9 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
-        drain_batch_queue = getattr(self, "_eep_drain_batch_queue", False)
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests() and not drain_batch_queue:
+        if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -787,14 +781,6 @@ class EngineCore:
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
             return None, False
-
-        if drain_batch_queue:
-            scaling_state = getattr(self, "eep_scaling_state", None)
-            assert scaling_state is not None
-            # A peer may need another progress exchange before it can issue
-            # the dummy batch that completes our pending DP collective.
-            if not scaling_state.poll_pending_batch(batch_queue[-1][0]):
-                return None, False
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
@@ -1305,16 +1291,6 @@ class EngineCoreProc(EngineCore):
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
-            )
-            ft_config = vllm_config.parallel_config.fault_tolerance_config
-            logger.info(
-                "[FT_DIAG] EngineCore initialized: engine_index=%s, "
-                "dp_rank=%s, enable_fault_tolerance=%s, "
-                "engine_recovery_timeout_sec=%s",
-                self.engine_index,
-                vllm_config.parallel_config.data_parallel_rank,
-                self.enable_fault_tolerance,
-                ft_config.engine_recovery_timeout_sec,
             )
             if self.enable_fault_tolerance:
                 self.ft_sentinel = EngineCoreSentinel(
@@ -2520,8 +2496,6 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
-        self._eep_drain_batch_queue = False
-        self._eep_force_dummy_batch = False
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -2632,13 +2606,9 @@ class DPEngineCoreProc(EngineCoreProc):
             if self.ignore_start_dp_wave:
                 return
             new_wave, exclude_eng_index = request
-            # External frontends retain their IPC engine identities after FT
-            # compaction. A new rank can reuse a survivor's engine_index, so
-            # excluding that identity would also leave the new rank asleep.
-            external_lb = self.vllm_config.parallel_config.data_parallel_external_lb
-            if (
-                external_lb or exclude_eng_index != self.engine_index
-            ) and new_wave >= self.current_wave:
+            if exclude_eng_index != self.engine_index and (
+                new_wave >= self.current_wave
+            ):
                 self.current_wave = new_wave
                 if not self.engines_running:
                     logger.debug(
@@ -2714,27 +2684,16 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
-                skip_dummy_batch = (
-                    self.eep_scaling_state is not None
-                    and self.eep_scaling_state.should_skip_dummy_batch()
-                )
                 # Execute a dummy pass when no ready requests ran, unless the
-                # engine is sleeping or the Elastic EP drain is waiting for
-                # queued work/peer epoch publication.
-                if not skip_dummy_batch and not self.model_executor.is_sleeping:
-                    if self._eep_drain_batch_queue:
-                        assert self.eep_scaling_state is not None
-                        self.eep_scaling_state.start_catch_up_dummy_batch()
-                    else:
-                        with self.capture_iteration_details(None) as iteration_details:
-                            self.execute_dummy_batch()
-                        if iteration_details is not None and not self.has_coordinator:
-                            stats = self._make_iteration_details_stats(
-                                iteration_details
-                            )
-                            self.output_queue.put_nowait(
-                                (0, EngineCoreOutputs(scheduler_stats=stats))
-                            )
+                # engine is sleeping.
+                elif not self.model_executor.is_sleeping:
+                    with self.capture_iteration_details(None) as iteration_details:
+                        self.execute_dummy_batch()
+                    if iteration_details is not None and not self.has_coordinator:
+                        stats = self._make_iteration_details_stats(iteration_details)
+                        self.output_queue.put_nowait(
+                            (0, EngineCoreOutputs(scheduler_stats=stats))
+                        )
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
@@ -2777,36 +2736,17 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        if (
-            self.eep_scaling_state is not None
-            and self.eep_scaling_state.should_defer_dp_state_sync()
-        ):
-            # All old ranks agreed to drain at the same DP-state sync.
-            # Use only drain progress collectives until PREPARE has finished.
-            return True
-
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
         self.step_counter += 1
         if self.step_counter != 1 and self.step_counter % self.dp_sync_interval != 0:
             return True
 
-        scaling_state = self.eep_scaling_state
         parallel_config = self.vllm_config.parallel_config
-        has_unfinished, pause_consensus, prepare_consensus = (
-            parallel_config.sync_dp_state(
-                self.dp_group,
-                has_unfinished=local_unfinished,
-                pending_pause=self.pending_pause,
-                prepare_ready=(
-                    scaling_state is not None
-                    and scaling_state.is_precommit_prepare_ready()
-                ),
-            )
+        has_unfinished, pause_consensus = parallel_config.sync_dp_state(
+            self.dp_group,
+            has_unfinished=local_unfinished,
+            pending_pause=self.pending_pause,
         )
-
-        if prepare_consensus:
-            assert scaling_state is not None
-            scaling_state.begin_prepare_quiesce()
 
         if pause_consensus:
             self.ignore_start_dp_wave = True

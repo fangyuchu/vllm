@@ -15,7 +15,6 @@ import msgspec
 import msgspec.msgpack
 import zmq
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.engine import (
@@ -45,7 +44,6 @@ class ExternalElasticEPScalePhase(str, enum.Enum):
 
     IDLE = "idle"
     PREPARING = "preparing"
-    PAUSED = "paused"
     COMMITTING = "committing"
     FAILED = "failed"
     COMPLETED = "completed"
@@ -219,9 +217,6 @@ class ExternalElasticEPScaleCoordinator:
         self.control_store_ref: Any | None = None
         self.reconfig_store_ref: Any | None = None
         self.active_epoch: str | None = None
-        self._ft_store_key: tuple[str, int, str, bool] | None = None
-        self._ft_store: Any | None = None
-        self._ft_coordinator_key: tuple[str, int, str, bool] | None = None
         self.prepared_scale: _PreparedExternalElasticEPScale | None = None
 
     @staticmethod
@@ -265,12 +260,8 @@ class ExternalElasticEPScaleCoordinator:
         )
         if num_physical_experts % cur_data_parallel_size != 0:
             raise ValueError(
-                "Current EPLB physical expert capacity is not evenly divided "
-                "across the active DP ranks: "
-                f"physical_experts={num_physical_experts}, "
-                f"dp_size={cur_data_parallel_size}. "
-                "Synchronize the frontend EPLB config after fault recovery "
-                "before scaling Elastic EP."
+                f"EPLB physical expert count {num_physical_experts} must be "
+                f"divisible by active DP size {cur_data_parallel_size}."
             )
         num_local_physical_experts = num_physical_experts // cur_data_parallel_size
         num_redundant_experts = (
@@ -294,26 +285,20 @@ class ExternalElasticEPScaleCoordinator:
         )
 
         is_master = rank == 0 and self.client.client_index == 0
-        store_key = (master_ip, port, request_id, is_master)
-        if self._ft_store_key != store_key:
-            store = await asyncio.to_thread(
-                create_tcp_store,
-                master_ip,
-                port,
-                is_master=is_master,
-                world_size=-1,
-                wait_for_workers=False,
-                timeout=timedelta(seconds=60),
-            )
-            # Retain the server even if the readiness barrier needs a retry.
-            self._ft_store = store
-            self._ft_store_key = store_key
-        store = self._ft_store
+        store = await asyncio.to_thread(
+            create_tcp_store,
+            master_ip,
+            port,
+            is_master=is_master,
+            world_size=-1,
+            wait_for_workers=False,
+            timeout=timedelta(seconds=60),
+        )
         if self.client.vllm_config.needs_dp_coordinator:
             from vllm.v1.engine.coordinator import DPCoordinator
 
             address_key = self.key("ft", request_id, "dp_coordinator")
-            if is_master and self._ft_coordinator_key != store_key:
+            if is_master:
                 parallel = copy.copy(self.client.vllm_config.parallel_config)
                 parallel.data_parallel_master_ip = master_ip
                 parallel.data_parallel_size = size
@@ -325,7 +310,6 @@ class ExternalElasticEPScaleCoordinator:
                 )
                 previous = self.client.resources.coordinator
                 self.client.resources.coordinator = coordinator
-                self._ft_coordinator_key = store_key
                 if previous is not None:
                     await asyncio.to_thread(previous.shutdown)
                 logger.info(
@@ -333,9 +317,6 @@ class ExternalElasticEPScaleCoordinator:
                     coordinator.proc.pid,
                     size,
                 )
-            if is_master:
-                coordinator = self.client.resources.coordinator
-                assert coordinator is not None
                 addresses = (
                     *coordinator.get_engine_socket_addresses(),
                     coordinator.get_stats_publish_address(),
@@ -430,101 +411,21 @@ class ExternalElasticEPScaleCoordinator:
             return None
         return store.get(error_key).decode()
 
-    def get_status(self) -> dict[str, str | int | None]:
+    def get_phase(self) -> ExternalElasticEPScalePhase:
         store = self._get_reconfig_store()
         current_epoch_key = self.key("current_epoch")
         if not store.check([current_epoch_key]):
-            return {
-                "phase": ExternalElasticEPScalePhase.IDLE.value,
-                "epoch": None,
-                "error": None,
-                "requested_data_parallel_size": None,
-            }
+            return ExternalElasticEPScalePhase.IDLE
 
         epoch = store.get(current_epoch_key).decode()
-        error = self._get_error(store, epoch)
-        if error is not None:
-            phase = ExternalElasticEPScalePhase.FAILED
-        elif store.check([self.key(epoch, "completed")]):
-            phase = ExternalElasticEPScalePhase.COMPLETED
-        elif store.check([self.key(epoch, "phase")]):
-            phase = ExternalElasticEPScalePhase(
-                store.get(self.key(epoch, "phase")).decode()
-            )
-        else:
-            phase = ExternalElasticEPScalePhase.IDLE
-        requested_dp_size = None
-        bootstrap_key = self.key(epoch, "bootstrap")
-        if store.check([bootstrap_key]):
-            bootstrap = msgspec.msgpack.decode(
-                store.get(bootstrap_key), type=ReconfigureDistributedRequest
-            )
-            requested_dp_size = bootstrap.new_data_parallel_size
-        return {
-            "phase": phase.value,
-            "epoch": epoch,
-            "error": error,
-            "requested_data_parallel_size": requested_dp_size,
-        }
-
-    def resume(self, epoch: str) -> None:
-        from vllm.distributed.utils import get_cached_tcp_store_client
-
-        store = self._get_reconfig_store()
-        current_epoch_key = self.key("current_epoch")
-        if (
-            not store.check([current_epoch_key])
-            or store.get(current_epoch_key).decode() != epoch
-        ):
-            raise ValueError("The requested epoch is not the current scale operation.")
-        bootstrap = msgspec.msgpack.decode(
-            store.get(self.key(epoch, "bootstrap")), type=ReconfigureDistributedRequest
-        )
-        # Another API process may still point at the old control store.
-        # Every resume must reach the target store used by the waiting ranks.
-        store = get_cached_tcp_store_client(
-            bootstrap.new_data_parallel_master_ip, bootstrap.coord_store_port
-        )
-        if store.get(current_epoch_key).decode() != epoch:
-            raise ValueError("The requested epoch is not the current scale operation.")
-        error = self._get_error(store, epoch)
-        if error is not None:
-            raise ValueError(f"Cannot resume failed scale operation: {error}")
-        resume_key = self.key(epoch, "resume")
-        if store.check([resume_key]):
-            return
-        if store.get(self.key(epoch, "phase")) != b"paused":
-            raise ValueError("The current scale operation is not paused.")
-        store.set(resume_key, b"1")
-
-    async def _wait_for_manual_resume(
-        self, prepared: _PreparedExternalElasticEPScale
-    ) -> None:
-        store = prepared.reconfig_store
-        pause_key = self.key(prepared.epoch, "pause_before_commit")
-        if not prepared.scale_up or not store.check([pause_key]):
-            return
-        if prepared.dp_rank == prepared.bootstrap.data_parallel_master_rank:
-            for target in (prepared.control_store, store):
-                self._set_phase(
-                    target, prepared.epoch, ExternalElasticEPScalePhase.PAUSED
-                )
-            logger.info(
-                "[Elastic EP] Scale-up paused before commit; old ranks keep serving. "
-                "Resume epoch %s with POST /resume_elastic_ep.",
-                prepared.epoch,
-            )
-        resume_key = self.key(prepared.epoch, "resume")
-        backoff_step = 0
-        while True:
-            if prepared.handshake_server is not None:
-                prepared.handshake_server.raise_if_failed()
-            error = self._get_error(store, prepared.epoch)
-            if error is not None:
-                raise RuntimeError(error)
-            if store.check([resume_key]):
-                return
-            backoff_step = await self._sleep_with_backoff(backoff_step)
+        if self._get_error(store, epoch) is not None:
+            return ExternalElasticEPScalePhase.FAILED
+        if store.check([self.key(epoch, "completed")]):
+            return ExternalElasticEPScalePhase.COMPLETED
+        phase_key = self.key(epoch, "phase")
+        if store.check([phase_key]):
+            return ExternalElasticEPScalePhase(store.get(phase_key).decode())
+        return ExternalElasticEPScalePhase.IDLE
 
     def _set_phase(
         self, store: Any, epoch: str, phase: ExternalElasticEPScalePhase
@@ -625,11 +526,6 @@ class ExternalElasticEPScaleCoordinator:
             stores.append(self.reconfig_store_ref)
         for target_store in stores:
             target_store.set(bootstrap_key, bootstrap_payload)
-            if (
-                new_data_parallel_size > cur_data_parallel_size
-                and envs.VLLM_ELASTIC_EP_PAUSE_BEFORE_COMMIT
-            ):
-                target_store.set(self.key(epoch, "pause_before_commit"), b"1")
             self._set_phase(target_store, epoch, ExternalElasticEPScalePhase.PREPARING)
             # Publish the epoch only after its metadata is ready for readers.
             target_store.set(current_epoch_key, epoch.encode())
@@ -867,12 +763,6 @@ class ExternalElasticEPScaleCoordinator:
             if existing_dp_ranks is None
             else sorted(existing_dp_ranks)
         )
-        if (
-            len(existing_dp_ranks) != cur_data_parallel_size
-            or len(set(existing_dp_ranks)) != len(existing_dp_ranks)
-            or dp_rank not in existing_dp_ranks
-        ):
-            raise ValueError("Invalid existing DP membership for external scaling")
         if new_data_parallel_size > cur_data_parallel_size and any(
             rank < 0 or rank >= new_data_parallel_size for rank in existing_dp_ranks
         ):
@@ -951,24 +841,9 @@ class ExternalElasticEPScaleCoordinator:
             )
 
             if scale_up or dp_rank < bootstrap.new_data_parallel_size:
-                reconfig_request = ReconfigureDistributedRequest(
-                    new_data_parallel_size=bootstrap.new_data_parallel_size,
-                    # Survivors retain their public and Worker DP identity.
+                reconfig_request = msgspec.structs.replace(
+                    bootstrap,
                     new_data_parallel_rank=dp_rank,
-                    new_data_parallel_rank_local=(
-                        ReconfigureRankType.KEEP_CURRENT_RANK
-                    ),
-                    new_data_parallel_master_ip=(bootstrap.new_data_parallel_master_ip),
-                    new_data_parallel_master_port=(
-                        bootstrap.new_data_parallel_master_port
-                    ),
-                    new_data_parallel_master_port_list=(
-                        bootstrap.new_data_parallel_master_port_list
-                    ),
-                    coord_store_port=bootstrap.coord_store_port,
-                    operation_id=bootstrap.operation_id,
-                    existing_dp_ranks=bootstrap.existing_dp_ranks,
-                    data_parallel_master_rank=bootstrap.data_parallel_master_rank,
                 )
                 await self.client.call_utility_async(
                     "reinitialize_distributed", reconfig_request
@@ -992,7 +867,6 @@ class ExternalElasticEPScaleCoordinator:
                 scale_up=scale_up,
                 handshake_server=handshake_server,
             )
-            await self._wait_for_manual_resume(self.prepared_scale)
         except BaseException as e:
             self.prepared_scale = None
             if epoch is not None:
@@ -1040,13 +914,6 @@ class ExternalElasticEPScaleCoordinator:
                 mode=self.client._eep_commit_pause_mode() if remaining else "abort",
                 clear_cache=False,
             )
-            if (
-                prepared.scale_up
-                and prepared.dp_rank == bootstrap.data_parallel_master_rank
-            ):
-                prepared.reconfig_store.set(
-                    self.key(prepared.epoch, "commit_started"), b"1"
-                )
             if remaining:
                 await self.client.call_utility_async("commit_prepared_elastic_ep")
             else:
