@@ -121,30 +121,6 @@ def scale_up_source_rank(
     return existing_ranks[sender_index]
 
 
-def compact_active_expert_tensor(
-    tensor: torch.Tensor, dp_group: GroupCoordinator
-) -> torch.Tensor:
-    """Remove dead DP chunks from the final physical-expert dimension."""
-    active_dp_size = get_active_dp_size(dp_group)
-    if active_dp_size == dp_group.world_size:
-        return tensor
-    if tensor.shape[-1] % dp_group.world_size:
-        raise ValueError(
-            "Physical expert capacity is not divisible by the preserved DP size: "
-            f"shape={tuple(tensor.shape)}, dp_size={dp_group.world_size}"
-        )
-    experts_per_dp = tensor.shape[-1] // dp_group.world_size
-    dead_dp_ranks = set(dp_group.dead_dp_ranks)
-    return torch.cat(
-        [
-            tensor[..., rank * experts_per_dp : (rank + 1) * experts_per_dp]
-            for rank in range(dp_group.world_size)
-            if rank not in dead_dp_ranks
-        ],
-        dim=-1,
-    )
-
-
 def batch_transfer_weights(
     model: nn.Module,
     is_sender: bool,
@@ -229,7 +205,6 @@ class ElasticEPScalingExecutor:
         )
         self._async_future: Future[None] | None = None
         self._group_cleanup_future: Future[None] | None = None
-        self._target_global_rank: int | None = None
 
     @property
     def worker(self):
@@ -348,40 +323,9 @@ class ElasticEPScalingExecutor:
         new_dp_size = reconfig_request.new_data_parallel_size
         active_dp_group = get_dp_group()
         old_dp_size = get_active_dp_size(active_dp_group)
-        if old_dp_size != active_dp_group.world_size:
-            logger.info(
-                "[Elastic EP] Using %d active DP ranks from preserved "
-                "model-side group width %d; dead_dp_ranks=%s",
-                old_dp_size,
-                active_dp_group.world_size,
-                sorted(active_dp_group.dead_dp_ranks),
-            )
         parallel_config = self.worker.vllm_config.parallel_config
         world_size = parallel_config.world_size
         new_world_size_across_dp = world_size * new_dp_size
-        requested_dp_rank = reconfig_request.new_data_parallel_rank
-        target_dp_rank = (
-            parallel_config.data_parallel_rank
-            if requested_dp_rank == ReconfigureRankType.KEEP_CURRENT_RANK
-            else int(requested_dp_rank)
-        )
-        if not 0 <= target_dp_rank < new_dp_size:
-            raise ValueError(
-                "Invalid target DP rank for Elastic EP standby groups: "
-                f"rank={target_dp_rank}, size={new_dp_size}"
-            )
-        active_world = get_world_group()
-        model_parallel_rank = active_world.rank % world_size
-        new_global_rank = target_dp_rank * world_size + model_parallel_rank
-        self._target_global_rank = new_global_rank
-        logger.info(
-            "[Elastic EP] Creating standby groups with target global rank "
-            "%d/%d (active global rank %d/%d)",
-            new_global_rank,
-            new_world_size_across_dp,
-            active_world.rank,
-            active_world.world_size,
-        )
         create_standby_groups(
             new_dp_size=new_dp_size,
             new_world_size_across_dp=new_world_size_across_dp,
@@ -389,7 +333,6 @@ class ElasticEPScalingExecutor:
             coord_store_port=reconfig_request.coord_store_port,
             use_all2all=use_all2all,
             enable_eplb=parallel_config.enable_eplb,
-            new_global_rank=new_global_rank,
         )
         standby_ep_group = get_standby_ep_group()
         assert standby_ep_group is not None
@@ -471,13 +414,6 @@ class ElasticEPScalingExecutor:
                 torch.distributed.all_reduce(tensor, group=group.device_group)
                 stream.synchronize()
 
-    def supports_precommit_graph_capture(self, operation_id: str) -> bool:
-        """Whether this worker prepared a platform fast-capture path."""
-        return False
-
-    def capture_new_rank_graphs(self, operation_id: str) -> None:
-        """Platform hook for graph capture before the topology commit."""
-
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
@@ -486,23 +422,7 @@ class ElasticEPScalingExecutor:
         assert eplb_state is not None
         eplb_state.drain_async()
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
-        physical_to_logical = eplb_model_state.physical_to_logical_map
-        if (
-            self.reconfig_request is None
-            or self.reconfig_request.existing_dp_ranks is None
-        ):
-            physical_to_logical = compact_active_expert_tensor(
-                physical_to_logical, get_dp_group()
-            )
-        physical_to_logical = torch.nn.functional.pad(
-            physical_to_logical,
-            (
-                0,
-                eplb_model_state.physical_to_logical_map_buffer.shape[1]
-                - physical_to_logical.shape[1],
-            ),
-            value=-1,
-        )
+        physical_to_logical = eplb_model_state.physical_to_logical_map_buffer
         broadcast_expert_mapping(
             physical_to_logical=physical_to_logical,
             dp_group=standby_dp_group,
@@ -598,9 +518,6 @@ class ElasticEPScalingExecutor:
         self._wait_for_group_cleanup()
 
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
-        old_dp_group = get_dp_group()
-        old_dp_size = get_active_dp_size(old_dp_group)
-
         if not self._can_reuse_fused_moe_kernel():
             self._release_cuda_graphs()
         retired_groups = _replace_active_groups(**pop_standby_groups())
@@ -658,41 +575,12 @@ class ElasticEPScalingExecutor:
         model_config = self.worker.model_runner.model_config
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
 
-        if (
-            old_dp_size != old_dp_group.world_size
-            and reconfig_request.existing_dp_ranks is None
-        ):
-            # FT leaves holes at the original rank positions. The standby
-            # groups use dense survivor ranks, so align maps and load history.
-            for name, fill_value in (
-                ("physical_to_logical_map", -1),
-                ("expert_load_pass", 0),
-            ):
-                compacted = compact_active_expert_tensor(
-                    getattr(eplb_model_state, name), old_dp_group
-                )
-                buffer = getattr(eplb_model_state, f"{name}_buffer")
-                buffer[:, : compacted.shape[1]].copy_(compacted)
-                buffer[:, compacted.shape[1] :].fill_(fill_value)
-            eplb_model_state.expert_load_window = compact_active_expert_tensor(
-                eplb_model_state.expert_load_window, old_dp_group
-            )
-
         num_physical_experts = num_local_experts * new_ep_size
         num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
         parallel_config.eplb_config.num_redundant_experts = (
             num_physical_experts - num_logical_experts
         )
         eplb_state.reconfigure_physical_expert_slots(model_config, num_physical_experts)
-
-        if (
-            old_dp_size != old_dp_group.world_size
-            and reconfig_request.existing_dp_ranks is None
-        ):
-            # Rebuild inverse maps before layers cache their routing tables.
-            eplb_state.update_mapping(
-                model_config, eplb_model_state.physical_to_logical_map
-            )
 
         model = self.worker.model_runner.get_model()
         model.expert_weights = []
@@ -804,7 +692,7 @@ class ElasticEPScalingExecutor:
     def prepare_new_worker(
         self,
         reconfig_request: ReconfigureDistributedRequest | None = None,
-    ) -> str | None:
+    ) -> None:
         if reconfig_request is not None:
             self.reconfig_request = reconfig_request
         dp_group = get_dp_group()
@@ -840,7 +728,6 @@ class ElasticEPScalingExecutor:
             self._warm_target_groups(get_dp_group(), get_ep_group())
         if self._can_reuse_fused_moe_kernel():
             sync_flashinfer_autotune_cache(self.worker.model_runner, get_world_group())
-        return reconfig_request.operation_id if reconfig_request is not None else None
 
     def receive_expert_mapping(self) -> torch.Tensor:
         dp_group = get_dp_group()

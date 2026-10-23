@@ -273,17 +273,12 @@ class EngineCoreClient(ABC):
     ) -> None:
         raise NotImplementedError
 
-    async def resume_elastic_ep(self, epoch: str) -> None:
-        raise NotImplementedError
-
     async def migrate_elastic_ep_coord_store(
         self, master_ip: str, port: int, rank: int, size: int, request_id: str
     ) -> None:
         raise NotImplementedError
 
-    async def get_external_elastic_ep_status(
-        self,
-    ) -> dict[str, str | int | None] | None:
+    async def get_external_elastic_ep_phase(self) -> str | None:
         return None
 
     async def get_output_async(self) -> EngineCoreOutputs:
@@ -1750,17 +1745,12 @@ class DPAsyncMPClient(AsyncMPClient):
             master_ip, port, rank, size, request_id
         )
 
-    async def resume_elastic_ep(self, epoch: str) -> None:
-        await asyncio.to_thread(self._get_external_eep_coordinator().resume, epoch)
-
-    async def get_external_elastic_ep_status(
-        self,
-    ) -> dict[str, str | int | None] | None:
+    async def get_external_elastic_ep_phase(self) -> str | None:
         coordinator = self.external_eep_coordinator
         return (
             None
             if coordinator is None
-            else await asyncio.to_thread(coordinator.get_status)
+            else await asyncio.to_thread(coordinator.get_phase)
         )
 
 
