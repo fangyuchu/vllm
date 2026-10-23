@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import json
-import socket
 from typing import Any, Optional
 
 import torch
@@ -30,42 +28,8 @@ from vllm.utils.network_utils import get_ip
 
 logger = init_logger(__name__)
 
-
-def _allocate_group_ports(
-    key: str,
-    host: str,
-    coord_store: Store,
-) -> tuple[list[int], list[socket.socket]]:
-    """Bind 3 sockets and publish their host and ports to *coord_store*.
-
-    Called by rank 0 only.  Returns ``(ports, sockets)`` with the
-    sockets still open.
-    """
-    socks: list[socket.socket] = []
-    ports: list[int] = []
-    family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    try:
-        for _ in range(3):
-            s = socket.socket(family, socket.SOCK_STREAM)
-            socks.append(s)
-            s.bind((host, 0))
-            s.listen()
-            ports.append(s.getsockname()[1])
-        coord_store.set(key, json.dumps({"host": host, "ports": ports}).encode())
-    except Exception:
-        for s in socks:
-            s.close()
-        raise
-    return ports, socks
-
-
-def _fetch_group_ports(key: str, coord_store: Store) -> tuple[str, list[int]]:
-    """Read the host and 3 ports published by group rank 0.
-
-    Blocks until the key is available.
-    """
-    endpoint = json.loads(coord_store.get(key))
-    return endpoint["host"], endpoint["ports"]
+# device, cpu and tcp-store groups each get one port
+_NUM_GROUP_PORTS = 3
 
 
 class StatelessGroupCoordinator(GroupCoordinator):
@@ -134,13 +98,13 @@ class StatelessGroupCoordinator(GroupCoordinator):
                             "Stateless group rendezvous requires a reachable local "
                             "IP; set VLLM_HOST_IP to this node's communication IP."
                         )
-                    ports, socks = _allocate_group_ports(
-                        key,
-                        group_host,
-                        coord_store,
+                    coord_store.set(f"{key}/host", group_host.encode())
+                    ports, socks = allocate_group_ports(
+                        coord_store, key, group_host, _NUM_GROUP_PORTS
                     )
                 else:
-                    group_host, ports = _fetch_group_ports(key, coord_store)
+                    group_host = coord_store.get(f"{key}/host").decode()
+                    ports = fetch_group_ports(coord_store, key, _NUM_GROUP_PORTS)
                     socks = []
                 device_port, cpu_port, tcp_store_port = ports
 

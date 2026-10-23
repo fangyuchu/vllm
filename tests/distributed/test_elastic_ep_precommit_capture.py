@@ -23,6 +23,7 @@ def test_existing_engine_is_ready_without_capture_companion():
     state._mark_ready_for_switch = MagicMock()
     state._commit_new_dp_group = MagicMock()
     state.commit_requested = False
+    state.prepare_controller = None
 
     assert state._progress_existing_engine()
     assert state.state is ScaleUpExistingEngineState.COMMIT_SCALE_UP
@@ -41,24 +42,14 @@ def test_new_engine_capture_failure_does_not_publish_readiness():
     state.state = ScaleUpNewEngineState.PREPARE
     state.new_dp_group = state.new_dp_store = object()
     state.reconfig_request = SimpleNamespace(operation_id="restore")
-    state._uses_precommit_graph_capture = MagicMock(return_value=True)
     state._collective_rpc = MagicMock(side_effect=RuntimeError("capture failed"))
     state._mark_ready_for_switch = MagicMock()
     with pytest.raises(RuntimeError, match="capture failed"):
         state._progress_new_engine()
+    state._collective_rpc.assert_called_once_with(
+        "elastic_ep_execute", args=("warmup_new_worker",)
+    )
     state._mark_ready_for_switch.assert_not_called()
-
-
-def test_ready_keys_preserve_rank_slots_after_fault_tolerance_scale_down():
-    keys = []
-    for old_rank, new_rank in [(0, 0), (1, 1), (2, 2), (3, 3)]:
-        state = object.__new__(ElasticEPScalingState)
-        engine_core = SimpleNamespace(dp_rank=old_rank)
-        state.engine_core_ref = lambda engine_core=engine_core: engine_core
-        state.new_parallel_config = SimpleNamespace(data_parallel_rank=new_rank)
-        keys.append(state.ready_key)
-
-    assert keys == ["eep_ready/0", "eep_ready/1", "eep_ready/2", "eep_ready/3"]
 
 
 def _commit_state_after_fault(old_rank, new_rank, new_size=4):
@@ -86,7 +77,6 @@ def _commit_state_after_fault(old_rank, new_rank, new_size=4):
         )
     )
     engine.output_queue.get_nowait()
-    sentinel._dp_reinit_epoch = 1
 
     state = object.__new__(ElasticEPScalingState)
     state.engine_core_ref = lambda: engine
@@ -131,12 +121,10 @@ def test_scale_up_rebases_fault_state_for_the_next_failure(
     # A replacement may reuse a previously dead rank. Only this cycle's
     # failure belongs in the worker recovery request.
     assert request.params["dead_dp_ranks"] == [removed_rank]
-    assert sentinel._dp_reinit_epoch == 0
     _, output = sentinel.engine.output_queue.get_nowait()
     assert output.engine_index == old_rank
     assert output.utility_output.result.result == {
         "id": old_rank,
-        "dp_rank": new_rank,
         "status": "healthy",
     }
 
@@ -147,18 +135,5 @@ def test_failed_scale_up_keeps_fault_state():
     with pytest.raises(RuntimeError, match="worker commit failed"):
         state._progress_existing_engine()
     assert sentinel._dead_dp_ranks == {2}
-    assert sentinel._dp_reinit_epoch == 1
     assert sentinel.parallel_config.data_parallel_rank == 3
     assert sentinel.engine.output_queue.empty()
-
-
-def test_scale_up_does_not_allow_removing_the_survivor_itself():
-    from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
-
-    state, sentinel = _commit_state_after_fault(3, 3)
-    state._progress_existing_engine()
-    request = FaultToleranceRequest(
-        "scale_down", {"removed_dp_ranks": [3]}, request_id="shrink-1"
-    )
-    with pytest.raises(ValueError, match=r"dp_rank=3, dead_dp_ranks=\[\]"):
-        sentinel.scale_down(request)

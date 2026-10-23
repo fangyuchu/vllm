@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
-import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+import msgspec
 import torch.distributed
 
 from vllm.config import ParallelConfig
@@ -14,9 +14,9 @@ from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
 from vllm.distributed.elastic_ep.external_elastic_ep import ExternalElasticEPScaleCoordinator
-from vllm.distributed.elastic_ep.readiness import new_worker_dist_init_ready_keys
 from vllm.distributed.utils import get_cached_tcp_store_client, set_gloo_backend_timeout
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.engine import (
     EEPNotificationType,
     ReconfigureDistributedRequest,
@@ -36,7 +36,7 @@ WorkerType = Literal["existing", "new", "removing"]
 class ScaleUpExistingEngineState(enum.IntEnum):
     PREPARE = 0
     SYNC_KV_CACHE_MEMORY_SIZE = 1
-    COMMIT_SCALE_UP = 2  # Waits for commit_requested before switching.
+    COMMIT_SCALE_UP = 2  # Blocks forward passes.
     COMPLETE = 3
 
 
@@ -80,7 +80,6 @@ class ElasticEPScalingState:
         self.engine_core_ref = weakref.ref(engine_core)
         self.vllm_config = vllm_config
         self.old_dp_group = self.engine_core.dp_group if worker_type != "new" else None
-        self.old_dp_store = self.engine_core.dp_store if worker_type != "new" else None
         self.new_parallel_config: ParallelConfig = new_parallel_config
         self.new_dp_group = self.engine_core.dp_group if worker_type == "new" else None
         self.new_dp_store = self.engine_core.dp_store if worker_type == "new" else None
@@ -92,14 +91,7 @@ class ElasticEPScalingState:
             max_workers=1, thread_name_prefix="ElasticEPPrepare"
         )
         self._prepare_future: Future[Any] | None = None
-        self._drain_future: Future[Any] | None = None
-        self._drain_dummy_future: Future[Any] | None = None
-        self._prepare_workers_complete = False
-        self._prepare_workers_synchronized = False
         self._new_dp_sync: tuple[object, Any] | None = None
-        self._precommit_capture_enabled: bool | None = None
-        self._precommit_operation_id = ""
-        self._prepare_quiesce_complete = False
         self.state: EngineState
         if scale_type == "scale_up":
             self.state = (
@@ -113,6 +105,10 @@ class ElasticEPScalingState:
                 if worker_type == "removing"
                 else ScaleDownRemainingEngineState.PREPARE
             )
+
+        self.prepare_controller = current_platform.get_elastic_ep_prepare_controller(
+            self
+        )
 
     @property
     def model_executor(self) -> "Executor":
@@ -131,171 +127,19 @@ class ElasticEPScalingState:
     def _collective_rpc(self, *args, **kwargs):
         return self.model_executor.collective_rpc(*args, **kwargs)
 
-    def _get_local_dp_collective_state(self) -> tuple[int, int]:
-        get_states = getattr(
-            self.model_executor, "get_elastic_ep_dp_collective_states", None
-        )
-        if get_states is None:
-            raise RuntimeError(
-                "Elastic EP batch-boundary drain requires Worker DP "
-                "collective state, but the current executor does not expose it"
-            )
-
-        states = get_states()
-        if not states:
-            raise RuntimeError("No Worker DP collective state is available")
-        if any(state != states[0] for state in states[1:]):
-            raise RuntimeError(
-                "Local workers reached different DP metadata collective "
-                f"epochs: {states}"
-            )
-        if states[0][0] < 0 or states[0][1] < 0:
-            raise RuntimeError(
-                "The current Worker does not publish DP metadata collective state"
-            )
-        return states[0]
-
-    def is_precommit_prepare_ready(self) -> bool:
-        return (
-            self.scale_type == "scale_up"
-            and self.worker_type == "existing"
-            and self.state is ScaleUpExistingEngineState.PREPARE
-            and self._prepare_workers_complete
-            and self._precommit_capture_enabled is True
-            and not self._prepare_workers_synchronized
-        )
-
-    def begin_prepare_quiesce(self) -> None:
-        """Enter drain after all old ranks agree in the regular DP-state sync."""
-        assert self.is_precommit_prepare_ready()
-        self._prepare_workers_synchronized = True
-        self.engine_core._eep_drain_batch_queue = True
-        self.engine_core._eep_force_dummy_batch = False
-        logger.info(
-            "[Elastic EP] All old ranks reached prepare consensus; "
-            "starting inference drain: operation_id=%s, dp_step=%s",
-            self._operation_id,
-            self.engine_core.step_counter,
-        )
-
-    def poll_pending_batch(self, future: Future[Any]) -> bool:
-        """Receive a queued batch without blocking EngineCore progress exchange."""
-        if self._drain_future is None:
-            # Multiproc FutureWrapper receives RPC replies lazily in result().
-            # Its done() alone cannot make progress. The prepare thread is idle
-            # here, and only the oldest batch may read executor replies.
-            self._drain_future = self._prepare_executor.submit(future.result)
-        if not self._drain_future.done():
-            return False
-        completed = self._drain_future
-        self._drain_future = None
-        completed.result()
-        return True
-
-    def start_catch_up_dummy_batch(self) -> None:
-        """Run one catch-up batch while EngineCore continues exchanging epochs."""
-        if self._drain_dummy_future is None:
-            self._drain_dummy_future = self._prepare_executor.submit(
-                self.model_executor.execute_dummy_batch
-            )
-
-    def _progress_prepare_quiesce(self) -> bool:
-        """Drain at a common Worker DP collective boundary."""
-        assert self.old_dp_group is not None
-
-        if self._drain_dummy_future is not None and self._drain_dummy_future.done():
-            self._drain_dummy_future.result()
-            self._drain_dummy_future = None
-
-        batch_queue = getattr(self.engine_core, "batch_queue", None)
-        # Include submitted dummy work even before its Worker publishes an epoch.
-        # This prevents duplicate catch-up batches and premature finalization.
-        local_pending = bool(batch_queue) or self._drain_dummy_future is not None
-        self.engine_core._eep_drain_batch_queue = True
-        entered_epoch, completed_epoch = self._get_local_dp_collective_state()
-        local_state = torch.tensor(
-            [entered_epoch, completed_epoch, int(local_pending)],
-            dtype=torch.int64,
-        )
-        gathered_states = [
-            torch.empty_like(local_state) for _ in range(self.old_dp_group.size())
-        ]
-        torch.distributed.all_gather(
-            gathered_states,
-            local_state,
-            group=self.old_dp_group,
-        )
-
-        states = [state.tolist() for state in gathered_states]
-        target_epoch = max(state[0] for state in states)
-        needs_catch_up = not local_pending and entered_epoch < target_epoch
-        self.engine_core._eep_force_dummy_batch = needs_catch_up
-        if needs_catch_up:
-            self.engine_core.engines_running = True
-
-        all_quiesced = all(
-            entered == target_epoch and completed == target_epoch and pending == 0
-            for entered, completed, pending in states
-        )
-        if all_quiesced:
-            self.engine_core._eep_force_dummy_batch = False
-            return True
-
-        logger.info_once(
-            "[Elastic EP] Waiting for a common DP batch boundary before "
-            "precommit finalization: local_epoch=%s/%s, target_epoch=%s, "
-            "local_pending_batches=%s, catch_up_dummy=%s",
-            completed_epoch,
-            entered_epoch,
-            target_epoch,
-            0 if batch_queue is None else len(batch_queue),
-            needs_catch_up,
-        )
-        return False
-
-    def _resume_model_execution_after_prepare_quiesce(self) -> None:
-        # Reconfiguration requests reach EngineCores independently, so their
-        # pre-quiesce running flags can differ. Resume from a common DP-state
-        # sync cadence after target-topology NPU collectives have completed.
-        self.engine_core.step_counter = 0
-        self.engine_core.engines_running = True
-        self.engine_core._eep_force_dummy_batch = False
-        self.engine_core._eep_drain_batch_queue = False
-
-    def should_skip_dummy_batch(self) -> bool:
-        if not getattr(self.engine_core, "_eep_drain_batch_queue", False):
-            return False
-        return not getattr(self.engine_core, "_eep_force_dummy_batch", False)
-
-    def should_defer_dp_state_sync(self) -> bool:
-        return bool(
-            self.scale_type == "scale_up"
-            and self.worker_type == "existing"
-            and self.state == ScaleUpExistingEngineState.PREPARE
-            and self._prepare_workers_synchronized
-        )
-
-    def _wait_for_async_workers(self, done_keys: list[str]) -> None:
-        assert self.reconfig_request is not None
-        # TCPStore.wait holds the connection lock. Use a dedicated connection
-        # so EngineCore's readiness checks can continue during preparation.
-        # Connect on this background thread to keep it off the serving loop.
-        coord_store = torch.distributed.TCPStore(
-            self.reconfig_request.new_data_parallel_master_ip,
-            self.reconfig_request.coord_store_port,
-            is_master=False,
-            wait_for_workers=False,
-        )
-        coord_store.wait(done_keys)
-
     def _execute_async(self, execute_method: str, *args) -> bool:
         if self._prepare_future is None:
             done_keys = self._collective_rpc(
                 "elastic_ep_execute",
                 args=("start_async", execute_method, *args),
             )
+            assert self.reconfig_request is not None
+            coord_store = get_cached_tcp_store_client(
+                self.reconfig_request.new_data_parallel_master_ip,
+                self.reconfig_request.coord_store_port,
+            )
             self._prepare_future = self._prepare_executor.submit(
-                self._wait_for_async_workers, done_keys
+                coord_store.wait, done_keys
             )
         if not self._prepare_future.done():
             return False
@@ -329,46 +173,14 @@ class ElasticEPScalingState:
         assert self.old_dp_group is not None
 
         if state == ScaleUpExistingEngineState.PREPARE:
-            if not self._prepare_workers_complete:
-                if not self._prepare_workers():
-                    return False
-                self._prepare_workers_complete = True
-
-            # Drain serving work before finalizing the mapping and communication
-            # context used for precommit capture.
-            if self._uses_precommit_graph_capture():
-                if not self._prepare_workers_synchronized:
-                    # Idle ranks must also run dummy steps to reach the regular
-                    # DP-state sync. Keep serving until that sync grants every
-                    # old rank permission to drain in the same round.
-                    self.engine_core.engines_running = True
-                    return False
-
-                if not self._prepare_quiesce_complete:
-                    if not self._progress_prepare_quiesce():
-                        return False
-                    # The progress all-gather already establishes a common
-                    # quiescent boundary; no additional staged barrier is needed.
-                    self._prepare_quiesce_complete = True
-                try:
-                    self._collective_rpc(
-                        "elastic_ep_execute",
-                        args=(
-                            "finalize_precommit_prepare",
-                            self._operation_id,
-                        ),
-                    )
-                finally:
-                    self._resume_model_execution_after_prepare_quiesce()
+            if not self._prepare_workers():
+                return False
             self.state = ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE
             return True
 
         elif state == ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE:
             if not self._sync_kv_cache_memory_size():
                 return False
-            # New workers capture locally and publish their own readiness.
-            # Existing workers keep serving until the frontend sees every
-            # target rank ready and requests the coordinated commit pause.
             self.state = ScaleUpExistingEngineState.COMMIT_SCALE_UP
             self._mark_ready_for_switch()
             return True
@@ -377,10 +189,7 @@ class ElasticEPScalingState:
             if not self.commit_requested:
                 return False
             self._commit_new_dp_group()
-            self._collective_rpc(
-                "elastic_ep_execute",
-                args=("commit_scale_up", True),
-            )
+            self._collective_rpc("elastic_ep_execute", args=("commit_scale_up", True))
             self.state = ScaleUpExistingEngineState.COMPLETE
             self._update_parallel_config()
             self._send_reconfigure_finished()
@@ -395,20 +204,26 @@ class ElasticEPScalingState:
         assert self.new_dp_group is not None and self.new_dp_store is not None
 
         if state == ScaleUpNewEngineState.PRE_KV_INIT:
-            operation_ids = self._collective_rpc(
+            parallel = self.new_parallel_config
+            if self.reconfig_request is None and parallel.data_parallel_external_lb:
+                from vllm.distributed.elastic_ep.external_elastic_ep import (
+                    ExternalElasticEPScaleCoordinator,
+                )
+
+                store = get_cached_tcp_store_client(
+                    parallel.data_parallel_master_ip, parallel._coord_store_port
+                )
+                key = ExternalElasticEPScaleCoordinator.key
+                # Bind EngineCore and Workers to the same operation before preparation.
+                epoch = store.get(key("current_epoch")).decode()
+                self.reconfig_request = msgspec.msgpack.decode(
+                    store.get(key(epoch, "bootstrap")),
+                    type=ReconfigureDistributedRequest,
+                )
+            self._collective_rpc(
                 "elastic_ep_execute",
                 args=("prepare_new_worker", self.reconfig_request),
             )
-            resolved_operation_ids = {
-                str(operation_id) for operation_id in operation_ids if operation_id
-            }
-            if len(resolved_operation_ids) > 1:
-                raise RuntimeError(
-                    "Workers resolved different external Elastic EP operation "
-                    f"IDs: {operation_ids}"
-                )
-            if resolved_operation_ids:
-                self._precommit_operation_id = resolved_operation_ids.pop()
             self.engine_core.available_gpu_memory_for_kv_cache = (
                 ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)
             )
@@ -416,15 +231,8 @@ class ElasticEPScalingState:
             return True
 
         elif state == ScaleUpNewEngineState.PREPARE:
-            if self._uses_precommit_graph_capture():
-                self._collective_rpc(
-                    "elastic_ep_execute",
-                    args=("capture_new_rank_graphs", self._operation_id),
-                )
-            else:
-                self._collective_rpc("elastic_ep_execute", args=("warmup_new_worker",))
+            self._collective_rpc("elastic_ep_execute", args=("warmup_new_worker",))
             self._mark_ready_for_switch()
-            self._wait_for_external_scale_commit()
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
             torch.distributed.all_reduce(
                 tensor,
@@ -442,31 +250,6 @@ class ElasticEPScalingState:
         else:
             assert self.state == ScaleUpNewEngineState.COMPLETE
             return True
-
-    def _wait_for_external_scale_commit(self) -> None:
-        parallel = self.new_parallel_config
-        if not parallel.data_parallel_external_lb:
-            return
-        from vllm.distributed.elastic_ep.external_elastic_ep import (
-            ExternalElasticEPScaleCoordinator,
-        )
-
-        store = get_cached_tcp_store_client(
-            parallel.data_parallel_master_ip, parallel._coord_store_port
-        )
-        key = ExternalElasticEPScaleCoordinator.key
-        epoch = self._operation_id or store.get(key("current_epoch")).decode()
-        if not store.check([key(epoch, "pause_before_commit")]):
-            return
-        # Old ranks still serve on the original group. Do not enter the new
-        # group's all-reduce until their schedulers have collectively paused.
-        while True:
-            error_key = key(epoch, "error")
-            if store.check([error_key]):
-                raise RuntimeError(store.get(error_key).decode())
-            if store.check([key(epoch, "commit_started")]):
-                return
-            time.sleep(0.1)
 
     def _progress_remaining_engine(self) -> bool:
         state = self.state
@@ -530,26 +313,6 @@ class ElasticEPScalingState:
         )
 
     @property
-    def _operation_id(self) -> str:
-        if self.reconfig_request is None:
-            return self._precommit_operation_id
-        return self.reconfig_request.operation_id
-
-    def _uses_precommit_graph_capture(self) -> bool:
-        if self._precommit_capture_enabled is None:
-            results = self._collective_rpc(
-                "elastic_ep_execute",
-                args=("supports_precommit_graph_capture", self._operation_id),
-            )
-            enabled_values = {bool(result) for result in results}
-            if len(enabled_values) != 1:
-                raise RuntimeError(
-                    f"Workers disagreed on pre-commit graph capture support: {results}"
-                )
-            self._precommit_capture_enabled = enabled_values.pop()
-        return self._precommit_capture_enabled
-
-    @property
     def ready_key(self) -> str:
         return f"eep_ready/{self.new_parallel_config.data_parallel_rank}"
 
@@ -595,12 +358,6 @@ class ElasticEPScalingState:
         assert self.old_dp_group is not None
         if not self._ensure_new_dp_group():
             return False
-        if (
-            self.scale_type == "scale_up"
-            and self.worker_type == "existing"
-            and not self._new_workers_dist_init_ready()
-        ):
-            return False
         if not self._execute_async(
             "prepare_reconfiguration",
             self.reconfig_request,
@@ -609,28 +366,6 @@ class ElasticEPScalingState:
             return False
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Prepared reconfiguration")
-        return True
-
-    def _new_workers_dist_init_ready(self) -> bool:
-        """Wait to create Worker groups until every new Worker can join."""
-        assert self.old_dp_group is not None
-        ready_keys = new_worker_dist_init_ready_keys(
-            self.new_parallel_config,
-            self.old_dp_group.size(),
-            self.new_parallel_config.data_parallel_size,
-            self.new_parallel_config.world_size,
-        )
-        coord_store = get_cached_tcp_store_client(
-            self.new_parallel_config.data_parallel_master_ip,
-            self.new_parallel_config._coord_store_port,
-        )
-        if not coord_store.check(ready_keys):
-            return False
-
-        logger.info_once(
-            "[Elastic EP scale-up] All new Workers reached distributed init; "
-            "starting standby communication group creation"
-        )
         return True
 
     def _sync_kv_cache_memory_size(self) -> bool:

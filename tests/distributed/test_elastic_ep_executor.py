@@ -84,7 +84,9 @@ def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
         new_data_parallel_master_ip="127.0.0.1",
         new_data_parallel_master_port=29500,
         data_parallel_master_rank=0,
-        existing_dp_ranks=None,
+        existing_dp_ranks=[
+            rank for rank in range(old_dp_size) if rank not in dead_ranks
+        ],
     )
     executor._prepared_eplb_communicator = object()
     executor._release_cuda_graphs = MagicMock()
@@ -127,78 +129,37 @@ def test_scale_up_preserves_surviving_experts_and_load_history(
     monkeypatch, dead_ranks, new_dp_size, tp_size
 ):
     executor, state, retired = _executor(monkeypatch, dead_ranks, new_dp_size, tp_size)
-    # Original rank 3 must move into rank 2's hole without losing its experts.
-    survivor_slots = [
-        slot for slot in range(8 * tp_size) if slot // (2 * tp_size) not in dead_ranks
-    ]
-    padding = new_dp_size * tp_size * 2 - len(survivor_slots)
-    expected_map = F.pad(
-        state.physical_to_logical_map[:, survivor_slots], (0, padding), value=-1
+    # Surviving ranks keep their original slots, including holes before them.
+    padding = new_dp_size * tp_size * 2 - state.physical_to_logical_map.shape[-1]
+    expected_map = F.pad(state.physical_to_logical_map, (0, padding), value=-1)
+    expected_pass = F.pad(state.expert_load_pass, (0, padding))
+    expected_window = F.pad(state.expert_load_window, (0, padding))
+    original = state.physical_to_logical_map.clone()
+    broadcast = MagicMock()
+    monkeypatch.setattr(elastic_execute, "get_standby_dp_group", MagicMock())
+    monkeypatch.setattr(elastic_execute, "broadcast_expert_mapping", broadcast)
+    executor.broadcast_expert_mapping()
+    torch.testing.assert_close(
+        broadcast.call_args.kwargs["physical_to_logical"],
+        F.pad(
+            original,
+            (0, state.physical_to_logical_map_buffer.shape[1] - original.shape[1]),
+            value=-1,
+        ),
     )
-    expected_pass = F.pad(state.expert_load_pass[:, survivor_slots], (0, padding))
-    if dead_ranks:
-        # Installing the recovered mapping resets the per-step load counters.
-        expected_pass.zero_()
-    expected_window = F.pad(state.expert_load_window[..., survivor_slots], (0, padding))
-    bound_maps = []
-    state.model.set_eplb_state.side_effect = lambda load, inverse, counts: (
-        bound_maps.append(inverse.clone())
-    )
+    torch.testing.assert_close(state.physical_to_logical_map, original)
 
     assert executor.switch_and_prepare() is retired
 
     torch.testing.assert_close(state.physical_to_logical_map, expected_map)
     torch.testing.assert_close(state.expert_load_pass, expected_pass)
     torch.testing.assert_close(state.expert_load_window, expected_window)
-    for layer in range(2):
-        for expert in range(2):
-            slots = torch.where(expected_map[layer] == expert)[0]
-            actual = state.logical_to_physical_map[layer, expert]
-            torch.testing.assert_close(actual[actual >= 0], slots)
-            # Backends may cache a routing table when the layer state is bound.
-            bound = bound_maps[0][layer, expert]
-            torch.testing.assert_close(bound[bound >= 0], slots)
-            assert state.logical_replica_count[layer, expert] == slots.numel()
     config = executor.worker.vllm_config.parallel_config
     assert config.data_parallel_size == new_dp_size
     state.model.update_physical_experts_metadata.assert_called_once_with(
         num_physical_experts=new_dp_size * tp_size * 2,
         num_local_physical_experts=2,
     )
-
-
-def test_planned_scale_down_still_truncates_load_history(monkeypatch):
-    executor, state, retired = _executor(monkeypatch, set(), 3)
-    expected_pass = state.expert_load_pass[:, :6].clone()
-    expected_window = state.expert_load_window[..., :6].clone()
-
-    assert executor.switch_and_prepare() is retired
-
-    torch.testing.assert_close(state.expert_load_pass, expected_pass)
-    torch.testing.assert_close(state.expert_load_window, expected_window)
-
-
-@pytest.mark.parametrize("tp_size", [1, 2])
-def test_broadcast_compacts_dead_rank_without_mutating_serving_state(
-    monkeypatch, tp_size
-):
-    executor, state, _ = _executor(monkeypatch, {2}, 4, tp_size)
-    original = state.physical_to_logical_map.clone()
-    broadcast = MagicMock()
-    monkeypatch.setattr(elastic_execute, "get_standby_dp_group", MagicMock())
-    monkeypatch.setattr(elastic_execute, "broadcast_expert_mapping", broadcast)
-
-    executor.broadcast_expert_mapping()
-
-    sent = broadcast.call_args.kwargs
-    survivor_slots = list(range(4 * tp_size)) + list(range(6 * tp_size, 8 * tp_size))
-    expected = F.pad(
-        original[:, survivor_slots],
-        (0, state.physical_to_logical_map_buffer.shape[1] - len(survivor_slots)),
-        value=-1,
-    )
-    torch.testing.assert_close(sent["physical_to_logical"], expected)
-    torch.testing.assert_close(state.physical_to_logical_map, original)
 
 
 @pytest.mark.parametrize("commit_fails", [False, True])
