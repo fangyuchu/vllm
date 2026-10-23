@@ -102,6 +102,10 @@ class EngineCoreReadyResponse:
     weight_transfer_backend: str | None = None
     enable_sleep_mode: bool = False
     supports_draft_weight_updates: bool = False
+    coord_store_port: int = 0
+    data_parallel_master_rank: int = 0
+    coordinator_input_address: str | None = None
+    coordinator_output_address: str | None = None
 
 
 class EngineCoreRequest(
@@ -305,6 +309,11 @@ class ReconfigureDistributedRequest(msgspec.Struct):
     new_data_parallel_master_port: int
     new_data_parallel_master_port_list: list[int]
     coord_store_port: int
+    # Stable identifier shared by every rank participating in one external
+    # reconfiguration. Empty for legacy/internal callers.
+    operation_id: str = ""
+    existing_dp_ranks: list[int] | None = None
+    data_parallel_master_rank: int = 0
 
 
 class ReconfigureRankType(enum.IntEnum):

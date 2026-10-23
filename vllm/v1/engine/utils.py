@@ -198,6 +198,7 @@ class CoreEngineProcManager:
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
+        self._coord_store: object | None = None
 
         # All ranks share this config object: capture the user-provided
         # --device-ids list before the per-rank shard overwrites it. Mutating
@@ -1070,7 +1071,13 @@ def get_engine_zmq_addresses(
         offline_mode or local_engines_only or (local_engine_count == dp_size)
     )
     # NOTE(yongji): handling scaling from intra-node to inter-node
-    if parallel_config.enable_elastic_ep:
+    if parallel_config.enable_elastic_ep and (
+        not local_engines_only
+        or (
+            parallel_config.data_parallel_rank == 0
+            and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+        )
+    ):
         client_local_only = False
 
     def _addr() -> str:
@@ -1132,8 +1139,38 @@ def launch_core_engines(
     # 1. Internal/hybrid LB: collecting and publishing queue stats for load balancing
     # 2. MoE models: wave coordination in addition to stats
     run_coordinator = (
-        vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
+        vllm_config.needs_dp_coordinator
+        and not offline_mode
+        and dp_rank == 0
+        and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
     )
+
+    coord_store = None
+
+    create_coord_store = (
+        parallel_config.enable_elastic_ep
+        and parallel_config.data_parallel_backend != "ray"
+        and dp_rank == 0
+        and not parallel_config._coord_store_port
+        and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+    )
+
+    if create_coord_store:
+        from vllm.distributed.utils import create_tcp_store
+
+        coord_store = create_tcp_store(
+            host,
+            0,
+            is_master=True,
+            world_size=-1,
+            wait_for_workers=False,
+        )
+        parallel_config._coord_store_port = coord_store.port
+        logger.info(
+            "Created Elastic EP coordination TCPStore on %s:%d",
+            host,
+            coord_store.port,
+        )
 
     if run_coordinator:
         coordinator = DPCoordinator(
@@ -1149,6 +1186,8 @@ def launch_core_engines(
         )
 
         logger.info("Started DP Coordinator process (PID: %d)", coordinator.proc.pid)
+        if coord_store is not None:
+            coordinator._coord_store = coord_store
     else:
         coordinator = None
 
@@ -1170,7 +1209,7 @@ def launch_core_engines(
     if offline_mode:
         assert local_engine_count == 1
         engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
-    elif dp_rank == 0:
+    elif dp_rank == 0 and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
         # Rank 0 holds Coordinator, so it handshakes with all Cores
         # in both external dplb and internal dplb mode.
         # Note this also covers the case where we have zero local engines
@@ -1205,7 +1244,7 @@ def launch_core_engines(
         parallel_config.data_parallel_rpc_port,
     )
 
-    if local_engines_only and dp_rank > 0:
+    if local_engines_only and (dp_rank > 0 or envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH):
         assert not handshake_local_only
         local_handshake_address = get_open_zmq_ipc_path()
         client_handshake_address = local_handshake_address
@@ -1233,6 +1272,13 @@ def launch_core_engines(
         else:
             local_engine_manager = None
 
+        if (
+            coord_store is not None
+            and coordinator is None
+            and (local_engine_manager is not None)
+        ):
+            local_engine_manager._coord_store = coord_store
+
         launch = CoreEngineLaunch(
             local_engine_manager, coordinator, addresses, tensor_queue
         )
@@ -1242,6 +1288,10 @@ def launch_core_engines(
             engines_to_handshake,
             parallel_config,
             dp_size > 1 and vllm_config.model_config.is_moe,
+            not (
+                local_engines_only
+                and (dp_rank > 0 or envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH)
+            ),
             vllm_config.cache_config,
             launch,
         )
@@ -1252,6 +1302,7 @@ def wait_for_engine_startup(
     core_engines: list[CoreEngine],
     parallel_config: ParallelConfig,
     coordinated_dp: bool,
+    send_parallel_config: bool,
     cache_config: CacheConfig,
     launch: CoreEngineLaunch,
 ):
@@ -1363,20 +1414,30 @@ def wait_for_engine_startup(
 
         if status == "HELLO" and engine.state == CoreEngineState.NEW:
             # Send init message with DP config info.
+            parallel_config_payload: dict[str, int | str | list[int]] = {}
+            if coordinated_dp and send_parallel_config:
+                parallel_config_payload = {
+                    k: getattr(parallel_config, k)
+                    for k in (
+                        "data_parallel_master_ip",
+                        "data_parallel_master_port",
+                        "_data_parallel_master_port_list",
+                        "data_parallel_size",
+                    )
+                }
+                if parallel_config.enable_elastic_ep:
+                    if not parallel_config._coord_store_port:
+                        raise RuntimeError(
+                            "Elastic EP startup requires a coordination TCPStore "
+                            "port before engine handshake."
+                        )
+                    parallel_config_payload["_coord_store_port"] = (
+                        parallel_config._coord_store_port
+                    )
             init_message = msgspec.msgpack.encode(
                 EngineHandshakeMetadata(
                     addresses=launch.addresses,
-                    parallel_config={
-                        k: getattr(parallel_config, k)
-                        for k in (
-                            "data_parallel_master_ip",
-                            "data_parallel_master_port",
-                            "_data_parallel_master_port_list",
-                            "data_parallel_size",
-                        )
-                    }
-                    if coordinated_dp
-                    else {},
+                    parallel_config=parallel_config_payload,
                 )
             )
             handshake_socket.send_multipart((eng_identity, init_message), copy=False)
@@ -1384,6 +1445,18 @@ def wait_for_engine_startup(
             start_pending[0 if local else 1] += 1
             engine.state = CoreEngineState.CONNECTED
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
+            coord_store_port = msg.get("coord_store_port")
+            if coord_store_port is not None and local:
+                parallel_config._coord_store_port = coord_store_port
+                parallel_config._data_parallel_master_rank = msg.get(
+                    "data_parallel_master_rank", 0
+                )
+            num_redundant_experts = msg.get("num_redundant_experts")
+            if num_redundant_experts is not None and local:
+                parallel_config.eplb_config.num_redundant_experts = (
+                    num_redundant_experts
+                )
+
             # Validate config hash consistency across DP workers for MoE models.
             if coordinated_dp:
                 worker_config_hash = msg.get("parallel_config_hash")

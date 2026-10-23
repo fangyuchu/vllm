@@ -3,16 +3,22 @@
 import enum
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+import msgspec
 import torch.distributed
 
 from vllm.config import ParallelConfig
 from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
-from vllm.distributed.utils import get_cached_tcp_store_client
+from vllm.distributed.utils import (
+    get_cached_tcp_store_client,
+    set_gloo_backend_timeout,
+)
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.engine import (
     EEPNotificationType,
     ReconfigureDistributedRequest,
@@ -101,6 +107,10 @@ class ElasticEPScalingState:
                 if worker_type == "removing"
                 else ScaleDownRemainingEngineState.PREPARE
             )
+
+        self.prepare_controller = current_platform.get_elastic_ep_prepare_controller(
+            self
+        )
 
     @property
     def model_executor(self) -> "Executor":
@@ -196,7 +206,26 @@ class ElasticEPScalingState:
         assert self.new_dp_group is not None and self.new_dp_store is not None
 
         if state == ScaleUpNewEngineState.PRE_KV_INIT:
-            self._collective_rpc("elastic_ep_execute", args=("prepare_new_worker",))
+            parallel = self.new_parallel_config
+            if self.reconfig_request is None and parallel.data_parallel_external_lb:
+                from vllm.distributed.elastic_ep.external_elastic_ep import (
+                    ExternalElasticEPScaleCoordinator,
+                )
+
+                store = get_cached_tcp_store_client(
+                    parallel.data_parallel_master_ip, parallel._coord_store_port
+                )
+                key = ExternalElasticEPScaleCoordinator.key
+                # Bind EngineCore and Workers to the same operation before preparation.
+                epoch = store.get(key("current_epoch")).decode()
+                self.reconfig_request = msgspec.msgpack.decode(
+                    store.get(key(epoch, "bootstrap")),
+                    type=ReconfigureDistributedRequest,
+                )
+            self._collective_rpc(
+                "elastic_ep_execute",
+                args=("prepare_new_worker", self.reconfig_request),
+            )
             self.engine_core.available_gpu_memory_for_kv_cache = (
                 ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)
             )
@@ -274,7 +303,7 @@ class ElasticEPScalingState:
 
     @property
     def ready_key(self) -> str:
-        return f"eep_ready/{self.engine_core.dp_rank}"
+        return f"eep_ready/{self.new_parallel_config.data_parallel_rank}"
 
     def _mark_ready_for_switch(self) -> None:
         parallel_config = self.new_parallel_config
@@ -379,12 +408,20 @@ class ElasticEPScalingState:
         self.engine_core.engines_running = bool(data[0])
         self.engine_core.current_wave = int(data[1])
         self.engine_core.step_counter = int(data[2])
+        # Preparation may use the default long timeout. Once the replacement
+        # group is active, restore fault detection before resuming inference.
+        timeout_seconds = self.new_parallel_config.cpu_distributed_timeout_seconds
+        if timeout_seconds is not None:
+            set_gloo_backend_timeout(new_dp_group, timedelta(seconds=timeout_seconds))
         if new_dp_group.rank() == 0:
             logger.info("[Elastic EP] Switched to new setup")
 
     def _send_reconfigure_finished(self):
         assert self.new_dp_group is not None
-        if self.new_dp_group.rank() == 0:
+        if (
+            self.new_dp_group.rank() == 0
+            or self.vllm_config.parallel_config.data_parallel_external_lb
+        ):
             self.engine_core._eep_send_engine_core_notification(
                 EEPNotificationType.RECONFIGURE_FINISHED
             )
@@ -429,3 +466,12 @@ class ElasticEPScalingState:
             reconfig_request.new_data_parallel_master_port_list
         )
         parallel_config._coord_store_port = reconfig_request.coord_store_port
+        parallel_config._data_parallel_master_rank = (
+            reconfig_request.data_parallel_master_rank
+        )
+        parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
+
+        if self.scale_type == "scale_up":
+            ft_sentinel = getattr(self.engine_core, "ft_sentinel", None)
+            if ft_sentinel is not None:
+                ft_sentinel.reset_after_scale_up()

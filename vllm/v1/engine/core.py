@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -1016,6 +1017,11 @@ class EngineShutdownState(IntEnum):
     SHUTTING_DOWN = 2
 
 
+@dataclass
+class _DPCoordinatorOutputUpdate:
+    address: str
+
+
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
@@ -1036,7 +1042,9 @@ class EngineCoreProc(EngineCore):
         engine_index: int = 0,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
-        self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        self.output_queue = queue.Queue[
+            tuple[int, EngineCoreOutputs] | bytes | _DPCoordinatorOutputUpdate
+        ]()
 
         def executor_fail_callback():
             self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
@@ -1240,6 +1248,16 @@ class EngineCoreProc(EngineCore):
                 ready_msg["parallel_config_hash"] = (
                     vllm_config.parallel_config.compute_hash()
                 )
+            if vllm_config.parallel_config.enable_elastic_ep:
+                ready_msg["coord_store_port"] = (
+                    vllm_config.parallel_config._coord_store_port
+                )
+                ready_msg["data_parallel_master_rank"] = (
+                    vllm_config.parallel_config._data_parallel_master_rank
+                )
+                ready_msg["num_redundant_experts"] = (
+                    vllm_config.parallel_config.eplb_config.num_redundant_experts
+                )
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
@@ -1270,14 +1288,34 @@ class EngineCoreProc(EngineCore):
                 f"minutes"
             )
         init_bytes = handshake_socket.recv()
-        init_message: EngineHandshakeMetadata = msgspec.msgpack.decode(
-            init_bytes, type=EngineHandshakeMetadata
-        )
+        num_redundant_experts: int | None = None
+        if (
+            envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+            and parallel_config is not None
+            and parallel_config.data_parallel_external_lb
+        ):
+            from vllm.distributed.elastic_ep.external_elastic_ep import (
+                ExternalElasticEPScaleUpHandshakeMetadata,
+            )
+
+            scale_up_message = msgspec.msgpack.decode(
+                init_bytes, type=ExternalElasticEPScaleUpHandshakeMetadata
+            )
+            init_message = scale_up_message.engine_metadata
+            num_redundant_experts = scale_up_message.num_redundant_experts
+        else:
+            init_message = msgspec.msgpack.decode(
+                init_bytes, type=EngineHandshakeMetadata
+            )
         logger.debug("Received init message: %s", init_message)
 
         if parallel_config is not None:
             for key, value in init_message.parallel_config.items():
                 setattr(parallel_config, key, value)
+            if num_redundant_experts is not None:
+                parallel_config.eplb_config.num_redundant_experts = (
+                    num_redundant_experts
+                )
 
         return init_message.addresses
 
@@ -1673,6 +1711,10 @@ class EngineCoreProc(EngineCore):
                 if self.vllm_config.lora_config is not None
                 else 0
             ),
+            coord_store_port=parallel_config._coord_store_port,
+            data_parallel_master_rank=parallel_config._data_parallel_master_rank,
+            coordinator_input_address=self.addresses.coordinator_input,
+            coordinator_output_address=self.addresses.coordinator_output,
             kv_events_config=self.scheduler.get_kv_event_publisher_config(),
             weight_transfer_backend=(
                 self.vllm_config.weight_transfer_config.backend
@@ -1742,14 +1784,45 @@ class EngineCoreProc(EngineCore):
 
             ready_event.set()
             del ready_event
+            coordinator_ready: Future[None] | None = None
+
+            def reconnect_dp_coordinator(input_address, output_address, stats_address):
+                nonlocal coord_socket, coord_input_address, coordinator_ready
+                if input_address == coord_input_address:
+                    return coordinator_ready
+                # ZMQ sockets must be replaced by their owning IO threads.
+                new_socket = stack.enter_context(
+                    make_zmq_socket(
+                        ctx, input_address, zmq.XSUB, identity=identity, bind=False
+                    )
+                )
+                new_socket.send(b"\x01")
+                if coord_socket is not None:
+                    poller.unregister(coord_socket)
+                    coord_socket.close(linger=0)
+                coord_socket = new_socket
+                coord_input_address = input_address
+                poller.register(coord_socket, zmq.POLLIN)
+                coordinator_ready = Future()
+                self.output_queue.put_nowait(_DPCoordinatorOutputUpdate(output_address))
+                self.addresses.coordinator_input = input_address
+                self.addresses.coordinator_output = output_address
+                self.addresses.frontend_stats_publish_address = stats_address
+                self.frontend_stats_publish_address = stats_address
+                return coordinator_ready
+
             while True:
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
-                    # NOTE(yongji): ignore READY message sent by DP coordinator
-                    # that is used to notify newly started engines
+                    # READY also acknowledges reconnection after master removal.
                     if type_frame.buffer == b"READY":
                         assert input_socket == coord_socket
+                        if (
+                            coordinator_ready is not None
+                            and not coordinator_ready.done()
+                        ):
+                            coordinator_ready.set_result(None)
                         continue
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
@@ -1770,6 +1843,19 @@ class EngineCoreProc(EngineCore):
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
                         client_idx, call_id, method, args = request
+                        if method == "reconnect_dp_coordinator":
+                            # Handle this on the IO thread even while the main
+                            # loop is participating in a DP collective.
+                            self._invoke_utility_method(
+                                method,
+                                lambda args=args: reconnect_dp_coordinator(*args),
+                                UtilityOutput(call_id),
+                                lambda out,
+                                idx=client_idx: self.output_queue.put_nowait(
+                                    (idx, EngineCoreOutputs(utility_output=out))
+                                ),
+                            )
+                            continue
                         if method == FT_UTILITY_METHOD:
                             self.ft_sentinel.handle_command(
                                 client_idx, call_id, args[0]
@@ -1825,6 +1911,24 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
+                if isinstance(output, _DPCoordinatorOutputUpdate):
+                    if coord_socket is not None:
+                        coord_socket.close(linger=0)
+                    coord_socket = stack.enter_context(
+                        make_zmq_socket(
+                            ctx, output.address, zmq.PUSH, bind=False, linger=4000
+                        )
+                    )
+                    # FT survivors keep stepping until scale-up commits. Seed
+                    # the replacement coordinator with their existing wave.
+                    state = (
+                        EngineCoreOutputs(start_wave=self.current_wave)
+                        if self.engines_running
+                        else EngineCoreOutputs(wave_complete=self.current_wave - 1)
+                    )
+                    state.engine_index = engine_index
+                    coord_socket.send_multipart(encoder.encode(state))
+                    continue
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
@@ -2205,6 +2309,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 if state.is_complete():
                     if state.worker_type == "removing":
                         raise SystemExit
+                    if (
+                        state.worker_type == "new"
+                        and self.vllm_config.parallel_config.data_parallel_external_lb
+                    ):
+                        # An independently launched rank has no external utility
+                        # caller to join the post-commit resume barrier.
+                        self.resume_scheduler()
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
                 elif not state.commit_requested and state.is_ready_for_switch():
@@ -2319,6 +2430,10 @@ class DPEngineCoreProc(EngineCoreProc):
             reconfig_request.new_data_parallel_master_port_list
         )
         new_parallel_config._coord_store_port = reconfig_request.coord_store_port
+        new_parallel_config._data_parallel_master_rank = (
+            reconfig_request.data_parallel_master_rank
+        )
+        new_parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
 
         is_scale_down = reconfig_request.new_data_parallel_size < old_dp_size
         is_shutdown = (
@@ -2379,12 +2494,10 @@ class DPEngineCoreProc(EngineCoreProc):
             self.output_queue.put_nowait((0, outputs))
         else:
             encoder = MsgpackEncoder()
-            with (
-                zmq.Context() as ctx,
-                make_zmq_socket(
-                    ctx, self.addresses.outputs[0], zmq.PUSH, linger=4000
-                ) as socket,
-            ):
+            ctx = zmq.Context.instance()
+            with make_zmq_socket(
+                ctx, self.addresses.outputs[0], zmq.PUSH, linger=4000
+            ) as socket:
                 socket.send_multipart(encoder.encode(outputs))
 
     def _eep_scale_up_before_kv_init(self):

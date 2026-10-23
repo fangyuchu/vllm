@@ -98,6 +98,20 @@ class EngineCoreSentinel:
             ),
         )
 
+    def reset_after_scale_up(self):
+        """Start a new FT baseline after committing the replacement topology."""
+        self.parallel_config = self.engine.vllm_config.parallel_config
+        self._initial_dp_size = self.parallel_config.data_parallel_size
+        self._dead_dp_ranks.clear()
+        self.fault_info = None
+        self._push_status()
+        logger.info(
+            "[FT] Engine %d reset after scale-up: dp_rank=%d, dp_size=%d",
+            self.engine_index,
+            self.parallel_config.data_parallel_rank,
+            self._initial_dp_size,
+        )
+
     def handle_command(self, client_idx: int, call_id: int, ft_args: dict):
         """Dispatch an FT command by instruction name."""
         ft_request = FaultToleranceRequest(**ft_args)
@@ -277,16 +291,15 @@ class EngineCoreSentinel:
                 f"dead_dp_ranks={sorted(self._dead_dp_ranks)})"
             )
 
-        # Removing the store master (the lowest alive rank) requires the new
-        # store location in the request.
-        alive_before = sorted(set(range(self._initial_dp_size)) - self._dead_dp_ranks)
-        if alive_before[0] in newly_dead and (
+        # The store owner can differ from rank 0 after hole-filling scale-up.
+        master_rank = self.parallel_config._data_parallel_master_rank
+        if master_rank in newly_dead and (
             ft_request.params.get("dp_store_port") is None
             or ft_request.params.get("dp_master_ip") is None
         ):
             raise ValueError(
                 "dp_store_port and dp_master_ip required when the store "
-                f"master (rank {alive_before[0]}) is removed"
+                f"master (rank {master_rank}) is removed"
             )
 
         new_dead = self._dead_dp_ranks | newly_dead
@@ -319,21 +332,22 @@ class EngineCoreSentinel:
         # the frozen original values.
         alive = sorted(set(range(self._initial_dp_size)) - dead)
         master_ip = self.parallel_config.data_parallel_master_ip
-        if self._initial_dp_size > 1 and dead_ranks is not None:
-            # The lowest alive rank hosts the TCPStore master; rebuild the
-            # store if that rank was just removed.
-            alive_before = sorted(
-                set(range(self._initial_dp_size)) - self._dead_dp_ranks
+        master_rank = self.parallel_config._data_parallel_master_rank
+        if (
+            self._initial_dp_size > 1
+            and dead_ranks is not None
+            and master_rank in dead_ranks - self._dead_dp_ranks
+        ):
+            master_rank = alive[0]
+            master_ip = params["dp_master_ip"]
+            self._rebuild_dp_store(
+                master_ip,
+                params["dp_store_port"],
+                is_master=(self.parallel_config.data_parallel_rank == alive[0]),
+                num_clients=len(alive),
             )
-            if alive_before[0] in dead_ranks - self._dead_dp_ranks:
-                master_ip = params["dp_master_ip"]
-                self._rebuild_dp_store(
-                    master_ip,
-                    params["dp_store_port"],
-                    is_master=(self.parallel_config.data_parallel_rank == alive[0]),
-                    num_clients=len(alive),
-                )
         params["dp_master_ip"] = master_ip
+        params["dp_master_rank"] = master_rank
         params["dp_group_rank"] = alive.index(self.parallel_config.data_parallel_rank)
         params["dp_group_size"] = len(alive)
         recovery_round = ft_request.request_id
@@ -395,7 +409,10 @@ class EngineCoreSentinel:
         recovery_round = params["recovery_round"]
         master_ip = params["dp_master_ip"]
         params["recovery_store_port"] = self._coordinate_recovery_store_port(
-            master_ip, recovery_round, is_master=params["dp_group_rank"] == 0
+            master_ip,
+            recovery_round,
+            is_master=self.parallel_config.data_parallel_rank
+            == params["dp_master_rank"],
         )
         with set_current_vllm_config(engine.vllm_config):
             self._reinit_engine_groups(
@@ -404,6 +421,7 @@ class EngineCoreSentinel:
         # Commit the master IP only after the group reinit succeeded, so a
         # failed recovery leaves a consistent state that can be retried.
         self.parallel_config.data_parallel_master_ip = master_ip
+        self.parallel_config._data_parallel_master_rank = params["dp_master_rank"]
 
     def _recover_and_vote(
         self,
