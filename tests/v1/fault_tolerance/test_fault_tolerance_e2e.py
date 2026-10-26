@@ -277,7 +277,8 @@ def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
 
     Injecting an exception into ``sync_cudagraph_and_dp_padding`` at a chosen
     step on rank 1, while a long streaming completion runs on rank 0 with
-    ``resume_requests_after_recovery`` enabled.
+    ``resume_requests_after_recovery`` enabled. The ``retry`` instruction is
+    sent with ``params={"resume": true}``.
 
     - Rank 1 raises inside the busy loop and goes UNHEALTHY.
     - Rank 0 detects the now-absent peer via the communication timeout and also
@@ -344,9 +345,9 @@ def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
         assert stream_error is None, stream_error
         assert consumer.is_alive(), "stream ended instead of stalling at fault"
 
-        # 3. retry both engines.
+        # 3. retry both engines, asking them to resume in-flight requests.
         for server in (rank0, rank1):
-            _apply_ft(server, "retry")
+            _apply_ft(server, "retry", {"resume": True})
 
         # 4. Recovery completes: both engines return to healthy and serve again.
         _assert_serving_and_healthy((rank0, rank1))
