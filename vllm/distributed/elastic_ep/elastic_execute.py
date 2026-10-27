@@ -313,7 +313,13 @@ class ElasticEPScalingExecutor:
             self._async_executor.shutdown()
 
     def load_model(self) -> None:
-        self.worker.load_model(load_dummy_weights=True)
+        load_config = self.worker.vllm_config.load_config
+        load_format = load_config.load_format
+        try:
+            self.worker.load_model(load_dummy_weights=True)
+        finally:
+            # Later FT expert reloads must use the original checkpoint loader.
+            load_config.load_format = load_format
 
     def prepare_reconfiguration(
         self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
