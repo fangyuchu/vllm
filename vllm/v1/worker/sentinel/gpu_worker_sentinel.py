@@ -211,6 +211,8 @@ class WorkerSentinel:
         # group reinit; placement is fixed by the redistribution below.
         model_runner.eep_eplb_suppressed = True
         self.retry(ft_request)
+        # Drop stale endpoints before a replacement process reuses these ranks.
+        get_ep_all2all_manager().disconnect_ranks(sorted(dead_ep_ranks))
 
         self._redistribute_experts(dead_ep_ranks)
 
