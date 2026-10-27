@@ -9,9 +9,43 @@ import torch
 import torch.nn.functional as F
 
 from vllm.config import CompilationMode
+from vllm.distributed.device_communicators.all2all import (
+    NixlEPAll2AllManager,
+    _NixlEPBufferState,
+)
 from vllm.distributed.elastic_ep import elastic_execute
 from vllm.distributed.eplb.eplb_state import EplbState, compute_logical_maps
 from vllm.v1.engine import ReconfigureRankType
+
+
+def test_nixl_ep_reconnects_failed_rank_slots_before_commit(monkeypatch):
+    buffer = MagicMock()
+    state = _NixlEPBufferState(buffer, 4, 4, 4)
+    monkeypatch.setattr(NixlEPAll2AllManager, "_buffer", state)
+    monkeypatch.setattr(NixlEPAll2AllManager, "_last_mask", torch.tensor([0, 1, 0, 0]))
+    monkeypatch.setattr(NixlEPAll2AllManager, "_mask", torch.zeros(4))
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    manager = object.__new__(NixlEPAll2AllManager)
+    manager.world_size = 4
+    manager.tcp_store_group = SimpleNamespace(store=object())
+
+    # FT may replay its cumulative dead set; each stale endpoint is dropped once.
+    manager.disconnect_ranks([1])
+    manager.disconnect_ranks([1])
+    buffer.disconnect_ranks.assert_called_once_with([1])
+
+    manager.stage_ep_size()
+    manager.stage_ep_size()
+    buffer.connect_ranks.assert_called_once_with([1], activate=False)
+    buffer.set_tcp_store_group.assert_called_with(manager.tcp_store_group.store)
+    buffer.update_mask_buffer.assert_not_called()
+
+    manager.commit_ep_size()
+    buffer.update_mask_buffer.assert_called_once_with(1, mask=False)
+    assert not state.disconnected_ranks and not state.staged_ranks
+    assert state.active_ep_size == 4
+    buffer.query_mask_buffer.side_effect = lambda mask: mask.zero_()
+    assert not manager.query_fault().item()
 
 
 def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
