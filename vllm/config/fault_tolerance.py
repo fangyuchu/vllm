@@ -18,10 +18,9 @@ class FaultToleranceConfig:
     """
 
     resume_requests_after_recovery: bool = False
-    """Whether in-flight requests are parked instead of aborted on fault.
-
-    If False (default), running requests are aborted immediately when a fault
-    occurs. If True, they are preempted back to the waiting queue and resumed
-    after a ``retry`` recovery, unless that instruction opts out for this round
-    with ``params={"resume": false}``.
+    """If True, in-flight requests are preempted back to the waiting queue on
+    fault (instead of being aborted) so they are automatically re-scheduled
+    after recovery via ``retry``. Clients will not receive abort notifications.
+    Setting this to False, or passing ``params={"abort": true}`` to the
+    ``retry`` instruction, discards the in-flight requests instead.
     """

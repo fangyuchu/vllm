@@ -199,12 +199,12 @@ class EngineCoreSentinel:
         executor = engine.model_executor
         scheduler = cast(Scheduler, engine.scheduler)
 
-        # ``resume`` lets the caller opt out of resuming the parked requests for
-        # this recovery round. It exists for faults such as OOM: retrying with
-        # the same in-flight requests would likely hit OOM again, so aborting
-        # them is safer. Otherwise leave them parked for the scheduler to resume
-        # after recovery.
-        if not ft_request.params.get("resume", True):
+        # ``abort`` lets the caller give up on the parked requests for this
+        # recovery round. It exists for faults such as OOM: retrying with the
+        # same in-flight requests would likely hit OOM again, so aborting them
+        # is safer than resuming. Otherwise leave them parked for the scheduler
+        # to resume after recovery.
+        if ft_request.params.get("abort", False):
             aborted = scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
             engine._send_abort_outputs(aborted)
 
