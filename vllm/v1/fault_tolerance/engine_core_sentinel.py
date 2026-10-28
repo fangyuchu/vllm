@@ -3,7 +3,6 @@
 """EngineCoreSentinel and fault_tolerant_wrapper for the engine core."""
 
 import threading
-import time
 from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
@@ -69,6 +68,7 @@ class EngineCoreSentinel:
         self._initial_dp_size = parallel_config.data_parallel_size
         self._dead_dp_ranks: set[int] = set()
         self._recovery_store: TCPStore | None = None
+        self._install_executor_failure_callback()
 
     @property
     def coordinator_disabled(self) -> bool:
@@ -209,9 +209,26 @@ class EngineCoreSentinel:
             )
         engine.batch_queue.clear()
 
+    def _install_executor_failure_callback(self) -> None:
+        """Report executor failure to the sentinel as well.
+
+        The busy loop cannot consume EXECUTOR_FAILED while it waits for
+        recovery, so the sentinel must observe the failure directly.
+        """
+        executor = self.engine.model_executor
+        upstream_callback = getattr(executor, "failure_callback", None)
+        if upstream_callback is None:
+            return
+
+        def callback() -> None:
+            upstream_callback()
+            self.on_executor_failed()
+
+        executor.register_failure_callback(callback)
+
     def on_executor_failed(self):
         """Notify the client about the executor failure"""
-        if self.status_type not in (EngineStatusType.HEALTHY, EngineStatusType.DEAD):
+        if self.status_type != EngineStatusType.HEALTHY:
             self.status_type = EngineStatusType.DEAD
             self._push_status()
 
@@ -490,26 +507,6 @@ class EngineCoreSentinel:
         return int(cast("DPEngineCoreProc", self.engine).dp_store.get(key).decode())
 
 
-# How often the recovery wait re-checks the executor failure state.
-_RECOVERY_POLL_INTERVAL_SEC = 1.0
-
-
-def _wait_for_recovery(engine: "EngineCoreProc") -> bool:
-    """Wait for the recovery command, reporting executor failure meanwhile.
-
-    The busy loop is blocked here, so it cannot consume the EXECUTOR_FAILED
-    queue item; poll the executor's failure state instead.
-    """
-    sentinel = engine.ft_sentinel
-    deadline = time.monotonic() + sentinel.engine_recovery_timeout_sec
-    while (remaining := deadline - time.monotonic()) > 0:
-        if sentinel.resumed.wait(min(_RECOVERY_POLL_INTERVAL_SEC, remaining)):
-            return True
-        if getattr(engine.model_executor, "is_failed", False):
-            sentinel.on_executor_failed()
-    return False
-
-
 def fault_tolerant_wrapper(busy_loop_func: Callable):
     """Wrap the busy loop to catch faults and delegate recovery."""
 
@@ -525,7 +522,10 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                 if not self.enable_fault_tolerance:
                     raise
                 self.ft_sentinel.on_fault(exc)
-                if _wait_for_recovery(self):
+                recovered = self.ft_sentinel.resumed.wait(
+                    timeout=self.ft_sentinel.engine_recovery_timeout_sec
+                )
+                if recovered:
                     continue
                 logger.error(
                     "[FT] No recovery within %ds timeout.",
