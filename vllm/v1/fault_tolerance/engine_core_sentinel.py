@@ -3,6 +3,7 @@
 """EngineCoreSentinel and fault_tolerant_wrapper for the engine core."""
 
 import threading
+import time
 from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
@@ -210,7 +211,7 @@ class EngineCoreSentinel:
 
     def on_executor_failed(self):
         """Notify the client about the executor failure"""
-        if self.status_type != EngineStatusType.HEALTHY:
+        if self.status_type not in (EngineStatusType.HEALTHY, EngineStatusType.DEAD):
             self.status_type = EngineStatusType.DEAD
             self._push_status()
 
@@ -489,6 +490,26 @@ class EngineCoreSentinel:
         return int(cast("DPEngineCoreProc", self.engine).dp_store.get(key).decode())
 
 
+# How often the recovery wait re-checks the executor failure state.
+_RECOVERY_POLL_INTERVAL_SEC = 1.0
+
+
+def _wait_for_recovery(engine: "EngineCoreProc") -> bool:
+    """Wait for the recovery command, reporting executor failure meanwhile.
+
+    The busy loop is blocked here, so it cannot consume the EXECUTOR_FAILED
+    queue item; poll the executor's failure state instead.
+    """
+    sentinel = engine.ft_sentinel
+    deadline = time.monotonic() + sentinel.engine_recovery_timeout_sec
+    while (remaining := deadline - time.monotonic()) > 0:
+        if sentinel.resumed.wait(min(_RECOVERY_POLL_INTERVAL_SEC, remaining)):
+            return True
+        if getattr(engine.model_executor, "is_failed", False):
+            sentinel.on_executor_failed()
+    return False
+
+
 def fault_tolerant_wrapper(busy_loop_func: Callable):
     """Wrap the busy loop to catch faults and delegate recovery."""
 
@@ -504,10 +525,7 @@ def fault_tolerant_wrapper(busy_loop_func: Callable):
                 if not self.enable_fault_tolerance:
                     raise
                 self.ft_sentinel.on_fault(exc)
-                recovered = self.ft_sentinel.resumed.wait(
-                    timeout=self.ft_sentinel.engine_recovery_timeout_sec
-                )
-                if recovered:
+                if _wait_for_recovery(self):
                     continue
                 logger.error(
                     "[FT] No recovery within %ds timeout.",
