@@ -27,6 +27,7 @@ steps:
   - export NCCL_CUMEM_HOST_ENABLE=0
   - pytest -v -s v1/fault_tolerance/test_engine_core_sentinel.py
   - pytest -v -s v1/fault_tolerance/test_fault_tolerance_e2e.py
+  - pytest -v -s v1/fault_tolerance/test_expert_reload.py
   mirror:
     amd:
       label: ":amd: (MI355) MoRI EP Healthy Baseline"
