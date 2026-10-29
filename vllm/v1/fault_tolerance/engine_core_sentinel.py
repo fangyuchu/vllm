@@ -13,7 +13,6 @@ import torch.distributed as dist
 from torch.distributed import PrefixStore, TCPStore
 from torch.distributed.distributed_c10d import Backend, _get_default_timeout
 
-from vllm.config import set_current_vllm_config
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.distributed.utils import (
     create_tcp_store,
@@ -412,10 +411,9 @@ class EngineCoreSentinel:
         params["recovery_store_port"] = self._coordinate_recovery_store_port(
             master_ip, recovery_round, is_master=params["dp_group_rank"] == 0
         )
-        with set_current_vllm_config(self.engine.vllm_config):
-            self._reinit_engine_groups(
-                params["dp_group_rank"], params["dp_group_size"], recovery_round
-            )
+        self._reinit_engine_groups(
+            params["dp_group_rank"], params["dp_group_size"], recovery_round
+        )
         # Commit the master IP only after the group reinit succeeded, so a
         # failed recovery leaves a consistent state that can be retried.
         self.parallel_config.data_parallel_master_ip = master_ip
