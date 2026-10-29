@@ -3,6 +3,7 @@
 import enum
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import copy
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
@@ -337,7 +338,10 @@ class ElasticEPScalingState:
         )
 
     def _init_new_dp_group(self) -> tuple[Any, Any]:
-        return self.new_parallel_config.stateless_init_dp_group(return_store=True)
+        # Joining ranks may still be starting; use the default group-init timeout.
+        prepare_config = copy(self.new_parallel_config)
+        prepare_config.cpu_distributed_timeout_seconds = None
+        return prepare_config.stateless_init_dp_group(return_store=True)
 
     def _ensure_new_dp_group(self) -> bool:
         if self.new_dp_group is not None:
