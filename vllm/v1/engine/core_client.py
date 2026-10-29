@@ -1781,6 +1781,13 @@ class DPAsyncMPClient(AsyncMPClient):
                     await task
             self.resources.stats_update_task = None
             self.resources.stats_update_socket = None
+            self.resources.scale_rcv_socket = None
+            # Recreate both ends: an inproc PAIR cannot replace only its peer.
+            self.scale_send_socket.close(linger=0)
+            self.scale_sock_addr = get_open_zmq_inproc_path()
+            self.scale_send_socket = self.resources.scale_send_socket = make_zmq_socket(
+                self.ctx, self.scale_sock_addr, zmq.PAIR, bind=True
+            )
             self.stats_update_address = stats_address
             self._ensure_stats_update_task()
         self.coordinator_input_address = input_address
