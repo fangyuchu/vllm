@@ -289,7 +289,9 @@ class EngineCoreClient(ABC):
     ) -> None:
         raise NotImplementedError
 
-    async def get_external_elastic_ep_phase(self) -> str | None:
+    async def get_external_elastic_ep_status(
+        self,
+    ) -> dict[str, str | int | None] | None:
         return None
 
     async def get_output_async(self) -> EngineCoreOutputs:
@@ -1613,7 +1615,7 @@ class DPAsyncMPClient(AsyncMPClient):
                         parallel_config = self.vllm_config.parallel_config
                         dp_size = parallel_config.data_parallel_size
                         dp_rank = parallel_config.data_parallel_rank
-                        assert dp_rank == 0
+                        assert dp_rank == parallel_config._data_parallel_master_rank
                         assert dp_size == new_engine_count
                         assert not parallel_config.data_parallel_hybrid_lb
                         # External LB clients continue to manage only local ranks.
@@ -1793,12 +1795,14 @@ class DPAsyncMPClient(AsyncMPClient):
             master_ip, port, rank, size, request_id
         )
 
-    async def get_external_elastic_ep_phase(self) -> str | None:
+    async def get_external_elastic_ep_status(
+        self,
+    ) -> dict[str, str | int | None] | None:
         coordinator = self.external_eep_coordinator
         return (
             None
             if coordinator is None
-            else await asyncio.to_thread(coordinator.get_phase)
+            else await asyncio.to_thread(coordinator.get_status)
         )
 
 

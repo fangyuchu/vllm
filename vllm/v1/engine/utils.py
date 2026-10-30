@@ -1527,7 +1527,10 @@ def wait_for_engine_startup(
             parallel_config_payload: dict[str, int | str | list[int]] = {}
             if coordinated_dp and not (
                 parallel_config.local_engines_only
-                and parallel_config.data_parallel_rank > 0
+                and (
+                    parallel_config.data_parallel_rank > 0
+                    or envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+                )
             ):
                 parallel_config_payload = {
                     k: getattr(parallel_config, k)
@@ -1536,6 +1539,7 @@ def wait_for_engine_startup(
                         "data_parallel_master_port",
                         "_data_parallel_master_port_list",
                         "_coord_store_port",
+                        "_data_parallel_master_rank",
                         "data_parallel_size",
                     )
                 }
