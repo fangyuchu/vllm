@@ -166,8 +166,11 @@ class ExternalElasticEPScaleUpHandshakeServer:
                             "data_parallel_size": b.new_data_parallel_size,
                             "_coord_store_port": b.coord_store_port,
                             "_data_parallel_master_rank": b.data_parallel_master_rank,
-                            "_eep_existing_dp_ranks": b.existing_dp_ranks,
                         }
+                        if b.existing_dp_ranks is not None:
+                            parallel_config["_eep_existing_dp_ranks"] = (
+                                b.existing_dp_ranks
+                            )
                         init_message = msgspec.msgpack.encode(
                             ExternalElasticEPScaleUpHandshakeMetadata(
                                 engine_metadata=EngineHandshakeMetadata(
@@ -411,21 +414,42 @@ class ExternalElasticEPScaleCoordinator:
             return None
         return store.get(error_key).decode()
 
-    def get_phase(self) -> ExternalElasticEPScalePhase:
+    def get_status(self) -> dict[str, str | int | None]:
         store = self._get_reconfig_store()
         current_epoch_key = self.key("current_epoch")
         if not store.check([current_epoch_key]):
-            return ExternalElasticEPScalePhase.IDLE
+            return {
+                "phase": ExternalElasticEPScalePhase.IDLE.value,
+                "epoch": None,
+                "error": None,
+                "requested_data_parallel_size": None,
+            }
 
         epoch = store.get(current_epoch_key).decode()
-        if self._get_error(store, epoch) is not None:
-            return ExternalElasticEPScalePhase.FAILED
-        if store.check([self.key(epoch, "completed")]):
-            return ExternalElasticEPScalePhase.COMPLETED
-        phase_key = self.key(epoch, "phase")
-        if store.check([phase_key]):
-            return ExternalElasticEPScalePhase(store.get(phase_key).decode())
-        return ExternalElasticEPScalePhase.IDLE
+        error = self._get_error(store, epoch)
+        if error is not None:
+            phase = ExternalElasticEPScalePhase.FAILED
+        elif store.check([self.key(epoch, "completed")]):
+            phase = ExternalElasticEPScalePhase.COMPLETED
+        elif store.check([self.key(epoch, "phase")]):
+            phase = ExternalElasticEPScalePhase(
+                store.get(self.key(epoch, "phase")).decode()
+            )
+        else:
+            phase = ExternalElasticEPScalePhase.IDLE
+        requested_dp_size = None
+        bootstrap_key = self.key(epoch, "bootstrap")
+        if store.check([bootstrap_key]):
+            bootstrap = msgspec.msgpack.decode(
+                store.get(bootstrap_key), type=ReconfigureDistributedRequest
+            )
+            requested_dp_size = bootstrap.new_data_parallel_size
+        return {
+            "phase": phase.value,
+            "epoch": epoch,
+            "error": error,
+            "requested_data_parallel_size": requested_dp_size,
+        }
 
     def _set_phase(
         self, store: Any, epoch: str, phase: ExternalElasticEPScalePhase
@@ -841,6 +865,7 @@ class ExternalElasticEPScaleCoordinator:
                 bootstrap.coord_store_port,
             )
             reconfig_store = await asyncio.to_thread(self._get_reconfig_store)
+            assert reconfig_store is not None
             reconfig_store.set(self.key("current_epoch"), epoch.encode())
             self._set_phase(
                 reconfig_store, epoch, ExternalElasticEPScalePhase.PREPARING
