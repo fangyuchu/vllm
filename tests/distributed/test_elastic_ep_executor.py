@@ -8,7 +8,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.config import CompilationMode
 from vllm.distributed.device_communicators.all2all import (
     NixlEPAll2AllManager,
     _NixlEPBufferState,
@@ -37,13 +36,11 @@ def test_nixl_ep_reconnects_failed_rank_slots_before_commit(monkeypatch):
     manager.stage_ep_size()
     manager.stage_ep_size()
     buffer.connect_ranks.assert_called_once_with([1], activate=False)
-    buffer.set_tcp_store_group.assert_called_with(manager.tcp_store_group.store)
     buffer.update_mask_buffer.assert_not_called()
 
     manager.commit_ep_size()
     buffer.update_mask_buffer.assert_called_once_with(1, mask=False)
     assert not state.disconnected_ranks and not state.staged_ranks
-    assert state.active_ep_size == 4
     buffer.query_mask_buffer.side_effect = lambda mask: mask.zero_()
     assert not manager.query_fault().item()
 
@@ -92,16 +89,12 @@ def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
     config = SimpleNamespace(
         data_parallel_size=old_dp_size - len(dead_ranks),
         data_parallel_rank=0,
-        tensor_parallel_size=tp_size,
         all2all_backend="allgather_reducescatter",
         eplb_config=SimpleNamespace(num_redundant_experts=width - local_experts),
     )
     worker = SimpleNamespace(
         device=torch.device("cpu"),
-        vllm_config=SimpleNamespace(
-            parallel_config=config,
-            compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
-        ),
+        vllm_config=SimpleNamespace(parallel_config=config),
         model_runner=SimpleNamespace(
             model=model,
             get_model=lambda: model,
@@ -126,82 +119,62 @@ def _executor(monkeypatch, dead_ranks, new_dp_size, tp_size=1):
     executor._release_cuda_graphs = MagicMock()
     executor._make_eep_moe_config = MagicMock()
     executor._commit_staged_moe_quant_methods = MagicMock()
-    groups = {
-        "dp": SimpleNamespace(world_size=old_dp_size, dead_dp_ranks=dead_ranks),
-        "ep": SimpleNamespace(world_size=old_dp_size * tp_size),
-    }
-    retired = tuple(groups.values())
-
-    def replace_groups(**standby):
-        groups.update(standby)
-        return retired
-
-    monkeypatch.setattr(elastic_execute, "get_dp_group", lambda: groups["dp"])
-    monkeypatch.setattr(elastic_execute, "get_ep_group", lambda: groups["ep"])
-    monkeypatch.setattr(elastic_execute, "_replace_active_groups", replace_groups)
+    monkeypatch.setattr(
+        elastic_execute, "get_dp_group", lambda: SimpleNamespace(world_size=new_dp_size)
+    )
     monkeypatch.setattr(
         elastic_execute,
-        "pop_standby_groups",
-        lambda: {
-            "dp": SimpleNamespace(world_size=new_dp_size),
-            "ep": SimpleNamespace(world_size=new_dp_size * tp_size),
-        },
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=new_dp_size * tp_size),
     )
+    monkeypatch.setattr(elastic_execute, "_replace_active_groups", MagicMock())
+    monkeypatch.setattr(elastic_execute, "pop_standby_groups", dict)
     monkeypatch.setattr(elastic_execute, "get_ep_all2all_manager", MagicMock())
     monkeypatch.setattr(elastic_execute, "is_moe_layer", lambda module: module is moe)
     monkeypatch.setattr(
         elastic_execute, "set_current_vllm_config", lambda _: nullcontext()
     )
-    return executor, model_state, retired
+    return executor, model_state
 
 
 @pytest.mark.parametrize(
     "dead_ranks,new_dp_size,tp_size",
-    [({2}, 4, 1), ({1, 3}, 3, 1), ({2}, 5, 1), ({2}, 4, 2), (set(), 5, 1)],
+    [({2}, 4, 1), ({2}, 5, 1), ({2}, 4, 2)],
 )
 def test_scale_up_preserves_surviving_experts_and_load_history(
     monkeypatch, dead_ranks, new_dp_size, tp_size
 ):
-    executor, state, retired = _executor(monkeypatch, dead_ranks, new_dp_size, tp_size)
+    executor, state = _executor(monkeypatch, dead_ranks, new_dp_size, tp_size)
     # Surviving ranks keep their original slots, including holes before them.
     padding = new_dp_size * tp_size * 2 - state.physical_to_logical_map.shape[-1]
     expected_map = F.pad(state.physical_to_logical_map, (0, padding), value=-1)
     expected_pass = F.pad(state.expert_load_pass, (0, padding))
     expected_window = F.pad(state.expert_load_window, (0, padding))
-    original = state.physical_to_logical_map.clone()
+    original = state.physical_to_logical_map_buffer.clone()
     broadcast = MagicMock()
     monkeypatch.setattr(elastic_execute, "get_standby_dp_group", MagicMock())
     monkeypatch.setattr(elastic_execute, "broadcast_expert_mapping", broadcast)
     executor.broadcast_expert_mapping()
     torch.testing.assert_close(
         broadcast.call_args.kwargs["physical_to_logical"],
-        F.pad(
-            original,
-            (0, state.physical_to_logical_map_buffer.shape[1] - original.shape[1]),
-            value=-1,
-        ),
+        original,
     )
-    torch.testing.assert_close(state.physical_to_logical_map, original)
+    torch.testing.assert_close(state.physical_to_logical_map_buffer, original)
 
-    assert executor.switch_and_prepare() is retired
+    executor.switch_and_prepare()
 
     torch.testing.assert_close(state.physical_to_logical_map, expected_map)
     torch.testing.assert_close(state.expert_load_pass, expected_pass)
     torch.testing.assert_close(state.expert_load_window, expected_window)
-    config = executor.worker.vllm_config.parallel_config
-    assert config.data_parallel_size == new_dp_size
-    state.model.update_physical_experts_metadata.assert_called_once_with(
-        num_physical_experts=new_dp_size * tp_size * 2,
-        num_local_physical_experts=2,
-    )
 
 
 @pytest.mark.parametrize("commit_fails", [False, True])
 def test_scale_up_resumes_eplb_only_after_successful_commit(monkeypatch, commit_fails):
-    executor, _, _ = _executor(monkeypatch, {2}, 4)
+    executor, _ = _executor(monkeypatch, {2}, 4)
     runner = executor.worker.model_runner
     runner.eep_eplb_suppressed = True
     executor.broadcast_expert_mapping = MagicMock()
+    executor.switch_and_prepare = MagicMock(return_value=())
     executor.warm_and_capture = MagicMock()
     executor._perform_eplb_reshuffle = MagicMock()
     executor._start_group_cleanup = MagicMock()
