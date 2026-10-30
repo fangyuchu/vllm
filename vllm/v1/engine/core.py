@@ -2130,6 +2130,7 @@ class EngineCoreProc(EngineCore):
                     )
                     # FT survivors keep stepping until scale-up commits. Seed
                     # the replacement coordinator with their existing wave.
+                    assert isinstance(self, DPEngineCoreProc)
                     state = (
                         EngineCoreOutputs(start_wave=self.current_wave)
                         if self.engines_running
