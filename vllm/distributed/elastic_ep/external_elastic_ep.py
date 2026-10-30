@@ -504,6 +504,7 @@ class ExternalElasticEPScaleCoordinator:
                 )
 
         ip, coord_store_port = self._setup_reconfig_bootstrap()
+        parallel_config = self.client.vllm_config.parallel_config
         epoch = uuid.uuid4().hex
         master_ports = get_open_ports_list(5)
         bootstrap = ReconfigureDistributedRequest(
@@ -721,7 +722,10 @@ class ExternalElasticEPScaleCoordinator:
         )
         keys = [
             self.key(prepared.epoch, "commit_ready", rank)
-            for rank in range(prepared.cur_data_parallel_size)
+            for rank in (
+                prepared.bootstrap.existing_dp_ranks
+                or list(range(prepared.cur_data_parallel_size))
+            )
         ]
 
         def is_ready() -> bool:
@@ -828,7 +832,9 @@ class ExternalElasticEPScaleCoordinator:
             assert epoch is not None
             assert bootstrap is not None
             if bootstrap.existing_dp_ranks != existing_dp_ranks:
-                raise ValueError("External scale-up frontends disagree on surviving ranks")
+                raise ValueError(
+                    "External scale-up frontends disagree on surviving ranks"
+                )
             self.active_epoch = epoch
             self.active_reconfig_store = (
                 bootstrap.new_data_parallel_master_ip,
@@ -945,7 +951,7 @@ class ExternalElasticEPScaleCoordinator:
 
             if remaining:
                 self._update_parallel_config(bootstrap, prepared.num_redundant_experts)
-                if prepared.dp_rank == 0:
+                if prepared.dp_rank == bootstrap.data_parallel_master_rank:
                     self.client._coord_store = self.reconfig_store_ref
                     self.client._ensure_stats_update_task()
                     await self.client.scale_send_socket.send(

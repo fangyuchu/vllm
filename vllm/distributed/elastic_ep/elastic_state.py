@@ -14,7 +14,9 @@ from vllm.config import ParallelConfig
 from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
-from vllm.distributed.elastic_ep.external_elastic_ep import ExternalElasticEPScaleCoordinator
+from vllm.distributed.elastic_ep.external_elastic_ep import (
+    ExternalElasticEPScaleCoordinator,
+)
 from vllm.distributed.utils import get_cached_tcp_store_client, set_gloo_backend_timeout
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
