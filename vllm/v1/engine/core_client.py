@@ -927,7 +927,9 @@ class MPClient(EngineCoreClient):
 
         parallel_config = vllm_config.parallel_config
         if response.coord_store_port:
-            parallel_config._data_parallel_master_rank = response.data_parallel_master_rank
+            parallel_config._data_parallel_master_rank = (
+                response.data_parallel_master_rank
+            )
             if parallel_config._coord_store_port:
                 assert response.coord_store_port == parallel_config._coord_store_port
             else:
@@ -1756,6 +1758,7 @@ class DPAsyncMPClient(AsyncMPClient):
 
     async def abort_external_elastic_ep(self, error: str) -> None:
         self._get_external_eep_coordinator().abort(error)
+
     async def reconnect_dp_coordinator(
         self, input_address: str, output_address: str, stats_address: str
     ) -> None:
