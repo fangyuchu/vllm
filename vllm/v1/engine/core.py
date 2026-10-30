@@ -1913,10 +1913,7 @@ class EngineCoreProc(EngineCore):
                 if self.vllm_config.lora_config is not None
                 else 0
             ),
-            coord_store_port=parallel_config._coord_store_port,
             data_parallel_master_rank=parallel_config._data_parallel_master_rank,
-            coordinator_input_address=self.addresses.coordinator_input,
-            coordinator_output_address=self.addresses.coordinator_output,
             kv_events_config=self.scheduler.get_kv_event_publisher_config(),
             weight_transfer_backend=(
                 self.vllm_config.weight_transfer_config.backend

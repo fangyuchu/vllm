@@ -27,6 +27,7 @@ def _commit_state_after_fault(new_size=4):
         vllm_config=SimpleNamespace(parallel_config=parallel_config),
         output_queue=Queue(),
         dp_store=MagicMock(),
+        model_executor=SimpleNamespace(failure_callback=None),
     )
     sentinel = engine.ft_sentinel = EngineCoreSentinel(engine, parallel_config)
     sentinel._recover_and_vote = MagicMock()
