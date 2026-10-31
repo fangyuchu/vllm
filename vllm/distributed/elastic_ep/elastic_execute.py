@@ -78,13 +78,7 @@ def can_reuse_fused_moe_kernel(parallel_config: ParallelConfig) -> bool:
 
 
 def get_active_dp_size(dp_group: GroupCoordinator | None = None) -> int:
-    """Return the number of DP ranks currently participating in serving.
-
-    Fault-tolerance scale-down keeps the original model-side group width so
-    captured MC2/V3 tensor addresses remain valid. Dead ranks are recorded on
-    that group instead, so ``world_size`` alone is not the active topology size
-    seen by a following planned Elastic EP operation.
-    """
+    """Return the number of DP ranks currently participating in serving."""
     if dp_group is None:
         dp_group = get_dp_group()
     dead_dp_ranks = set(getattr(dp_group, "dead_dp_ranks", ()))
