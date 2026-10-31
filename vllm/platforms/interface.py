@@ -368,6 +368,11 @@ class Platform:
         )
 
     @classmethod
+    def get_elastic_ep_prepare_controller(cls, scaling_state: Any) -> Any | None:
+        """Return a platform controller for precommit batch-boundary preparation."""
+        return None
+
+    @classmethod
     def import_kernels(cls) -> None:
         """Import any platform-specific C kernels."""
         try:

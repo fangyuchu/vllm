@@ -83,7 +83,11 @@ def sync_cudagraph_and_dp_padding(
     # consumers index it by original dp_rank.
     num_tokens_across_dp_full = tensor[0]
 
-    if parallel_config is not None and parallel_config.enable_fault_tolerance:
+    if (
+        not should_skip_dp_coordination()
+        and parallel_config is not None
+        and parallel_config.enable_fault_tolerance
+    ):
         # Per-step barrier over the TP cpu group: a faulted sibling stops
         # arriving, so survivors fail here on the host instead of leaving
         # an orphaned TP collective running on device.

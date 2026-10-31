@@ -3,9 +3,11 @@
 
 import asyncio
 import contextlib
+import copy
 import enum
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 
@@ -55,12 +57,12 @@ class ExternalElasticEPScaleUpHandshakeMetadata:
 
 
 class ExternalElasticEPScaleUpHandshakeServer:
-    """Temporary rank-0 handshake server for external EEP scale-up.
+    """Temporary master-frontend handshake server for external EEP scale-up.
 
     During normal external startup the global handshake listener only exists
     while the rank starts. Scale-up needs the same handshake contract again for
-    newly launched ranks, so rank 0 re-opens a temporary listener for the
-    duration of the current scale operation.
+    newly launched ranks, so the surviving master re-opens a temporary listener
+    for the duration of the current scale operation.
 
     The handshake gives new ranks the information they cannot infer locally:
     front-end and DP coordinator ZMQ addresses, the new DP master address/ports,
@@ -163,7 +165,12 @@ class ExternalElasticEPScaleUpHandshakeServer:
                             ),
                             "data_parallel_size": b.new_data_parallel_size,
                             "_coord_store_port": b.coord_store_port,
+                            "_data_parallel_master_rank": b.data_parallel_master_rank,
                         }
+                        if b.existing_dp_ranks is not None:
+                            parallel_config["_eep_existing_dp_ranks"] = (
+                                b.existing_dp_ranks
+                            )
                         init_message = msgspec.msgpack.encode(
                             ExternalElasticEPScaleUpHandshakeMetadata(
                                 engine_metadata=EngineHandshakeMetadata(
@@ -241,6 +248,7 @@ class ExternalElasticEPScaleCoordinator:
             bootstrap.new_data_parallel_master_port_list.copy()
         )
         parallel_config._coord_store_port = bootstrap.coord_store_port
+        parallel_config._data_parallel_master_rank = bootstrap.data_parallel_master_rank
         parallel_config.eplb_config.num_redundant_experts = num_redundant_experts
 
     def _calculate_num_redundant_experts(
@@ -250,9 +258,18 @@ class ExternalElasticEPScaleCoordinator:
     ) -> int:
         parallel_config = self.client.vllm_config.parallel_config
         num_experts = self.client.vllm_config.model_config.get_num_experts()
-        num_redundant_experts = (
+        num_physical_experts = (
             num_experts + parallel_config.eplb_config.num_redundant_experts
-        ) * new_data_parallel_size // cur_data_parallel_size - num_experts
+        )
+        if num_physical_experts % cur_data_parallel_size != 0:
+            raise ValueError(
+                f"EPLB physical expert count {num_physical_experts} must be "
+                f"divisible by active DP size {cur_data_parallel_size}."
+            )
+        num_local_physical_experts = num_physical_experts // cur_data_parallel_size
+        num_redundant_experts = (
+            num_local_physical_experts * new_data_parallel_size - num_experts
+        )
         if num_redundant_experts < 0:
             raise ValueError(
                 "Cannot scale external Elastic EP from DP size "
@@ -260,6 +277,90 @@ class ExternalElasticEPScaleCoordinator:
                 "the target topology cannot retain all model experts."
             )
         return num_redundant_experts
+
+    async def migrate_coord_store(
+        self, master_ip: str, port: int, rank: int, size: int, request_id: str
+    ) -> None:
+        """Rehome the frontend control store after its owning rank is removed."""
+        from vllm.distributed.utils import (
+            create_tcp_store,
+            get_cached_tcp_store_client,
+        )
+
+        is_master = rank == 0 and self.client.client_index == 0
+        store = await asyncio.to_thread(
+            create_tcp_store,
+            master_ip,
+            port,
+            is_master=is_master,
+            world_size=-1,
+            wait_for_workers=False,
+            timeout=timedelta(seconds=60),
+        )
+        if self.client.vllm_config.needs_dp_coordinator:
+            from vllm.v1.engine.coordinator import DPCoordinator
+
+            address_key = self.key("ft", request_id, "dp_coordinator")
+            if is_master:
+                parallel = copy.copy(self.client.vllm_config.parallel_config)
+                parallel.data_parallel_master_ip = master_ip
+                parallel.data_parallel_size = size
+                parallel.data_parallel_rank = rank
+                coordinator = await asyncio.to_thread(
+                    DPCoordinator,
+                    parallel,
+                    enable_wave_coordination=self.client.vllm_config.model_config.is_moe,
+                )
+                previous = self.client.resources.coordinator
+                self.client.resources.coordinator = coordinator
+                if previous is not None:
+                    await asyncio.to_thread(previous.shutdown)
+                logger.info(
+                    "[FT] Started replacement DP Coordinator (PID: %d), size=%d",
+                    coordinator.proc.pid,
+                    size,
+                )
+                addresses = (
+                    *coordinator.get_engine_socket_addresses(),
+                    coordinator.get_stats_publish_address(),
+                )
+                await asyncio.to_thread(
+                    store.set, address_key, msgspec.msgpack.encode(addresses)
+                )
+            await asyncio.to_thread(store.wait, [address_key], timedelta(seconds=60))
+            addresses = msgspec.msgpack.decode(
+                await asyncio.to_thread(store.get, address_key)
+            )
+            await self.client.reconnect_dp_coordinator(*addresses)
+
+        ready_keys = [self.key("ft", request_id, "ready", r) for r in range(size)]
+        await asyncio.to_thread(store.set, ready_keys[rank], b"1")
+        await asyncio.to_thread(store.wait, ready_keys, timedelta(seconds=60))
+
+        if self.prepared_scale is not None:
+            await asyncio.to_thread(
+                self._stop_handshake_server,
+                self.prepared_scale.handshake_server,
+                True,
+            )
+        self.prepared_scale = None
+        self.active_epoch = None
+        self.active_reconfig_store = None
+        self.control_store_ref = None
+        self.reconfig_store_ref = None
+        self.client._coord_store = store
+        # A later recovery may reuse the same address with a new server.
+        get_cached_tcp_store_client.cache_clear()
+        parallel = self.client.vllm_config.parallel_config
+        parallel.data_parallel_master_ip = master_ip
+        parallel._coord_store_port = port
+        logger.info(
+            "[FT] Frontend coordination store migrated: %s:%d, rank=%d/%d",
+            master_ip,
+            port,
+            rank,
+            size,
+        )
 
     def _get_reconfig_store(self):
         from vllm.distributed.utils import get_cached_tcp_store_client
@@ -361,8 +462,7 @@ class ExternalElasticEPScaleCoordinator:
         requested_new_dp_size: int,
         timeout_s: float = 300,
     ) -> tuple[str, ReconfigureDistributedRequest]:
-        """Wait for rank 0 to publish matching scale bootstrap metadata.
-        Non-zero ranks poll the old control store until prepared or errored."""
+        """Wait for the master frontend to publish this scale operation."""
         loop = asyncio.get_running_loop()
         start = loop.time()
         current_epoch_key = self.key("current_epoch")
@@ -412,6 +512,7 @@ class ExternalElasticEPScaleCoordinator:
         store: Any,
         cur_data_parallel_size: int,
         new_data_parallel_size: int,
+        existing_dp_ranks: list[int],
     ) -> tuple[str, ReconfigureDistributedRequest]:
         from vllm.utils.network_utils import get_open_ports_list
 
@@ -427,6 +528,7 @@ class ExternalElasticEPScaleCoordinator:
                 )
 
         ip, coord_store_port = self._setup_reconfig_bootstrap()
+        parallel_config = self.client.vllm_config.parallel_config
         epoch = uuid.uuid4().hex
         master_ports = get_open_ports_list(5)
         bootstrap = ReconfigureDistributedRequest(
@@ -437,6 +539,9 @@ class ExternalElasticEPScaleCoordinator:
             new_data_parallel_master_port=master_ports.pop(),
             new_data_parallel_master_port_list=master_ports,
             coord_store_port=coord_store_port,
+            operation_id=epoch,
+            existing_dp_ranks=existing_dp_ranks,
+            data_parallel_master_rank=parallel_config._data_parallel_master_rank,
         )
 
         bootstrap_key = self.key(epoch, "bootstrap")
@@ -464,12 +569,14 @@ class ExternalElasticEPScaleCoordinator:
                 bootstrap.new_data_parallel_master_ip,
                 self.client.vllm_config.parallel_config.data_parallel_rpc_port,
             ),
-            expected_new_ranks=list(
-                range(
-                    cur_data_parallel_size,
-                    bootstrap.new_data_parallel_size,
+            expected_new_ranks=[
+                rank
+                for rank in range(bootstrap.new_data_parallel_size)
+                if rank
+                not in (
+                    bootstrap.existing_dp_ranks or list(range(cur_data_parallel_size))
                 )
-            ),
+            ],
             addresses=self._get_existing_engine_zmq_address(),
             bootstrap=bootstrap,
             num_redundant_experts=num_redundant_experts,
@@ -573,7 +680,10 @@ class ExternalElasticEPScaleCoordinator:
                 ),
                 rank,
             )
-            for rank in range(prepared.cur_data_parallel_size)
+            for rank in (
+                bootstrap.existing_dp_ranks
+                or list(range(prepared.cur_data_parallel_size))
+            )
         ]
         loop = asyncio.get_running_loop()
         start = loop.time()
@@ -636,7 +746,10 @@ class ExternalElasticEPScaleCoordinator:
         )
         keys = [
             self.key(prepared.epoch, "commit_ready", rank)
-            for rank in range(prepared.cur_data_parallel_size)
+            for rank in (
+                prepared.bootstrap.existing_dp_ranks
+                or list(range(prepared.cur_data_parallel_size))
+            )
         ]
 
         def is_ready() -> bool:
@@ -655,7 +768,11 @@ class ExternalElasticEPScaleCoordinator:
             backoff_step = await self._sleep_with_backoff(backoff_step)
 
     async def prepare(
-        self, cur_data_parallel_size: int, new_data_parallel_size: int
+        self,
+        cur_data_parallel_size: int,
+        new_data_parallel_size: int,
+        *,
+        existing_dp_ranks: list[int] | None = None,
     ) -> None:
         from vllm.distributed.utils import get_cached_tcp_store_client
 
@@ -669,6 +786,18 @@ class ExternalElasticEPScaleCoordinator:
 
         parallel_config = self.client.vllm_config.parallel_config
         dp_rank = parallel_config.data_parallel_rank
+        existing_dp_ranks = (
+            list(range(cur_data_parallel_size))
+            if existing_dp_ranks is None
+            else sorted(existing_dp_ranks)
+        )
+        if new_data_parallel_size > cur_data_parallel_size and any(
+            rank < 0 or rank >= new_data_parallel_size for rank in existing_dp_ranks
+        ):
+            raise ValueError(
+                "Scale-up must include every surviving DP rank without renumbering; "
+                f"survivors={existing_dp_ranks}, target_size={new_data_parallel_size}"
+            )
         scale_up = new_data_parallel_size > cur_data_parallel_size
         if new_data_parallel_size > parallel_config.elastic_ep_max_dp_size:
             raise ValueError(
@@ -686,7 +815,8 @@ class ExternalElasticEPScaleCoordinator:
             raise RuntimeError(
                 "External Elastic EP requires a runtime coordination store port."
             )
-        control_store = get_cached_tcp_store_client(
+        control_store = await asyncio.to_thread(
+            get_cached_tcp_store_client,
             parallel_config.data_parallel_master_ip,
             parallel_config._coord_store_port,
         )
@@ -696,11 +826,12 @@ class ExternalElasticEPScaleCoordinator:
         reconfig_store: Any | None = None
 
         try:
-            if dp_rank == 0:
+            if dp_rank == parallel_config._data_parallel_master_rank:
                 epoch, bootstrap = self._prepare_reconfig_bootstrap(
                     control_store,
                     cur_data_parallel_size,
                     new_data_parallel_size,
+                    existing_dp_ranks,
                 )
                 control_store.set(
                     self.key(epoch, "num_redundant_experts"),
@@ -724,20 +855,29 @@ class ExternalElasticEPScaleCoordinator:
 
             assert epoch is not None
             assert bootstrap is not None
+            if bootstrap.existing_dp_ranks != existing_dp_ranks:
+                raise ValueError(
+                    "External scale-up frontends disagree on surviving ranks"
+                )
             self.active_epoch = epoch
             self.active_reconfig_store = (
                 bootstrap.new_data_parallel_master_ip,
                 bootstrap.coord_store_port,
             )
-            reconfig_store = self._get_reconfig_store()
+            reconfig_store = await asyncio.to_thread(self._get_reconfig_store)
+            assert reconfig_store is not None
             reconfig_store.set(self.key("current_epoch"), epoch.encode())
             self._set_phase(
                 reconfig_store, epoch, ExternalElasticEPScalePhase.PREPARING
             )
 
             if scale_up or dp_rank < bootstrap.new_data_parallel_size:
+                reconfig_request = msgspec.structs.replace(
+                    bootstrap,
+                    new_data_parallel_rank=dp_rank,
+                )
                 await self.client.call_utility_async(
-                    "reinitialize_distributed", bootstrap
+                    "reinitialize_distributed", reconfig_request
                 )
 
             await self._wait_for_ready_ranks(
@@ -759,6 +899,7 @@ class ExternalElasticEPScaleCoordinator:
                 handshake_server=handshake_server,
             )
         except BaseException as e:
+            self.prepared_scale = None
             if epoch is not None:
                 self.active_epoch = epoch
                 error_key = self.key(epoch, "error")
@@ -823,7 +964,7 @@ class ExternalElasticEPScaleCoordinator:
                 prepared.dp_rank,
                 prepared.scale_up,
             )
-            if prepared.dp_rank == 0:
+            if prepared.dp_rank == prepared.bootstrap.data_parallel_master_rank:
                 await self._wait_for_all_old_ranks(prepared)
                 completed_key = self.key(prepared.epoch, "completed")
                 prepared.control_store.set(completed_key, b"1")
@@ -835,7 +976,7 @@ class ExternalElasticEPScaleCoordinator:
 
             if remaining:
                 self._update_parallel_config(bootstrap, prepared.num_redundant_experts)
-                if prepared.dp_rank == 0:
+                if prepared.dp_rank == bootstrap.data_parallel_master_rank:
                     self.client._coord_store = self.reconfig_store_ref
                     self.client._ensure_stats_update_task()
                     await self.client.scale_send_socket.send(
@@ -877,7 +1018,7 @@ class ExternalElasticEPScaleCoordinator:
             return
 
         epoch = self.active_epoch
-        reconfig_store = self._get_reconfig_store()
+        reconfig_store = await asyncio.to_thread(self._get_reconfig_store)
         if epoch is None:
             current_epoch_key = self.key("current_epoch")
             if not reconfig_store.check([current_epoch_key]):
