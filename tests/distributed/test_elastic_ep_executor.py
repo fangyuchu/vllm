@@ -40,7 +40,7 @@ def test_nixl_ep_reconnects_failed_rank_slots_before_commit(monkeypatch):
 
     manager.commit_ep_size()
     buffer.update_mask_buffer.assert_called_once_with(1, mask=False)
-    assert not state.disconnected_ranks and not state.staged_ranks
+    assert not state.ft_disconnected_ranks and not state.pending_activation_ranks
     buffer.query_mask_buffer.side_effect = lambda mask: mask.zero_()
     assert not manager.query_fault().item()
 

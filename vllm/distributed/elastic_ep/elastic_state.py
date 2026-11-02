@@ -209,10 +209,6 @@ class ElasticEPScalingState:
         if state == ScaleUpNewEngineState.PRE_KV_INIT:
             parallel = self.new_parallel_config
             if self.reconfig_request is None and parallel.data_parallel_external_lb:
-                from vllm.distributed.elastic_ep.external_elastic_ep import (
-                    ExternalElasticEPScaleCoordinator,
-                )
-
                 store = get_cached_tcp_store_client(
                     parallel.data_parallel_master_ip, parallel._coord_store_port
                 )
@@ -317,7 +313,7 @@ class ElasticEPScalingState:
 
     @property
     def ready_key(self) -> str:
-        return f"eep_ready/{self.new_parallel_config.data_parallel_rank}"
+        return f"eep_ready/{self.engine_core.dp_rank}"
 
     def _mark_ready_for_switch(self) -> None:
         parallel_config = self.new_parallel_config

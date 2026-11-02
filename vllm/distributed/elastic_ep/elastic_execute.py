@@ -81,24 +81,7 @@ def get_active_dp_size(dp_group: GroupCoordinator | None = None) -> int:
     """Return the number of DP ranks currently participating in serving."""
     if dp_group is None:
         dp_group = get_dp_group()
-    dead_dp_ranks = set(getattr(dp_group, "dead_dp_ranks", ()))
-    invalid_dead_ranks = {
-        rank for rank in dead_dp_ranks if rank < 0 or rank >= dp_group.world_size
-    }
-    if invalid_dead_ranks:
-        raise RuntimeError(
-            "Elastic EP found invalid dead DP ranks: "
-            f"dead_dp_ranks={sorted(dead_dp_ranks)}, "
-            f"world_size={dp_group.world_size}"
-        )
-    active_dp_size = dp_group.world_size - len(dead_dp_ranks)
-    if active_dp_size <= 0:
-        raise RuntimeError(
-            "Elastic EP requires at least one active DP rank: "
-            f"dead_dp_ranks={sorted(dead_dp_ranks)}, "
-            f"world_size={dp_group.world_size}"
-        )
-    return active_dp_size
+    return dp_group.world_size - len(dp_group.dead_dp_ranks)
 
 
 def scale_up_source_rank(
