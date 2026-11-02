@@ -274,7 +274,6 @@ class EngineCoreClient(ABC):
     async def prepare_elastic_ep(
         self,
         new_data_parallel_size: int,
-        *,
         existing_dp_ranks: list[int] | None = None,
     ) -> None:
         raise NotImplementedError
@@ -1712,7 +1711,6 @@ class DPAsyncMPClient(AsyncMPClient):
     async def prepare_elastic_ep(
         self,
         new_data_parallel_size: int,
-        *,
         existing_dp_ranks: list[int] | None = None,
     ) -> None:
         cur_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
@@ -1736,6 +1734,9 @@ class DPAsyncMPClient(AsyncMPClient):
     async def reconnect_dp_coordinator(
         self, input_address: str, output_address: str, stats_address: str
     ) -> None:
+        """After FT replaces the DP coordinator, reconnect the engine and frontend
+        to restore stats updates and idle-request wakeups.
+        """
         await asyncio.wait_for(
             self.call_utility_async(
                 "reconnect_dp_coordinator",
@@ -1768,6 +1769,9 @@ class DPAsyncMPClient(AsyncMPClient):
     async def migrate_elastic_ep_coord_store(
         self, master_ip: str, port: int, rank: int, size: int, request_id: str
     ) -> None:
+        """After FT removes the store owner, move the external EEP control store
+        and any DP coordinator to a surviving rank, then reconnect all survivors.
+        """
         await self._get_external_eep_coordinator().migrate_coord_store(
             master_ip, port, rank, size, request_id
         )
@@ -1997,7 +2001,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def prepare_elastic_ep(
         self,
         new_data_parallel_size: int,
-        *,
         existing_dp_ranks: list[int] | None = None,
     ) -> None:
         """Prepare elastic EP scaling without routing requests to new engines."""

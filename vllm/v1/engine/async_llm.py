@@ -1393,17 +1393,20 @@ class AsyncLLM(EngineClient):
         if fault_tolerance_request.instruction != "scale_down":
             return await self.engine_core.handle_fault(fault_tolerance_request)
         async with self._elastic_ep_lock:
+            self._ft_frontend_sync_status = {
+                "ft_state": "recovering",
+                "last_ft_request_id": fault_tolerance_request.request_id,
+            }
             try:
                 result = await self._handle_scale_down(fault_tolerance_request)
             except Exception as exc:
-                if self._ft_frontend_sync_status is not None:
-                    self._ft_frontend_sync_status.update(
-                        ft_state="failed", ft_error=str(exc)
-                    )
+                self._ft_frontend_sync_status.update(
+                    ft_state="failed", ft_error=str(exc) or type(exc).__name__
+                )
                 raise
             if result.success:
                 self._ft_frontend_sync_status = None
-            elif self._ft_frontend_sync_status is not None:
+            else:
                 self._ft_frontend_sync_status.update(
                     ft_state="failed", ft_error=result.reason
                 )
@@ -1414,17 +1417,22 @@ class AsyncLLM(EngineClient):
     ) -> FaultToleranceResult:
         parallel = self.vllm_config.parallel_config
         params = request.params
-        removed = set(params["removed_dp_ranks"])
+        removed_ranks = params.get("removed_dp_ranks")
+        if (
+            not isinstance(removed_ranks, list)
+            or not removed_ranks
+            or any(type(rank) is not int for rank in removed_ranks)
+        ):
+            raise ValueError(
+                "'removed_dp_ranks' must be a non-empty list of integer rank IDs."
+            )
+        removed = set(removed_ranks)
         migrate_store = (
             parallel.enable_elastic_ep
             and parallel.data_parallel_external_lb
             and parallel._data_parallel_master_rank in removed
         )
         if migrate_store:
-            self._ft_frontend_sync_status = {
-                "ft_state": "recovering",
-                "last_ft_request_id": request.request_id,
-            }
             port = params.get("coord_store_port")
             # Reject invalid migration metadata before recovering EngineCore.
             if (
@@ -1444,8 +1452,6 @@ class AsyncLLM(EngineClient):
             return result
 
         active = [rank for rank in self._ft_active_dp_ranks if rank not in removed]
-        if parallel.data_parallel_rank not in active:
-            raise RuntimeError("Successful scale-down removed the current frontend.")
         redundant = None
         if parallel.enable_eplb:
             num_experts = self.model_config.get_num_experts()
