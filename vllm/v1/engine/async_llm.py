@@ -1452,26 +1452,9 @@ class AsyncLLM(EngineClient):
             return result
 
         active = [rank for rank in self._ft_active_dp_ranks if rank not in removed]
-        redundant = None
-        if parallel.enable_eplb:
-            num_experts = self.model_config.get_num_experts()
-            if num_experts is not None:
-                local_experts, remainder = divmod(
-                    num_experts + parallel.eplb_config.num_redundant_experts,
-                    parallel.data_parallel_size,
-                )
-                if remainder:
-                    raise RuntimeError(
-                        "Frontend EPLB capacity is inconsistent with DP size."
-                    )
-                redundant = local_experts * len(active) - num_experts
-                if redundant < 0:
-                    raise RuntimeError(
-                        "Scale-down left fewer physical experts than required."
-                    )
 
         if migrate_store:
-            await self.engine_core.migrate_elastic_ep_coord_store(
+            await self.engine_core.recover_elastic_ep_coord_store(
                 params["dp_master_ip"],
                 params["coord_store_port"],
                 active.index(parallel.data_parallel_rank),
@@ -1479,8 +1462,10 @@ class AsyncLLM(EngineClient):
                 request.request_id,
             )
             parallel._data_parallel_master_rank = active[0]
-        if redundant is not None:
-            parallel.eplb_config.num_redundant_experts = redundant
+        if result.num_redundant_experts is not None:
+            # Track surviving expert capacity for subsequent scaling;
+            # workers retain their original slot layout until reconfiguration.
+            parallel.eplb_config.num_redundant_experts = result.num_redundant_experts
         parallel.data_parallel_size = len(active)
         self._ft_active_dp_ranks = active
         logger.info("[FT] Frontend topology synchronized: active_dp_ranks=%s", active)

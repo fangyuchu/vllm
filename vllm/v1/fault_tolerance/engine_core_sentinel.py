@@ -397,7 +397,7 @@ class EngineCoreSentinel:
         new_dead = self._dead_dp_ranks | newly_dead
         ft_request.params["dead_dp_ranks"] = sorted(new_dead)
         self._prepare_round(ft_request, dead_ranks=new_dead)
-        self._recover_and_vote(ft_request, terminal=True)
+        num_redundant_experts = self._recover_and_vote(ft_request, terminal=True)
         # Commit the dead set only after the full recovery succeeded.
         self._dead_dp_ranks = new_dead
         logger.info(
@@ -407,7 +407,9 @@ class EngineCoreSentinel:
             sorted(newly_dead),
             sorted(new_dead),
         )
-        return self._mark_healthy(ft_request)
+        result = self._mark_healthy(ft_request)
+        result.num_redundant_experts = num_redundant_experts
+        return result
 
     def _prepare_round(
         self, ft_request: FaultToleranceRequest, dead_ranks: set[int] | None = None
@@ -517,7 +519,7 @@ class EngineCoreSentinel:
         self,
         ft_request: FaultToleranceRequest,
         terminal: bool,
-    ) -> None:
+    ) -> int | None:
         """Reinit the engine groups, dispatch the command to workers, then
         all surviving engines vote one success bit over the rebuilt DP group
         so they commit or fail together. Any failure is terminal when
@@ -529,7 +531,7 @@ class EngineCoreSentinel:
         local_error: Exception | None = None
         try:
             self._reinit_groups(ft_request)
-            engine.model_executor.collective_rpc(
+            worker_results = engine.model_executor.collective_rpc(
                 "handle_ft_command", args=(ft_request,)
             )
             self._drain_batch_queue()
@@ -547,7 +549,7 @@ class EngineCoreSentinel:
             except Exception:
                 success.zero_()
         if success.item():
-            return
+            return worker_results[0]
 
         if terminal:
             self.status_type = EngineStatusType.DEAD
