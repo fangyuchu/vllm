@@ -16,6 +16,7 @@ from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.distributed.eplb.eplb_communicator import NixlEplbCommunicator
 from vllm.distributed.eplb.eplb_state import _commit_eplb_maps
 from vllm.distributed.utils import (
     allocate_group_ports,
@@ -215,6 +216,11 @@ class WorkerSentinel:
         get_ep_all2all_manager().disconnect_ranks(sorted(dead_ep_ranks))
 
         self._redistribute_experts(dead_ep_ranks)
+
+        for model_state in model_runner.eplb_state.model_states.values():
+            communicator = model_state.communicator
+            if isinstance(communicator, NixlEplbCommunicator):
+                communicator.retire_peers(dead_ep_ranks)
 
         logger.info(
             "[FT] Worker scale_down complete: dp_group_size=%d, "

@@ -3,6 +3,7 @@
 """EPLB communicator implementations and factory."""
 
 import contextlib
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -354,6 +355,9 @@ class NixlEplbCommunicator(EplbCommunicator):
         # Per-rank expert_id -> physical row; set by set_transfer_context.
         self._expert_to_src_row: list[dict[int, int]] | None = None
         self._layer_idx: int | None = None
+        self._peer_lock = threading.Lock()
+        self._pending_peer_retirements: set[int] = set()
+        self._retiring = False
         self.set_stream(None)
 
         nixl_agent_config = nixl_utils.nixl_agent_config
@@ -429,7 +433,11 @@ class NixlEplbCommunicator(EplbCommunicator):
                 torch.accelerator.current_stream().synchronize()
                 if self._stream is not None:
                     self._stream.synchronize()
-        self._layer_idx = layer_idx
+        # Mark the layer active before reading peer metadata in add_recv().
+        with self._peer_lock:
+            if self._retiring:
+                raise RuntimeError("EPLB communicator retired after FT scale-down")
+            self._layer_idx = layer_idx
         n = self._num_local_experts
         rank_experts = old_indices[: self._world_size * n].reshape(self._world_size, n)
         self._expert_to_src_row = [
@@ -506,6 +514,27 @@ class NixlEplbCommunicator(EplbCommunicator):
         descs = self._nixl_wrapper.get_reg_descs(all_tensors)
         self._nixl_wrapper.register_memory(descs)
         self._registered_descs.append(descs)
+
+    def retire_peers(self, dead_ep_ranks: set[int]) -> None:
+        """Freeze the FT communicator and release dead peers once transfers finish."""
+        with self._peer_lock:
+            # FT suppresses EPLB until scale-up installs a new communicator.
+            self._retiring = True
+            self._pending_peer_retirements.update(
+                dead_ep_ranks.intersection(self._remote_agents)
+            )
+            if self._layer_idx is not None:
+                return
+            self._retire_idle_peers()
+
+    def _retire_idle_peers(self) -> None:
+        # Caller holds _peer_lock; transfer descriptors have already been released.
+        for peer in sorted(self._pending_peer_retirements):
+            agent_name = self._remote_agents[peer]
+            self._nixl_wrapper.remove_remote_agent(agent_name)
+            del self._remote_agents[peer]
+            self._remote_send_meta.pop(peer, None)
+            self._pending_peer_retirements.remove(peer)
 
     def _exchange_remote_send_meta(self) -> None:
         """Exchange per-layer per-tensor metadata so receivers can compute
@@ -631,16 +660,25 @@ class NixlEplbCommunicator(EplbCommunicator):
 
             self._post_read_barrier()
         finally:
+            release_error: Exception | None = None
             for local_h, remote_h, xfer_h in self._xfer_entries:
-                with contextlib.suppress(Exception):
+                try:
                     self._nixl_wrapper.release_xfer_handle(xfer_h)
-                with contextlib.suppress(Exception):
                     self._nixl_wrapper.release_dlist_handle(local_h)
-                with contextlib.suppress(Exception):
                     self._nixl_wrapper.release_dlist_handle(remote_h)
-            self._xfer_entries.clear()
-            self._expert_to_src_row = None
-            self._layer_idx = None
+                except Exception as exc:
+                    release_error = exc
+                    logger.exception("Failed to release EPLB NIXL transfer handles")
+            if release_error is not None:
+                # Keep peer metadata until its outstanding handles can be released.
+                raise RuntimeError(
+                    "Failed to release EPLB NIXL transfer handles"
+                ) from release_error
+            with self._peer_lock:
+                self._xfer_entries.clear()
+                self._expert_to_src_row = None
+                self._layer_idx = None
+                self._retire_idle_peers()
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
