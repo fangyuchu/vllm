@@ -283,7 +283,7 @@ class EngineCoreClient(ABC):
     async def abort_external_elastic_ep(self, error: str) -> None:
         raise NotImplementedError
 
-    async def migrate_elastic_ep_coord_store(
+    async def recover_elastic_ep_coord_store(
         self, master_ip: str, port: int, rank: int, size: int, request_id: str
     ) -> None:
         raise NotImplementedError
@@ -1796,11 +1796,13 @@ class DPAsyncMPClient(AsyncMPClient):
         self.coordinator_input_address = input_address
         self.coordinator_output_address = output_address
 
-    async def migrate_elastic_ep_coord_store(
+    async def recover_elastic_ep_coord_store(
         self, master_ip: str, port: int, rank: int, size: int, request_id: str
     ) -> None:
-        """After FT removes the store owner, move the external EEP control store
-        and any DP coordinator to a surviving rank, then reconnect all survivors.
+        """Migrate Elastic EP coordination after fault recovery removes its owner.
+
+        Recreate the control store and any DP coordinator on a surviving rank,
+        then reconnect this frontend and its engine.
         """
         await self._get_external_eep_coordinator().migrate_coord_store(
             master_ip, port, rank, size, request_id

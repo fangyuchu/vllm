@@ -212,7 +212,7 @@ class WorkerSentinel:
         # Drop stale endpoints before a replacement process reuses these ranks.
         get_ep_all2all_manager().disconnect_ranks(sorted(dead_ep_ranks))
 
-        self._redistribute_experts(dead_ep_ranks)
+        num_redundant_experts = self._redistribute_experts(dead_ep_ranks)
 
         for model_state in model_runner.eplb_state.model_states.values():
             communicator = model_state.communicator
@@ -226,6 +226,7 @@ class WorkerSentinel:
             ft_request.params["dp_group_rank"],
             sorted(dead_ep_ranks),
         )
+        return num_redundant_experts
 
     def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
         """Query the mask on a side stream."""
@@ -267,7 +268,7 @@ class WorkerSentinel:
             model_runner.model_config.compute_hash()
         ]
 
-    def _redistribute_experts(self, dead_ep_ranks: set[int]) -> None:
+    def _redistribute_experts(self, dead_ep_ranks: set[int]) -> int:
         """One-shot expert redistribution after scale-down."""
         model_runner = self.worker.model_runner
         eplb_model_state = self._eplb_model_state()
@@ -301,6 +302,7 @@ class WorkerSentinel:
             ep_world_size,
             len(reassignments),
         )
+        return int((p2l[0] >= 0).sum().item()) - num_logical
 
     def _clean_worker_state(self):
         model_runner = self.worker.model_runner
