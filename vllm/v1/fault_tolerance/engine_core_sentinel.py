@@ -152,10 +152,8 @@ class EngineCoreSentinel:
 
     @property
     def coordinator_disabled(self) -> bool:
-        """True once any scale_down has committed dead ranks. The DP wave
-        wake-up path depends on the DP coordinator, which has no failover;
-        after a scale_down the engine never idle-pauses and keeps stepping
-        dummy batches instead."""
+        """Keep stepping after fault recovery until scale-up restores the
+        topology and rank 0's coordinator can wake idle engines again."""
         return bool(self._dead_dp_ranks)
 
     def activate_cpu_group_timeouts(self) -> None:

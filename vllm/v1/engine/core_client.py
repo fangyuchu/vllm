@@ -1734,8 +1734,8 @@ class DPAsyncMPClient(AsyncMPClient):
     async def reconnect_dp_coordinator(
         self, input_address: str, output_address: str, stats_address: str
     ) -> None:
-        """After FT replaces the DP coordinator, reconnect the engine and frontend
-        to restore stats updates and idle-request wakeups.
+        """When scale-up restores rank 0's coordinator, reconnect the engine and
+        frontend to restore stats updates and idle-request wakeups.
         """
         await asyncio.wait_for(
             self.call_utility_async(
@@ -1744,7 +1744,7 @@ class DPAsyncMPClient(AsyncMPClient):
                 output_address,
                 stats_address,
             ),
-            timeout=60,
+            timeout=300,
         )
         if self.stats_update_address != stats_address:
             task = self.resources.stats_update_task
@@ -1771,8 +1771,8 @@ class DPAsyncMPClient(AsyncMPClient):
     ) -> None:
         """Migrate Elastic EP coordination after fault recovery removes its owner.
 
-        Recreate the control store and any DP coordinator on a surviving rank,
-        then reconnect this frontend and its engine.
+        Recreate the control store on a survivor. The DP coordinator stays on
+        rank 0 and is recreated when that rank returns during scale-up.
         """
         await self._get_external_eep_coordinator().migrate_coord_store(
             master_ip, port, rank, size, request_id
