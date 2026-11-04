@@ -16,7 +16,7 @@ import msgspec.msgpack
 import zmq
 
 from vllm.logger import init_logger
-from vllm.utils.network_utils import make_zmq_socket
+from vllm.utils.network_utils import get_ip, make_zmq_socket, zmq_socket_ctx
 from vllm.v1.engine import (
     EEPNotificationType,
     ReconfigureDistributedRequest,
@@ -26,6 +26,8 @@ from vllm.v1.engine.utils import EngineHandshakeMetadata, EngineZmqAddresses
 from vllm.v1.utils import get_engine_client_zmq_addr
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.core_client import DPAsyncMPClient
 
 logger = init_logger(__name__)
@@ -56,6 +58,51 @@ class ExternalElasticEPScaleUpHandshakeMetadata:
     elastic_ep_max_dp_size: int
 
 
+def create_scale_up_coordinator(vllm_config: "VllmConfig") -> "DPCoordinator":
+    """Let returning rank 0 create the coordinator for the target topology."""
+    from vllm.v1.engine.coordinator import DPCoordinator
+
+    parallel = copy.copy(vllm_config.parallel_config)
+    with zmq_socket_ctx(
+        get_engine_client_zmq_addr(
+            False, parallel.data_parallel_master_ip, parallel.data_parallel_rpc_port
+        ),
+        zmq.DEALER,
+        bind=False,
+        identity=b"\x00\x00",
+    ) as socket:
+        socket.send(msgspec.msgpack.encode({"status": "COORDINATOR"}))
+        if not socket.poll(timeout=300_000):
+            raise TimeoutError("Timed out obtaining the scale-up coordinator topology.")
+        parallel.data_parallel_size = msgspec.msgpack.decode(socket.recv())
+        # The DP/store master may still be a survivor on another node.
+        parallel.data_parallel_master_ip = get_ip()
+        coordinator = DPCoordinator(
+            parallel,
+            enable_wave_coordination=vllm_config.model_config.is_moe,
+            logging_config=vllm_config.logging_config,
+        )
+        try:
+            socket.send(
+                msgspec.msgpack.encode(
+                    {
+                        "status": "COORDINATOR",
+                        "addresses": (
+                            *coordinator.get_engine_socket_addresses(),
+                            coordinator.get_stats_publish_address(),
+                        ),
+                    }
+                )
+            )
+            if not socket.poll(timeout=300_000) or socket.recv() != b"OK":
+                raise RuntimeError("Failed to register rank 0's scale-up coordinator.")
+        except BaseException:
+            coordinator.shutdown()
+            raise
+    vllm_config.parallel_config.data_parallel_size = parallel.data_parallel_size
+    return coordinator
+
+
 class ExternalElasticEPScaleUpHandshakeServer:
     """Temporary master-frontend handshake server for external EEP scale-up.
 
@@ -79,6 +126,7 @@ class ExternalElasticEPScaleUpHandshakeServer:
         bootstrap: ReconfigureDistributedRequest,
         num_redundant_experts: int,
         elastic_ep_max_dp_size: int,
+        reconfig_store: Any,
     ) -> None:
         self.handshake_address = handshake_address
         self.expected_new_ranks = set(expected_new_ranks)
@@ -86,6 +134,7 @@ class ExternalElasticEPScaleUpHandshakeServer:
         self.bootstrap = bootstrap
         self.num_redundant_experts = num_redundant_experts
         self.elastic_ep_max_dp_size = elastic_ep_max_dp_size
+        self.reconfig_store = reconfig_store
         self.started_event = Event()
         self._stop_event = Event()
         self._thread = Thread(
@@ -119,6 +168,8 @@ class ExternalElasticEPScaleUpHandshakeServer:
 
     def _run(self) -> None:
         pending_ready_ranks = self.expected_new_ranks.copy()
+        pending_hellos: list[bytes] = []
+        coordinator_ready = 0 not in self.expected_new_ranks
         try:
             with (
                 zmq.Context() as ctx,
@@ -154,6 +205,42 @@ class ExternalElasticEPScaleUpHandshakeServer:
                     message = msgspec.msgpack.decode(payload)
                     status = message["status"]
                     if status == "HELLO":
+                        pending_hellos.append(engine_identity)
+                    elif status == "COORDINATOR" and engine_rank == 0:
+                        if "addresses" not in message:
+                            handshake_socket.send_multipart(
+                                (
+                                    engine_identity,
+                                    msgspec.msgpack.encode(
+                                        self.bootstrap.new_data_parallel_size
+                                    ),
+                                )
+                            )
+                            continue
+                        (
+                            self.addresses.coordinator_input,
+                            self.addresses.coordinator_output,
+                            self.addresses.frontend_stats_publish_address,
+                        ) = message["addresses"]
+                        self.reconfig_store.set(
+                            ExternalElasticEPScaleCoordinator.key(
+                                self.bootstrap.operation_id, "dp_coordinator"
+                            ),
+                            msgspec.msgpack.encode(message["addresses"]),
+                        )
+                        coordinator_ready = True
+                        handshake_socket.send_multipart((engine_identity, b"OK"))
+                    elif status == "READY":
+                        pending_ready_ranks.discard(engine_rank)
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected handshake status {status} from dp rank "
+                            f"{engine_rank}"
+                        )
+
+                    # Other new ranks may arrive before rank 0 publishes its
+                    # replacement coordinator. Do not send retired addresses.
+                    if coordinator_ready and pending_hellos:
                         b = self.bootstrap
                         parallel_config: dict[str, int | str | list[int]] = {
                             "data_parallel_master_ip": b.new_data_parallel_master_ip,
@@ -181,16 +268,11 @@ class ExternalElasticEPScaleUpHandshakeServer:
                                 elastic_ep_max_dp_size=self.elastic_ep_max_dp_size,
                             )
                         )
-                        handshake_socket.send_multipart(
-                            (engine_identity, init_message), copy=False
-                        )
-                    elif status == "READY":
-                        pending_ready_ranks.discard(engine_rank)
-                    else:
-                        raise RuntimeError(
-                            f"Unexpected handshake status {status} from dp rank "
-                            f"{engine_rank}"
-                        )
+                        for identity in pending_hellos:
+                            handshake_socket.send_multipart(
+                                (identity, init_message), copy=False
+                            )
+                        pending_hellos.clear()
         except Exception as e:
             self._error = e
             self.started_event.set()
@@ -297,42 +379,6 @@ class ExternalElasticEPScaleCoordinator:
             wait_for_workers=False,
             timeout=timedelta(seconds=60),
         )
-        if self.client.vllm_config.needs_dp_coordinator:
-            from vllm.v1.engine.coordinator import DPCoordinator
-
-            address_key = self.key("ft", request_id, "dp_coordinator")
-            if is_master:
-                parallel = copy.copy(self.client.vllm_config.parallel_config)
-                parallel.data_parallel_master_ip = master_ip
-                parallel.data_parallel_size = size
-                parallel.data_parallel_rank = rank
-                coordinator = await asyncio.to_thread(
-                    DPCoordinator,
-                    parallel,
-                    enable_wave_coordination=self.client.vllm_config.model_config.is_moe,
-                )
-                previous = self.client.resources.coordinator
-                self.client.resources.coordinator = coordinator
-                if previous is not None:
-                    await asyncio.to_thread(previous.shutdown)
-                logger.info(
-                    "[FT] Started replacement DP Coordinator (PID: %d), size=%d",
-                    coordinator.proc.pid,
-                    size,
-                )
-                addresses = (
-                    *coordinator.get_engine_socket_addresses(),
-                    coordinator.get_stats_publish_address(),
-                )
-                await asyncio.to_thread(
-                    store.set, address_key, msgspec.msgpack.encode(addresses)
-                )
-            await asyncio.to_thread(store.wait, [address_key], timedelta(seconds=60))
-            addresses = msgspec.msgpack.decode(
-                await asyncio.to_thread(store.get, address_key)
-            )
-            await self.client.reconnect_dp_coordinator(*addresses)
-
         ready_keys = [self.key("ft", request_id, "ready", r) for r in range(size)]
         await asyncio.to_thread(store.set, ready_keys[rank], b"1")
         await asyncio.to_thread(store.wait, ready_keys, timedelta(seconds=60))
@@ -581,6 +627,7 @@ class ExternalElasticEPScaleCoordinator:
             bootstrap=bootstrap,
             num_redundant_experts=num_redundant_experts,
             elastic_ep_max_dp_size=elastic_ep_max_dp_size,
+            reconfig_store=self.reconfig_store_ref,
         )
         handshake_server.start()
         return handshake_server
@@ -879,6 +926,18 @@ class ExternalElasticEPScaleCoordinator:
                 await self.client.call_utility_async(
                     "reinitialize_distributed", reconfig_request
                 )
+
+            if scale_up and 0 not in existing_dp_ranks:
+                # Start target-group preparation first: the new rank must join
+                # that group before it can subscribe to its coordinator.
+                address_key = self.key(epoch, "dp_coordinator")
+                await asyncio.to_thread(
+                    reconfig_store.wait, [address_key], timedelta(seconds=300)
+                )
+                addresses = msgspec.msgpack.decode(
+                    await asyncio.to_thread(reconfig_store.get, address_key)
+                )
+                await self.client.reconnect_dp_coordinator(*addresses)
 
             await self._wait_for_ready_ranks(
                 control_store,

@@ -1237,10 +1237,13 @@ def launch_core_engines(
     # 1. Internal/hybrid LB: collecting and publishing queue stats for load balancing
     # 2. MoE models: wave coordination in addition to stats
     run_coordinator = (
-        vllm_config.needs_dp_coordinator
-        and not offline_mode
+        not offline_mode
         and dp_rank == 0
-        and not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+        and (
+            parallel_config.data_parallel_external_lb
+            if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+            else vllm_config.needs_dp_coordinator
+        )
     )
 
     coord_store = None
@@ -1271,11 +1274,18 @@ def launch_core_engines(
         )
 
     if run_coordinator:
-        coordinator = DPCoordinator(
-            parallel_config,
-            enable_wave_coordination=vllm_config.model_config.is_moe,
-            logging_config=vllm_config.logging_config,
-        )
+        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            from vllm.distributed.elastic_ep.external_elastic_ep import (
+                create_scale_up_coordinator,
+            )
+
+            coordinator = create_scale_up_coordinator(vllm_config)
+        else:
+            coordinator = DPCoordinator(
+                parallel_config,
+                enable_wave_coordination=vllm_config.model_config.is_moe,
+                logging_config=vllm_config.logging_config,
+            )
 
         addresses.coordinator_input, addresses.coordinator_output = (
             coordinator.get_engine_socket_addresses()
