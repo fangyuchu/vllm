@@ -19,7 +19,6 @@ from vllm.distributed.elastic_ep.external_elastic_ep import (
 )
 from vllm.distributed.utils import get_cached_tcp_store_client, set_gloo_backend_timeout
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.v1.engine import (
     EEPNotificationType,
     ReconfigureDistributedRequest,
@@ -108,10 +107,6 @@ class ElasticEPScalingState:
                 if worker_type == "removing"
                 else ScaleDownRemainingEngineState.PREPARE
             )
-
-        self.prepare_controller = current_platform.get_elastic_ep_prepare_controller(
-            self
-        )
 
     @property
     def model_executor(self) -> "Executor":
