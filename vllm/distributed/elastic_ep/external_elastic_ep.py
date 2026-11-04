@@ -59,7 +59,8 @@ class ExternalElasticEPScaleUpHandshakeMetadata:
 
 
 def create_scale_up_coordinator(vllm_config: "VllmConfig") -> "DPCoordinator":
-    """Let returning rank 0 create the coordinator for the target topology."""
+    """Let returning rank 0 host the target coordinator and control store."""
+    from vllm.distributed.utils import create_tcp_store
     from vllm.v1.engine.coordinator import DPCoordinator
 
     parallel = copy.copy(vllm_config.parallel_config)
@@ -75,18 +76,29 @@ def create_scale_up_coordinator(vllm_config: "VllmConfig") -> "DPCoordinator":
         if not socket.poll(timeout=300_000):
             raise TimeoutError("Timed out obtaining the scale-up coordinator topology.")
         parallel.data_parallel_size = msgspec.msgpack.decode(socket.recv())
-        # The DP/store master may still be a survivor on another node.
         parallel.data_parallel_master_ip = get_ip()
+        coord_store = create_tcp_store(
+            parallel.data_parallel_master_ip,
+            0,
+            is_master=True,
+            world_size=-1,
+            wait_for_workers=False,
+        )
         coordinator = DPCoordinator(
             parallel,
             enable_wave_coordination=vllm_config.model_config.is_moe,
             logging_config=vllm_config.logging_config,
         )
+        coordinator._coord_store = coord_store
         try:
             socket.send(
                 msgspec.msgpack.encode(
                     {
                         "status": "COORDINATOR",
+                        "coord_store": (
+                            parallel.data_parallel_master_ip,
+                            coord_store.port,
+                        ),
                         "addresses": (
                             *coordinator.get_engine_socket_addresses(),
                             coordinator.get_stats_publish_address(),
@@ -100,6 +112,11 @@ def create_scale_up_coordinator(vllm_config: "VllmConfig") -> "DPCoordinator":
             coordinator.shutdown()
             raise
     vllm_config.parallel_config.data_parallel_size = parallel.data_parallel_size
+    vllm_config.parallel_config.data_parallel_master_ip = (
+        parallel.data_parallel_master_ip
+    )
+    vllm_config.parallel_config._coord_store_port = coord_store.port
+    vllm_config.parallel_config._data_parallel_master_rank = 0
     return coordinator
 
 
@@ -217,17 +234,37 @@ class ExternalElasticEPScaleUpHandshakeServer:
                                 )
                             )
                             continue
+                        from vllm.distributed.utils import get_cached_tcp_store_client
+
+                        master_ip, coord_store_port = message["coord_store"]
+                        self.bootstrap = msgspec.structs.replace(
+                            self.bootstrap,
+                            new_data_parallel_master_ip=master_ip,
+                            coord_store_port=coord_store_port,
+                            data_parallel_master_rank=0,
+                        )
+                        key = ExternalElasticEPScaleCoordinator.key
+                        epoch = self.bootstrap.operation_id
+                        target_store = get_cached_tcp_store_client(
+                            master_ip, coord_store_port
+                        )
+                        target_store.set(
+                            key(epoch, "bootstrap"),
+                            msgspec.msgpack.encode(self.bootstrap),
+                        )
+                        target_store.set(key("current_epoch"), epoch.encode())
                         (
                             self.addresses.coordinator_input,
                             self.addresses.coordinator_output,
                             self.addresses.frontend_stats_publish_address,
                         ) = message["addresses"]
-                        self.reconfig_store.set(
-                            ExternalElasticEPScaleCoordinator.key(
-                                self.bootstrap.operation_id, "dp_coordinator"
-                            ),
-                            msgspec.msgpack.encode(message["addresses"]),
-                        )
+                        for store in (self.reconfig_store, target_store):
+                            store.set(
+                                key(epoch, "dp_coordinator"),
+                                msgspec.msgpack.encode(
+                                    (message["addresses"], self.bootstrap)
+                                ),
+                            )
                         coordinator_ready = True
                         handshake_socket.send_multipart((engine_identity, b"OK"))
                     elif status == "READY":
@@ -913,6 +950,23 @@ class ExternalElasticEPScaleCoordinator:
             )
             reconfig_store = await asyncio.to_thread(self._get_reconfig_store)
             assert reconfig_store is not None
+            if scale_up and 0 not in existing_dp_ranks:
+                address_key = self.key(epoch, "dp_coordinator")
+                await asyncio.to_thread(
+                    reconfig_store.wait, [address_key], timedelta(seconds=300)
+                )
+                addresses, bootstrap = msgspec.msgpack.decode(
+                    await asyncio.to_thread(reconfig_store.get, address_key),
+                    type=tuple[tuple[str, str, str], ReconfigureDistributedRequest],
+                )
+                self.active_reconfig_store = (
+                    bootstrap.new_data_parallel_master_ip,
+                    bootstrap.coord_store_port,
+                )
+                reconfig_store = await asyncio.to_thread(
+                    get_cached_tcp_store_client, *self.active_reconfig_store
+                )
+            assert reconfig_store is not None
             reconfig_store.set(self.key("current_epoch"), epoch.encode())
             self._set_phase(
                 reconfig_store, epoch, ExternalElasticEPScalePhase.PREPARING
@@ -930,13 +984,6 @@ class ExternalElasticEPScaleCoordinator:
             if scale_up and 0 not in existing_dp_ranks:
                 # Start target-group preparation first: the new rank must join
                 # that group before it can subscribe to its coordinator.
-                address_key = self.key(epoch, "dp_coordinator")
-                await asyncio.to_thread(
-                    reconfig_store.wait, [address_key], timedelta(seconds=300)
-                )
-                addresses = msgspec.msgpack.decode(
-                    await asyncio.to_thread(reconfig_store.get, address_key)
-                )
                 await self.client.reconnect_dp_coordinator(*addresses)
 
             await self._wait_for_ready_ranks(
@@ -991,6 +1038,10 @@ class ExternalElasticEPScaleCoordinator:
             raise RuntimeError("External Elastic EP scaling has not been prepared.")
 
         bootstrap = prepared.bootstrap
+        old_master_rank = (
+            self.client.vllm_config.parallel_config._data_parallel_master_rank
+        )
+        master_changed = old_master_rank != bootstrap.data_parallel_master_rank
         remaining = prepared.scale_up or (
             prepared.dp_rank < bootstrap.new_data_parallel_size
         )
@@ -1023,7 +1074,7 @@ class ExternalElasticEPScaleCoordinator:
                 prepared.dp_rank,
                 prepared.scale_up,
             )
-            if prepared.dp_rank == prepared.bootstrap.data_parallel_master_rank:
+            if prepared.dp_rank == old_master_rank:
                 await self._wait_for_all_old_ranks(prepared)
                 completed_key = self.key(prepared.epoch, "completed")
                 prepared.control_store.set(completed_key, b"1")
@@ -1035,6 +1086,8 @@ class ExternalElasticEPScaleCoordinator:
 
             if remaining:
                 self._update_parallel_config(bootstrap, prepared.num_redundant_experts)
+                if master_changed:
+                    self.client._coord_store = prepared.reconfig_store
                 if prepared.dp_rank == bootstrap.data_parallel_master_rank:
                     self.client._coord_store = self.reconfig_store_ref
                     self.client._ensure_stats_update_task()
@@ -1047,6 +1100,11 @@ class ExternalElasticEPScaleCoordinator:
             self._stop_handshake_server(
                 prepared.handshake_server, suppress_errors=False
             )
+            if master_changed:
+                # Every old frontend has entered the resume collective, so
+                # none still polls the retired stores for preparation/errors.
+                self.control_store_ref = None
+                self.reconfig_store_ref = None
         except BaseException as e:
             self._publish_error(prepared, e)
             self._stop_handshake_server(prepared.handshake_server, suppress_errors=True)
