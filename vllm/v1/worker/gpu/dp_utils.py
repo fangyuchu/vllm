@@ -81,18 +81,16 @@ def sync_cudagraph_and_dp_padding(
     # consumers index it by original dp_rank.
     num_tokens_across_dp_full = tensor[0]
 
-    if (
-        not should_skip_dp_coordination()
-        and parallel_config is not None
-        and parallel_config.enable_fault_tolerance
-    ):
+    if parallel_config is not None and parallel_config.enable_fault_tolerance:
         # Per-step barrier over the TP cpu group: a faulted sibling stops
         # arriving, so survivors fail here on the host instead of leaving
         # an orphaned TP collective running on device.
         if ft_tp_barrier_required(parallel_config):
             dist.barrier(group=get_tp_group().cpu_group)
 
-        if dead_dp_ranks := get_dp_group().dead_dp_ranks:
+        if not should_skip_dp_coordination() and (
+            dead_dp_ranks := get_dp_group().dead_dp_ranks
+        ):
             # Drop the failed ranks' columns so the min / all(==1) agreements
             # below only see ranks that are still running.
             tensor = tensor[:, [r for r in range(dp_size) if r not in dead_dp_ranks]]

@@ -291,10 +291,6 @@ class ExternalElasticEPScaleUpHandshakeServer:
                             "_coord_store_port": b.coord_store_port,
                             "_data_parallel_master_rank": b.data_parallel_master_rank,
                         }
-                        if b.existing_dp_ranks is not None:
-                            parallel_config["_eep_existing_dp_ranks"] = (
-                                b.existing_dp_ranks
-                            )
                         init_message = msgspec.msgpack.encode(
                             ExternalElasticEPScaleUpHandshakeMetadata(
                                 engine_metadata=EngineHandshakeMetadata(
@@ -406,6 +402,13 @@ class ExternalElasticEPScaleCoordinator:
             get_cached_tcp_store_client,
         )
 
+        if self.prepared_scale is not None:
+            await asyncio.to_thread(
+                self.abort,
+                "Fault recovery interrupted prepared scaling; restart required "
+                "before further Elastic EP operations.",
+            )
+
         is_master = rank == 0 and self.client.client_index == 0
         store = await asyncio.to_thread(
             create_tcp_store,
@@ -420,12 +423,6 @@ class ExternalElasticEPScaleCoordinator:
         await asyncio.to_thread(store.set, ready_keys[rank], b"1")
         await asyncio.to_thread(store.wait, ready_keys, timedelta(seconds=60))
 
-        if self.prepared_scale is not None:
-            await asyncio.to_thread(
-                self._stop_handshake_server,
-                self.prepared_scale.handshake_server,
-                True,
-            )
         self.prepared_scale = None
         self.active_epoch = None
         self.active_reconfig_store = None
