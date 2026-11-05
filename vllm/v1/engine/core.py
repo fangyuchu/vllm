@@ -2740,8 +2740,6 @@ class DPEngineCoreProc(EngineCoreProc):
         new_parallel_config._data_parallel_master_rank = (
             reconfig_request.data_parallel_master_rank
         )
-        new_parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
-
         is_scale_down = reconfig_request.new_data_parallel_size < old_dp_size
         is_shutdown = (
             reconfig_request.new_data_parallel_rank

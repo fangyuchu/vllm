@@ -344,22 +344,21 @@ class ElasticEPScalingExecutor:
             model_runner.model_config, eplb_group
         )
 
+    def _existing_dp_ranks(self) -> list[int] | None:
+        if self.reconfig_request is not None:
+            return self.reconfig_request.existing_dp_ranks
+        return None
+
     def scale_up_members(
         self, old_dp_size: int, new_dp_size: int
     ) -> tuple[list[int], list[int]]:
-        request = self.reconfig_request
-        existing = request.existing_dp_ranks if request is not None else None
-        if request is None:
-            existing = self.worker.vllm_config.parallel_config._eep_existing_dp_ranks
+        existing = self._existing_dp_ranks()
         if existing is None:
             existing = list(range(old_dp_size))
         return existing, [rank for rank in range(new_dp_size) if rank not in existing]
 
     def _mapping_source_rank(self) -> int:
-        request = self.reconfig_request
-        existing = request.existing_dp_ranks if request is not None else None
-        if request is None:
-            existing = self.worker.vllm_config.parallel_config._eep_existing_dp_ranks
+        existing = self._existing_dp_ranks()
         return existing[0] if existing else 0
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
@@ -562,7 +561,6 @@ class ElasticEPScalingExecutor:
         parallel_config._data_parallel_master_rank = (
             reconfig_request.data_parallel_master_rank
         )
-        parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
         parallel_config.data_parallel_master_port = (
             reconfig_request.new_data_parallel_master_port
         )

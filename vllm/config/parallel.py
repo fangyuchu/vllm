@@ -405,8 +405,6 @@ class ParallelConfig:
 
     _data_parallel_master_rank: int = 0
     """Owner of the coordination stores; independent of communication rank 0."""
-    _eep_existing_dp_ranks: list[int] | None = None
-    """Surviving DP identities in the current external scale-up operation."""
 
     _coord_store_port: int = 0
     """Port of the coordination TCPStore. Can be set by the API server; workers
@@ -970,7 +968,6 @@ class ParallelConfig:
             "_data_parallel_master_port_list",
             "_coord_store_port",
             "_data_parallel_master_rank",
-            "_eep_existing_dp_ranks",
             "data_parallel_rpc_port",
             "rank",
             "master_addr",
