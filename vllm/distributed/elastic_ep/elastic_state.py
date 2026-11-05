@@ -479,7 +479,6 @@ class ElasticEPScalingState:
         )
         parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
 
-        if self.scale_type == "scale_up":
-            ft_sentinel = getattr(self.engine_core, "ft_sentinel", None)
-            if ft_sentinel is not None:
-                ft_sentinel.reset_after_scale_up()
+        ft_sentinel = getattr(self.engine_core, "ft_sentinel", None)
+        if ft_sentinel is not None:
+            ft_sentinel.reset_after_reconfiguration()
