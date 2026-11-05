@@ -176,14 +176,14 @@ class EngineCoreSentinel:
             ),
         )
 
-    def reset_after_scale_up(self):
+    def reset_after_reconfiguration(self):
         """Start a new FT baseline after committing the replacement topology."""
         self._initial_dp_size = self.parallel_config.data_parallel_size
         self._dead_dp_ranks.clear()
         self.fault_info = None
         self._push_status()
         logger.info(
-            "[FT] Engine %d reset after scale-up: dp_rank=%d, dp_size=%d",
+            "[FT] Engine %d reset after reconfiguration: dp_rank=%d, dp_size=%d",
             self.engine_index,
             self.parallel_config.data_parallel_rank,
             self._initial_dp_size,
