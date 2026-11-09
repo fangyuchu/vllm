@@ -267,14 +267,6 @@ class PyNcclCommunicator:
             abort_thread = threading.Thread(target=_abort, daemon=True)
             abort_thread.start()
             abort_thread.join(timeout=5.0)
-            if abort_thread.is_alive():
-                logger.warning(
-                    "PyNCCL communicator abort is still pending after 5s "
-                    "(rank=%d, world_size=%d); GPU resources may remain "
-                    "until captured CUDA graphs release the communicator.",
-                    self.rank,
-                    self.world_size,
-                )
             self.available = False
             self.disabled = True
 
