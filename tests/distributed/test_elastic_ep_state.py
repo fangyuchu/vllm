@@ -1,15 +1,78 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
+import gc
+from datetime import timedelta
 from queue import Queue
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from torch.distributed import TCPStore
 
+from vllm.config import ParallelConfig, VllmConfig
+from vllm.distributed import utils as distributed_utils
 from vllm.distributed.elastic_ep.elastic_state import (
     ElasticEPScalingState,
     ScaleUpExistingEngineState,
 )
+from vllm.distributed.elastic_ep.external_elastic_ep import (
+    ExternalElasticEPScaleCoordinator,
+)
+from vllm.utils.network_utils import get_open_port
+
+
+def _scale_coordinator(**parallel_kwargs):
+    config = VllmConfig(parallel_config=ParallelConfig(**parallel_kwargs))
+    return ExternalElasticEPScaleCoordinator(
+        MagicMock(client_index=0, vllm_config=config)
+    )
+
+
+def test_migration_master_retry_keeps_completed_peer_ready(monkeypatch):
+    master, peer = _scale_coordinator(), _scale_coordinator()
+    peer_done = Event()
+    port = get_open_port()
+
+    class FailOnceStore(TCPStore):
+        def __init__(self, **kwargs):
+            self.fail_once = kwargs["is_master"]
+            super().__init__(**kwargs)
+
+        def wait(self, keys, timeout):
+            super().wait(keys, timedelta(seconds=5))
+            if self.fail_once:
+                self.fail_once = False
+                assert peer_done.wait(5)
+                raise ConnectionError("injected master wait failure")
+
+    monkeypatch.setattr(distributed_utils, "TCPStore", FailOnceStore)
+
+    async def run():
+        async def fail_master():
+            with pytest.raises(ConnectionError, match="injected"):
+                await master.migrate_coord_store("127.0.0.1", port, 0, 2, "ft")
+
+        async def finish_peer():
+            await peer.migrate_coord_store("127.0.0.1", port, 1, 2, "ft")
+            peer_done.set()
+
+        await asyncio.gather(fail_master(), finish_peer())
+        gc.collect()  # Drop exception-local references to the server.
+        # A completed peer does not run migration again on the same request.
+        await master.migrate_coord_store("127.0.0.1", port, 0, 2, "ft")
+        assert peer.client._coord_store.get(master.key("ft", "ft", "ready", 0)) == b"1"
+
+    asyncio.run(run())
+
+
+def test_sparse_scale_down_rejected_before_bootstrap():
+    coordinator = _scale_coordinator(data_parallel_size=4, data_parallel_rank=1)
+    with pytest.raises(ValueError, match="sparse.*restore"):
+        asyncio.run(coordinator.prepare(2, 1, existing_dp_ranks=[1, 3]))
+    assert coordinator.active_epoch is None
+    coordinator.client.call_utility_async.assert_not_called()
 
 
 def _commit_state_after_fault(new_size=4):

@@ -336,6 +336,9 @@ class ExternalElasticEPScaleCoordinator:
         self.reconfig_store_ref: Any | None = None
         self.active_epoch: str | None = None
         self.prepared_scale: _PreparedExternalElasticEPScale | None = None
+        self._coord_store_migration: (
+            tuple[tuple[str, str, int, int, int], Any] | None
+        ) = None
 
     @staticmethod
     def key(*parts: str | int) -> str:
@@ -409,16 +412,25 @@ class ExternalElasticEPScaleCoordinator:
                 "before further Elastic EP operations.",
             )
 
-        is_master = rank == 0 and self.client.client_index == 0
-        store = await asyncio.to_thread(
-            create_tcp_store,
-            master_ip,
-            port,
-            is_master=is_master,
-            world_size=-1,
-            wait_for_workers=False,
-            timeout=timedelta(seconds=60),
-        )
+        migration_key = (request_id, master_ip, port, rank, size)
+        if self._coord_store_migration is None:
+            store = await asyncio.to_thread(
+                create_tcp_store,
+                master_ip,
+                port,
+                is_master=rank == 0 and self.client.client_index == 0,
+                world_size=-1,
+                wait_for_workers=False,
+                timeout=timedelta(seconds=60),
+            )
+            # Keep the server and peer ready keys alive if this round needs retrying.
+            self._coord_store_migration = (migration_key, store)
+        else:
+            key, store = self._coord_store_migration
+            if key != migration_key:
+                raise ValueError(
+                    "Coordination store migration is pending; retry it unchanged."
+                )
         ready_keys = [self.key("ft", request_id, "ready", r) for r in range(size)]
         await asyncio.to_thread(store.set, ready_keys[rank], b"1")
         await asyncio.to_thread(store.wait, ready_keys, timedelta(seconds=60))
@@ -434,6 +446,7 @@ class ExternalElasticEPScaleCoordinator:
         parallel = self.client.vllm_config.parallel_config
         parallel.data_parallel_master_ip = master_ip
         parallel._coord_store_port = port
+        self._coord_store_migration = None
         logger.info(
             "[FT] Frontend coordination store migrated: %s:%d, rank=%d/%d",
             master_ip,
@@ -872,6 +885,14 @@ class ExternalElasticEPScaleCoordinator:
             if existing_dp_ranks is None
             else sorted(existing_dp_ranks)
         )
+        if (
+            new_data_parallel_size < cur_data_parallel_size
+            and existing_dp_ranks != list(range(cur_data_parallel_size))
+        ):
+            raise ValueError(
+                "Planned scale-down with sparse surviving ranks is not supported; "
+                "restore the full topology first."
+            )
         if new_data_parallel_size > cur_data_parallel_size and any(
             rank < 0 or rank >= new_data_parallel_size for rank in existing_dp_ranks
         ):

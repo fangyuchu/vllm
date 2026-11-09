@@ -6,6 +6,7 @@ import socket
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
+from dataclasses import dataclass
 from typing import Any
 
 import vllm.envs as envs
@@ -91,6 +92,14 @@ class InputStreamError(Exception):
         super().__init__(str(cause))
 
 
+@dataclass
+class _ScaleDownRecovery:
+    request_id: str
+    removed_ranks: frozenset[int]
+    result: FaultToleranceResult
+    frontend_synced: bool = False
+
+
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
 
@@ -144,9 +153,7 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self._elastic_ep_lock = asyncio.Lock()
         self._ft_frontend_sync_status: dict[str, Any] | None = None
-        self._ft_scale_down_result: (
-            tuple[str, frozenset[int], FaultToleranceResult] | None
-        ) = None
+        self._ft_scale_down_recovery: _ScaleDownRecovery | None = None
         parallel_config = vllm_config.parallel_config
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -1387,7 +1394,7 @@ class AsyncLLM(EngineClient):
             # The committed topology becomes the next fault-recovery baseline.
             self._ft_active_dp_ranks = list(range(new_data_parallel_size))
             self._ft_baseline_dp_size = new_data_parallel_size
-            self._ft_scale_down_result = None
+            self._ft_scale_down_recovery = None
             commit_succeeded = True
             if rank_will_retire:
                 logger.info(
@@ -1413,10 +1420,8 @@ class AsyncLLM(EngineClient):
         """Recover the engine and synchronize its frontend topology."""
         if fault_tolerance_request.instruction != "scale_down":
             result = await self.engine_core.handle_fault(fault_tolerance_request)
-            cached = self._ft_scale_down_result
-            if result.success and (
-                cached is None or cached[1].isdisjoint(self._ft_active_dp_ranks)
-            ):
+            cached = self._ft_scale_down_recovery
+            if result.success and (cached is None or cached.frontend_synced):
                 self._ft_frontend_sync_status = None
             return result
         async with self._elastic_ep_lock:
@@ -1454,20 +1459,22 @@ class AsyncLLM(EngineClient):
                 "'removed_dp_ranks' must be a non-empty list of integer rank IDs."
             )
         removed = set(removed_ranks)
-        cached = self._ft_scale_down_result
+        cached = self._ft_scale_down_recovery
         recovered = None
         if cached is not None:
-            same_request = cached[:2] == (request.request_id, frozenset(removed))
-            pending = not cached[1].isdisjoint(self._ft_active_dp_ranks)
-            if pending and not same_request:
+            same_request = (
+                cached.request_id == request.request_id
+                and cached.removed_ranks == removed
+            )
+            if not cached.frontend_synced and not same_request:
                 raise ValueError(
                     "Frontend migration is pending; retry the same scale_down "
                     "request_id and removed_dp_ranks."
                 )
             if same_request:
-                if not pending:
-                    return cached[2]
-                recovered = cached[2]
+                if cached.frontend_synced:
+                    return cached.result
+                recovered = cached.result
         migrate_store = (
             parallel.enable_elastic_ep
             and parallel.data_parallel_external_lb
@@ -1491,7 +1498,8 @@ class AsyncLLM(EngineClient):
         result = recovered or await self.engine_core.handle_fault(request)
         if not result.success:
             return result
-        self._ft_scale_down_result = (request.request_id, frozenset(removed), result)
+        recovery = _ScaleDownRecovery(request.request_id, frozenset(removed), result)
+        self._ft_scale_down_recovery = recovery
 
         active = [rank for rank in self._ft_active_dp_ranks if rank not in removed]
 
@@ -1510,6 +1518,7 @@ class AsyncLLM(EngineClient):
             parallel.eplb_config.num_redundant_experts = result.num_redundant_experts
         parallel.data_parallel_size = len(active)
         self._ft_active_dp_ranks = active
+        recovery.frontend_synced = True
         logger.info("[FT] Frontend topology synchronized: active_dp_ranks=%s", active)
         return result
 
