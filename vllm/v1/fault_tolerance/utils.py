@@ -14,7 +14,6 @@ class FaultToleranceResult(msgspec.Struct):
     request_id: str
     success: bool
     reason: str | None = None
-    num_redundant_experts: int | None = None
 
 
 class FaultToleranceRequest(msgspec.Struct):

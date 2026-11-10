@@ -558,6 +558,12 @@ class ParallelConfig:
                 "The FT system assumes one AsyncMPClient manages all engines."
             )
 
+        if self.enable_fault_tolerance and not self.enable_elastic_ep:
+            logger.warning(
+                "Scale-up after fault recovery requires both --enable-fault-tolerance "
+                "and --enable-elastic-ep. Only fault recovery is enabled."
+            )
+
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(
                 "The '%s' all2all backend has been removed. "

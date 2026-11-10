@@ -1344,6 +1344,12 @@ class AsyncLLM(EngineClient):
             )
             return
 
+        assert (
+            new_data_parallel_size <= old_data_parallel_size
+            or old_data_parallel_size >= self._ft_baseline_dp_size
+            or parallel_config.all2all_backend == "nixl_ep"
+        )
+
         if old_data_parallel_size < new_data_parallel_size < self._ft_baseline_dp_size:
             raise ValueError(
                 "Partial scale-up after fault recovery is not supported; "
@@ -1512,10 +1518,14 @@ class AsyncLLM(EngineClient):
                 request.request_id,
             )
             parallel._data_parallel_master_rank = active[0]
-        if result.num_redundant_experts is not None:
-            # Track surviving expert capacity for subsequent scaling;
-            # workers retain their original slot layout until reconfiguration.
-            parallel.eplb_config.num_redundant_experts = result.num_redundant_experts
+        if parallel.enable_eplb:
+            num_logical = self.model_config.get_num_experts()
+            num_local_experts = (
+                num_logical + parallel.eplb_config.num_redundant_experts
+            ) // parallel.data_parallel_size
+            parallel.eplb_config.num_redundant_experts = (
+                num_local_experts * len(active) - num_logical
+            )
         parallel.data_parallel_size = len(active)
         self._ft_active_dp_ranks = active
         recovery.frontend_synced = True

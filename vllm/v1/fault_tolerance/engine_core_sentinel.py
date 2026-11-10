@@ -152,8 +152,7 @@ class EngineCoreSentinel:
 
     @property
     def coordinator_disabled(self) -> bool:
-        """Keep stepping after fault recovery until scale-up restores the
-        topology and rank 0's coordinator can wake idle engines again."""
+        """Whether to bypass coordinator-driven idle waiting after fault recovery."""
         return bool(self._dead_dp_ranks)
 
     def activate_cpu_group_timeouts(self) -> None:
@@ -176,14 +175,14 @@ class EngineCoreSentinel:
             ),
         )
 
-    def reset_after_reconfiguration(self):
+    def reset_after_scale_reconfiguration(self):
         """Start a new FT baseline after committing the replacement topology."""
         self._initial_dp_size = self.parallel_config.data_parallel_size
         self._dead_dp_ranks.clear()
         self.fault_info = None
         self._push_status()
         logger.info(
-            "[FT] Engine %d reset after reconfiguration: dp_rank=%d, dp_size=%d",
+            "[FT] Engine %d reset after scale reconfiguration: dp_rank=%d, dp_size=%d",
             self.engine_index,
             self.parallel_config.data_parallel_rank,
             self._initial_dp_size,
@@ -381,7 +380,7 @@ class EngineCoreSentinel:
                 f"dead_dp_ranks={sorted(self._dead_dp_ranks)})"
             )
 
-        # The store owner can differ from rank 0 after hole-filling scale-up.
+        # Removing the store master requires the new store location in the request.
         master_rank = self.parallel_config._data_parallel_master_rank
         if master_rank in newly_dead and (
             ft_request.params.get("dp_store_port") is None
@@ -395,7 +394,7 @@ class EngineCoreSentinel:
         new_dead = self._dead_dp_ranks | newly_dead
         ft_request.params["dead_dp_ranks"] = sorted(new_dead)
         self._prepare_round(ft_request, dead_ranks=new_dead)
-        num_redundant_experts = self._recover_and_vote(ft_request, terminal=True)
+        self._recover_and_vote(ft_request, terminal=True)
         # Commit the dead set only after the full recovery succeeded.
         self._dead_dp_ranks = new_dead
         logger.info(
@@ -405,9 +404,7 @@ class EngineCoreSentinel:
             sorted(newly_dead),
             sorted(new_dead),
         )
-        result = self._mark_healthy(ft_request)
-        result.num_redundant_experts = num_redundant_experts
-        return result
+        return self._mark_healthy(ft_request)
 
     def _prepare_round(
         self, ft_request: FaultToleranceRequest, dead_ranks: set[int] | None = None
@@ -517,7 +514,7 @@ class EngineCoreSentinel:
         self,
         ft_request: FaultToleranceRequest,
         terminal: bool,
-    ) -> int | None:
+    ) -> None:
         """Reinit the engine groups, dispatch the command to workers, then
         all surviving engines vote one success bit over the rebuilt DP group
         so they commit or fail together. Any failure is terminal when
@@ -529,7 +526,7 @@ class EngineCoreSentinel:
         local_error: Exception | None = None
         try:
             self._reinit_groups(ft_request)
-            worker_results = engine.model_executor.collective_rpc(
+            engine.model_executor.collective_rpc(
                 "handle_ft_command", args=(ft_request,)
             )
             self._drain_batch_queue()
@@ -547,7 +544,7 @@ class EngineCoreSentinel:
             except Exception:
                 success.zero_()
         if success.item():
-            return worker_results[0]
+            return
 
         if terminal:
             self.status_type = EngineStatusType.DEAD

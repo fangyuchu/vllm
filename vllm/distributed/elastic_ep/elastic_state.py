@@ -480,4 +480,4 @@ class ElasticEPScalingState:
 
         ft_sentinel = getattr(self.engine_core, "ft_sentinel", None)
         if ft_sentinel is not None:
-            ft_sentinel.reset_after_reconfiguration()
+            ft_sentinel.reset_after_scale_reconfiguration()
