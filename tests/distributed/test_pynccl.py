@@ -85,7 +85,7 @@ def test_pynccl():
 @worker_fn_wrapper
 def retire_faulted_nccl_worker_fn():
     from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
-        _retire_nccl_communicators,
+        WorkerSentinel,
     )
 
     world = get_world_group()
@@ -101,7 +101,7 @@ def retire_faulted_nccl_worker_fn():
         group.device_communicator.pynccl_comm.destroy()
         torch.distributed.barrier(group=group.cpu_group)
         free_before = torch.accelerator.memory.get_memory_info(world.device)[0]
-        _retire_nccl_communicators([group])
+        WorkerSentinel._retire_device_communicators([group])
         torch.distributed.barrier(group=group.cpu_group)
         if torch.accelerator.memory.get_memory_info(world.device)[0] <= free_before:
             raise AssertionError("Native NCCL allocations remained after retirement")
