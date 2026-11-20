@@ -22,7 +22,7 @@ from vllm.distributed.elastic_ep.external_elastic_ep import (
 )
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.engine import ReconfigureDistributedRequest
-from vllm.v1.fault_tolerance.engine_core_sentinel import FrontendSentinel
+from vllm.v1.fault_tolerance.frontend_sentinel import FrontendSentinel
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 
 

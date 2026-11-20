@@ -64,7 +64,7 @@ from vllm.v1.engine.utils import (
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
-from vllm.v1.fault_tolerance.engine_core_sentinel import FrontendSentinel
+from vllm.v1.fault_tolerance.frontend_sentinel import FrontendSentinel
 from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
@@ -1195,7 +1195,7 @@ class AsyncMPClient(MPClient):
 
         self.client_count = client_count
         self.client_index = client_index
-        self.ft_sentinel = FrontendSentinel(self)
+        self.frontend_sentinel = FrontendSentinel(self)
         self.outputs_queue = asyncio.Queue[EngineCoreOutputs | Exception]()
 
         # locally-cached engine status
@@ -1484,7 +1484,7 @@ class AsyncMPClient(MPClient):
     async def handle_fault(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
-        return await self.ft_sentinel.handle_fault(ft_request)
+        return await self.frontend_sentinel.handle_fault(ft_request)
 
     @property
     def engine_status(self) -> dict:
@@ -1492,7 +1492,7 @@ class AsyncMPClient(MPClient):
         return self._engine_status.get(self.engine_ranks_managed[0], {})
 
     async def get_status(self):
-        return self.ft_sentinel.get_status()
+        return self.frontend_sentinel.get_status()
 
 
 class DPAsyncMPClient(AsyncMPClient):
@@ -1719,12 +1719,12 @@ class DPAsyncMPClient(AsyncMPClient):
             f"new_data_parallel_size {new_data_parallel_size} must be "
             f"different from cur_data_parallel_size {cur_data_parallel_size}"
         )
-        self.ft_sentinel.validate_scale_up(new_data_parallel_size)
+        self.frontend_sentinel.validate_scale_up(new_data_parallel_size)
         await self._get_external_eep_coordinator().prepare(
             cur_data_parallel_size,
             new_data_parallel_size,
             existing_dp_ranks=(
-                self.ft_sentinel.active_dp_ranks.copy()
+                self.frontend_sentinel.active_dp_ranks.copy()
                 if existing_dp_ranks is None
                 else existing_dp_ranks
             ),
@@ -1991,7 +1991,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             num_redundant_experts
         )
         self._prepared_elastic_ep = None
-        self.ft_sentinel.reset_after_scale_reconfiguration(new_data_parallel_size)
+        self.frontend_sentinel.reset_after_scale_reconfiguration(new_data_parallel_size)
 
     async def prepare_elastic_ep(
         self,

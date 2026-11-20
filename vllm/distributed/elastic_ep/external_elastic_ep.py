@@ -1171,7 +1171,7 @@ class ExternalElasticEPScaleCoordinator:
         finally:
             self.prepared_scale = None
 
-        self.client.ft_sentinel.reset_after_scale_reconfiguration(
+        self.client.frontend_sentinel.reset_after_scale_reconfiguration(
             bootstrap.new_data_parallel_size
         )
 

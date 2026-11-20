@@ -1314,7 +1314,7 @@ class AsyncLLM(EngineClient):
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ):
         """Scale the elastic EP data parallel size."""
-        async with self.engine_core.ft_sentinel.lock:
+        async with self.engine_core.frontend_sentinel.lock:
             await self._scale_elastic_ep(new_data_parallel_size, drain_timeout)
 
     async def _scale_elastic_ep(
