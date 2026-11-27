@@ -47,9 +47,9 @@ logger = init_logger(__name__)
 FT_UTILITY_METHOD = "handle_fault_tolerance"
 
 # How long an engine waits for the other alive engines to check in for the
-# same recovery round. This covers orchestrator dispatch skew (the
-# apply POSTs are fired concurrently),.
-_ROUND_CHECKIN_TIMEOUT_SEC = 10
+# same recovery round and for the final success vote. This covers orchestrator
+# dispatch skew because the apply POSTs are fired concurrently.
+_ROUND_CHECKIN_TIMEOUT_SEC = 30
 
 
 class EngineCoreSentinel:
@@ -491,14 +491,25 @@ class EngineCoreSentinel:
 
         success = torch.tensor([local_error is None], dtype=torch.int32)
         if self._initial_dp_size > 1:
+            dp_group = cast("DPEngineCoreProc", engine).dp_group
+            original_timeout = (
+                self.parallel_config.cpu_distributed_timeout
+                or _get_default_timeout(Backend.GLOO)
+            )
             try:
+                set_gloo_backend_timeout(
+                    dp_group,
+                    timedelta(seconds=_ROUND_CHECKIN_TIMEOUT_SEC),
+                )
                 dist.all_reduce(
                     success,
                     op=dist.ReduceOp.MIN,
-                    group=cast("DPEngineCoreProc", engine).dp_group,
+                    group=dp_group,
                 )
             except Exception:
                 success.zero_()
+            finally:
+                set_gloo_backend_timeout(dp_group, original_timeout)
         if success.item():
             return
 
