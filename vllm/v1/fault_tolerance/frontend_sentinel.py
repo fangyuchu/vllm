@@ -48,7 +48,7 @@ class FrontendSentinel:
 
     def validate_scale_up(self, new_data_parallel_size: int) -> None:
         parallel_config = self.client.vllm_config.parallel_config
-        old_data_parallel_size = parallel_config.data_parallel_size
+        old_data_parallel_size = len(self.active_dp_ranks)
         assert (
             new_data_parallel_size <= old_data_parallel_size
             or old_data_parallel_size >= self.baseline_dp_size
