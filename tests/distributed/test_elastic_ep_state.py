@@ -73,7 +73,7 @@ def test_migration_master_retry_keeps_completed_peer_ready(monkeypatch):
 def test_sparse_scale_down_rejected_before_bootstrap():
     coordinator = _scale_coordinator(data_parallel_size=4, data_parallel_rank=1)
     with pytest.raises(ValueError, match="sparse.*restore"):
-        asyncio.run(coordinator.prepare(2, 1, existing_dp_ranks=[1, 3]))
+        asyncio.run(coordinator.prepare(1, existing_dp_ranks=[1, 3]))
     assert coordinator.active_epoch is None
     coordinator.client.call_utility_async.assert_not_called()
 

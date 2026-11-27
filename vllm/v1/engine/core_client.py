@@ -273,11 +273,7 @@ class EngineCoreClient(ABC):
     async def commit_elastic_ep(self) -> None:
         raise NotImplementedError
 
-    async def prepare_elastic_ep(
-        self,
-        new_data_parallel_size: int,
-        existing_dp_ranks: list[int] | None = None,
-    ) -> None:
+    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
         raise NotImplementedError
 
     async def abort_external_elastic_ep(self, error: str) -> None:
@@ -1684,15 +1680,6 @@ class DPAsyncMPClient(AsyncMPClient):
         self._coord_store = store
         return ip, store.port
 
-    @staticmethod
-    async def eep_process_engine_core_notification(
-        self: "DPAsyncMPClient", notification_data: tuple[str, int]
-    ) -> None:
-        if self.external_eep_coordinator is not None:
-            await self.external_eep_coordinator.process_engine_core_notification(
-                notification_data
-            )
-
     def _get_external_eep_coordinator(self) -> ExternalElasticEPScaleCoordinator:
         parallel_config = self.vllm_config.parallel_config
         if not parallel_config.enable_elastic_ep:
@@ -1708,26 +1695,11 @@ class DPAsyncMPClient(AsyncMPClient):
         assert coordinator is not None
         return coordinator
 
-    async def prepare_elastic_ep(
-        self,
-        new_data_parallel_size: int,
-        existing_dp_ranks: list[int] | None = None,
-    ) -> None:
-        cur_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
-
-        assert new_data_parallel_size != cur_data_parallel_size, (
-            f"new_data_parallel_size {new_data_parallel_size} must be "
-            f"different from cur_data_parallel_size {cur_data_parallel_size}"
-        )
+    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
         self.frontend_sentinel.validate_scale_up(new_data_parallel_size)
         await self._get_external_eep_coordinator().prepare(
-            cur_data_parallel_size,
             new_data_parallel_size,
-            existing_dp_ranks=(
-                self.frontend_sentinel.active_dp_ranks.copy()
-                if existing_dp_ranks is None
-                else existing_dp_ranks
-            ),
+            existing_dp_ranks=self.frontend_sentinel.active_dp_ranks,
         )
 
     async def commit_elastic_ep(self) -> None:
@@ -1993,11 +1965,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self._prepared_elastic_ep = None
         self.frontend_sentinel.reset_after_scale_reconfiguration(new_data_parallel_size)
 
-    async def prepare_elastic_ep(
-        self,
-        new_data_parallel_size: int,
-        existing_dp_ranks: list[int] | None = None,
-    ) -> None:
+    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Prepare elastic EP scaling without routing requests to new engines."""
         if (prepared := self._prepared_elastic_ep) is not None:
             if prepared[0] == new_data_parallel_size:

@@ -8,6 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 import torch.nn as nn
 from torch.distributed import P2POp
@@ -61,6 +62,7 @@ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 logger = init_logger(__name__)
+_EXISTING_DP_RANKS_KEY = "eep_existing_dp_ranks"
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
@@ -75,13 +77,6 @@ def can_reuse_fused_moe_kernel(parallel_config: ParallelConfig) -> bool:
     disconnected, masked, or unmasked.
     """
     return parallel_config.all2all_backend == "nixl_ep"
-
-
-def get_active_dp_size(dp_group: GroupCoordinator | None = None) -> int:
-    """Return the number of DP ranks currently participating in serving."""
-    if dp_group is None:
-        dp_group = get_dp_group()
-    return dp_group.world_size - len(dp_group.dead_dp_ranks)
 
 
 def scale_up_source_rank(
@@ -176,6 +171,7 @@ class ElasticEPScalingExecutor:
     def __init__(self, worker):
         self.worker_ref = weakref.ref(worker)
         self.reconfig_request = None
+        self._mapping_source_rank = 0
         self._staged_moe_quant_methods: dict[nn.Module, FusedMoEMethodBase] = {}
         self._prepared_eplb_communicator: EplbCommunicator | None = None
         self._async_executor = ThreadPoolExecutor(
@@ -306,7 +302,7 @@ class ElasticEPScalingExecutor:
         self.reconfig_request = reconfig_request
         new_dp_size = reconfig_request.new_data_parallel_size
         active_dp_group = get_dp_group()
-        old_dp_size = get_active_dp_size(active_dp_group)
+        old_dp_size = active_dp_group.world_size - len(active_dp_group.dead_dp_ranks)
         parallel_config = self.worker.vllm_config.parallel_config
         world_size = parallel_config.world_size
         new_world_size_across_dp = world_size * new_dp_size
@@ -344,31 +340,24 @@ class ElasticEPScalingExecutor:
             model_runner.model_config, eplb_group
         )
 
-    def _existing_dp_ranks(self) -> list[int] | None:
-        if self.reconfig_request is not None:
-            return self.reconfig_request.existing_dp_ranks
-        return None
-
-    def scale_up_members(
-        self, old_dp_size: int, new_dp_size: int
-    ) -> tuple[list[int], list[int]]:
-        existing = self._existing_dp_ranks()
-        if existing is None:
-            existing = list(range(old_dp_size))
-        return existing, [rank for rank in range(new_dp_size) if rank not in existing]
-
-    def _mapping_source_rank(self) -> int:
-        existing = self._existing_dp_ranks()
-        return existing[0] if existing else 0
+    @staticmethod
+    def _joining_dp_ranks(existing: list[int], new_dp_size: int) -> list[int]:
+        return [rank for rank in range(new_dp_size) if rank not in existing]
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
-        existing, new = self.scale_up_members(old_dp_size, new_dp_size)
-        standby_dp_group.tcp_store_group.broadcast(
-            torch.tensor([old_dp_size], dtype=torch.int64, device="cpu"), existing[0]
-        )
+        assert self.reconfig_request is not None
+        existing = self.reconfig_request.existing_dp_ranks
+        if existing is None:
+            existing = list(range(old_dp_size))
+        self._mapping_source_rank = existing[0]
         dp_rank = standby_dp_group.rank_in_group
+        if dp_rank == self._mapping_source_rank:
+            standby_dp_group.tcp_store_group.store.set(
+                _EXISTING_DP_RANKS_KEY, msgspec.msgpack.encode(existing)
+            )
+        new = self._joining_dp_ranks(existing, new_dp_size)
         ranks_to_send = [
             rank for rank in new if scale_up_source_rank(existing, new, rank) == dp_rank
         ]
@@ -382,10 +371,6 @@ class ElasticEPScalingExecutor:
                 dp_group=standby_dp_group,
                 expert_weights=model.expert_weights,
             )
-        self._synchronize_weight_transfer()
-
-    def _synchronize_weight_transfer(self) -> None:
-        """Wait for weight P2P operations using platform semantics."""
         torch.accelerator.synchronize()
 
     def _warm_target_groups(self, dp_group, ep_group) -> None:
@@ -409,7 +394,7 @@ class ElasticEPScalingExecutor:
         broadcast_expert_mapping(
             physical_to_logical=physical_to_logical,
             dp_group=standby_dp_group,
-            src_rank=self._mapping_source_rank(),
+            src_rank=self._mapping_source_rank,
             device=self.worker.device,
         )
 
@@ -702,26 +687,16 @@ class ElasticEPScalingExecutor:
         }
         self._perform_eplb_reshuffle(rank_mapping=rank_mapping)
 
-    def prepare_new_worker(
-        self,
-        reconfig_request: ReconfigureDistributedRequest | None = None,
-    ) -> None:
-        if reconfig_request is not None:
-            self.reconfig_request = reconfig_request
+    def prepare_new_worker(self) -> None:
         dp_group = get_dp_group()
         assert isinstance(dp_group, StatelessGroupCoordinator)
-        new_dp_size = dp_group.world_size
-        dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
-
-        # Receive old_dp_size broadcasted during transfer_weights
-        old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
-        old_dp_size_tensor = dp_group.tcp_store_group.broadcast(
-            old_dp_size_tensor, self._mapping_source_rank()
+        existing = msgspec.msgpack.decode(
+            dp_group.tcp_store_group.store.get(_EXISTING_DP_RANKS_KEY),
+            type=list[int],
         )
-        old_dp_size = int(old_dp_size_tensor[0].item())
-
-        existing, new = self.scale_up_members(old_dp_size, new_dp_size)
-        sender_rank = scale_up_source_rank(existing, new, dp_rank)
+        self._mapping_source_rank = existing[0]
+        new = self._joining_dp_ranks(existing, dp_group.world_size)
+        sender_rank = scale_up_source_rank(existing, new, dp_group.rank_in_group)
 
         model = self.worker.model_runner.get_model()
         expert_weights = [
@@ -736,7 +711,7 @@ class ElasticEPScalingExecutor:
             dp_group=dp_group,
             expert_weights=expert_weights,
         )
-        self._synchronize_weight_transfer()
+        torch.accelerator.synchronize()
         if not current_platform.is_rocm():
             self._warm_target_groups(get_dp_group(), get_ep_group())
         if self._can_reuse_fused_moe_kernel():
@@ -748,7 +723,7 @@ class ElasticEPScalingExecutor:
         return broadcast_expert_mapping(
             physical_to_logical=None,
             dp_group=dp_group,
-            src_rank=self._mapping_source_rank(),
+            src_rank=self._mapping_source_rank,
             device=self.worker.device,
         )
 

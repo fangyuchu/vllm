@@ -63,9 +63,7 @@ def test_external_elastic_ep_visible_epoch_has_bootstrap_and_phase(monkeypatch):
     monkeypatch.setattr(
         coordinator, "_setup_reconfig_bootstrap", lambda: ("127.0.0.1", 12348)
     )
-    epoch, bootstrap = coordinator._prepare_reconfig_bootstrap(
-        control_store, 2, 3, [0, 1]
-    )
+    epoch, bootstrap = coordinator._prepare_reconfig_bootstrap(control_store, 3, [0, 1])
 
     for store in (control_store, reconfig_store):
         # DictStore preserves insertion order: metadata must precede the epoch.
@@ -125,7 +123,9 @@ async def test_validate_expert_capacity_on_every_rank(dp_rank, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="cannot retain all model experts"):
-        await asyncio.wait_for(coordinator.prepare(4, 2), timeout=1)
+        await asyncio.wait_for(
+            coordinator.prepare(2, existing_dp_ranks=list(range(4))), timeout=1
+        )
 
     assert not store.values
     assert coordinator.prepared_scale is None

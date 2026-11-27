@@ -7,7 +7,6 @@ from copy import copy
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
-import msgspec
 import torch.distributed
 
 from vllm.config import ParallelConfig
@@ -202,22 +201,7 @@ class ElasticEPScalingState:
         assert self.new_dp_group is not None and self.new_dp_store is not None
 
         if state == ScaleUpNewEngineState.PRE_KV_INIT:
-            parallel = self.new_parallel_config
-            if self.reconfig_request is None and parallel.data_parallel_external_lb:
-                store = get_cached_tcp_store_client(
-                    parallel.data_parallel_master_ip, parallel._coord_store_port
-                )
-                key = ExternalElasticEPScaleCoordinator.key
-                # Bind EngineCore and Workers to the same operation before preparation.
-                epoch = store.get(key("current_epoch")).decode()
-                self.reconfig_request = msgspec.msgpack.decode(
-                    store.get(key(epoch, "bootstrap")),
-                    type=ReconfigureDistributedRequest,
-                )
-            self._collective_rpc(
-                "elastic_ep_execute",
-                args=("prepare_new_worker", self.reconfig_request),
-            )
+            self._collective_rpc("elastic_ep_execute", args=("prepare_new_worker",))
             self.engine_core.available_gpu_memory_for_kv_cache = (
                 ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)
             )
@@ -277,22 +261,12 @@ class ElasticEPScalingState:
         if state == ScaleDownRemovingEngineState.PREPARE:
             assert self.old_dp_group.rank() > 0
             self._commit_scale_down(removing=True)
-            external_lb = self.vllm_config.parallel_config.data_parallel_external_lb
-            if external_lb:
-                # Preserve completion delivery: client cleanup on exit must not
-                # cancel the receiver before it records the notification.
-                parallel_config = self.new_parallel_config
-                store = get_cached_tcp_store_client(
-                    parallel_config.data_parallel_master_ip,
-                    parallel_config._coord_store_port,
+            if self.vllm_config.parallel_config.data_parallel_external_lb:
+                self._record_external_completion("shutdown_complete")
+            else:
+                self.engine_core._eep_send_engine_core_notification(
+                    EEPNotificationType.SHUTDOWN_COMPLETE
                 )
-                key = ExternalElasticEPScaleCoordinator.key
-                epoch = store.get(key("current_epoch")).decode()
-            self.engine_core._eep_send_engine_core_notification(
-                EEPNotificationType.SHUTDOWN_COMPLETE
-            )
-            if external_lb:
-                store.wait([key(epoch, "shutdown_complete", self.engine_core.dp_rank)])
             self.state = ScaleDownRemovingEngineState.COMPLETE
             return True
 
@@ -424,12 +398,27 @@ class ElasticEPScalingState:
         if new_dp_group.rank() == 0:
             logger.info("[Elastic EP] Switched to new setup")
 
-    def _send_reconfigure_finished(self):
+    def _record_external_completion(self, event: str) -> None:
+        request = self.reconfig_request
+        assert request is not None and request.operation_id
+        store = get_cached_tcp_store_client(
+            request.new_data_parallel_master_ip, request.coord_store_port
+        )
+        key = ExternalElasticEPScaleCoordinator.key(
+            request.operation_id,
+            event,
+            self.vllm_config.parallel_config.data_parallel_rank,
+        )
+        store.set(key, b"1")
+        if event == "shutdown_complete":
+            # Confirm the store received the marker before this EngineCore exits.
+            store.wait([key])
+
+    def _send_reconfigure_finished(self) -> None:
         assert self.new_dp_group is not None
-        if (
-            self.new_dp_group.rank() == 0
-            or self.vllm_config.parallel_config.data_parallel_external_lb
-        ):
+        if self.vllm_config.parallel_config.data_parallel_external_lb:
+            self._record_external_completion("old_rank_finished")
+        elif self.new_dp_group.rank() == 0:
             self.engine_core._eep_send_engine_core_notification(
                 EEPNotificationType.RECONFIGURE_FINISHED
             )
